@@ -448,6 +448,8 @@ class Go2WalkEnv:
 
         # Penalty: joint velocity (no flailing)
         r_joint_vel   = -np.sum(np.square(motor_vel), axis=1)
+        # Reward being at the correct standing height
+        r_height = -np.square(height - 0.34)   # 0.34m is nominal standing height
 
         reward = (
             1.0   * r_track_lin
@@ -460,6 +462,7 @@ class Go2WalkEnv:
           + 0.01  * r_action_mag
           + 0.001 * r_action_rate   # FIX 3: was 0.01
           + 0.001 * r_joint_vel
+          + 2*r_height
         )
 
         return reward.astype(np.float32)

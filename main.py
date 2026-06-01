@@ -409,12 +409,6 @@ class PPOTrainer:
         cfg = self.cfg
 
         obs_flat, act_flat, lp_flat, adv_flat, ret_flat, val_flat = self.buf.get_flat()
-        # DEBUG
-        print(f"lp_flat  — mean: {lp_flat.mean():.4f}  std: {lp_flat.std():.4f}  device: {lp_flat.device}")
-        print(f"adv_flat — mean: {adv_flat.mean():.4f}  std: {adv_flat.std():.4f}")
-        print(f"ret_flat — mean: {ret_flat.mean():.4f}  std: {ret_flat.std():.4f}")
-        print(f"obs_flat — mean: {obs_flat.mean():.4f}  device: {obs_flat.device}")
-
         # Normalise advantages across the full rollout
         adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
@@ -437,6 +431,10 @@ class PPOTrainer:
                 new_lp, entropy, value = self.net.evaluate(
                     obs_flat[mb], act_flat[mb]
                 )
+                    # DEBUG — add this
+                print(f"old_lp: {lp_flat[mb][:3]}  new_lp: {new_lp[:3]}  ratio: {(new_lp - lp_flat[mb]).exp()[:3]}")
+                break  # only first minibatch
+
 
                 ratio = (new_lp - lp_flat[mb]).exp()
 

@@ -461,7 +461,7 @@ class Go2WalkEnv:
     # ------------------------------------------------------------------
  
     def _compute_done(self, obs: np.ndarray) -> np.ndarray:
-            height     = self.robot.get_pos().detach().numpy()[:, 2]
+            height     = self.robot.get_pos().detach().cpu().numpy()[:, 2]
             proj_grav  = obs[:, 6:9]
  
             # Existing conditions

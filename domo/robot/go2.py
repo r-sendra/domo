@@ -168,6 +168,7 @@ class Go2WalkEnv:
         self.max_episode_steps = max_episode_steps
         self.device            = device
 
+        backend = gs.cuda if torch.cuda.is_available() else gs.cpu
         # --- Genesis initialisation ---
         gs.init(backend=backend, logging_level="warning")
         # gs.init(backend=gs.cuda, logging_level="warning")

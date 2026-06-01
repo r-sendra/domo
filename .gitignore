@@ -1,0 +1,95 @@
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+*.whl
+
+# ── Virtual environments ──────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+env_isaaclab/
+env_domo/
+
+# ── Training outputs ──────────────────────────────────────────────────
+logs/
+runs/
+outputs/
+wandb/
+
+# ── Model checkpoints (large files) ──────────────────────────────────
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pb
+*.tflite
+
+# ── Genesis cache ─────────────────────────────────────────────────────
+.genesis/
+genesis_cache/
+
+# ── Jupyter ───────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── macOS ─────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+.AppleDB
+.AppleDesktop
+Icon
+ehthumbs.db
+Thumbs.db
+.fseventsd
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.DocumentRevisions-V100
+.TemporaryItems
+
+# ── IDE ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.nvimrc
+.exrc
+Session.vim
+.vim/
+
+# ── Secrets ───────────────────────────────────────────────────────────
+.env
+.env.*
+*.key
+*.pem
+secrets.yaml
+secrets.json
+
+# ── Config overrides (generated at runtime) ───────────────────────────
+configs/overrides/
+multirun/
+
+# ── Misc ──────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.orig
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

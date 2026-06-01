@@ -396,6 +396,7 @@ class Go2WalkEnv:
         All weights are multiplied by dt inside the PPO trainer to keep
         them timestep-independent.
         """
+        height = self.robot.get_pos().cpu().numpy()[:, 2]
         lin_vel       = obs[:, 0:3]    # (N, 3) body frame
         ang_vel       = obs[:, 3:6]    # (N, 3) body frame
         proj_grav     = obs[:, 6:9]    # (N, 3)
@@ -480,7 +481,7 @@ class Go2WalkEnv:
         height    = self.robot.get_pos().cpu().numpy()[:, 2]   # (N,)
         proj_grav = obs[:, 6:9]                          # (N, 3)
 
-        done_fallen  = height < 0.15
+        done_fallen  = height < 0.25
         done_flipped = proj_grav[:, 2] > 0.5             # upside-down
         done_pitch   = np.abs(proj_grav[:, 0]) > 0.7     # pitched > ~45 deg
         done_roll    = np.abs(proj_grav[:, 1]) > 0.7     # rolled  > ~45 deg

@@ -353,17 +353,15 @@ class PPOTrainer:
                 action_t, log_prob_t, value_t = self.net.get_action(obs_t)
                 action_np = action_t.cpu().numpy()
 
-                # FIX 4: store pre-step quantities BEFORE env.step()
                 self.buf.store_step(
-                    obs       = obs_t.cpu().numpy(),
+                    obs       = obs_t.detach()cpu().numpy(),
                     actions   = action_np,
-                    log_probs = log_prob_t.cpu().numpy(),
-                    values    = value_t.cpu().numpy(),
+                    log_probs = log_prob_t.detach().cpu().numpy(),
+                    values    = value_t.detach().cpu().numpy(),
                 )
 
                 obs_np, reward_np, done_np, info = self.env.step(action_np)
 
-                # FIX 4: store post-step quantities AFTER env.step()
                 self.buf.store_outcome(
                     rewards = reward_np,
                     dones   = done_np,
@@ -431,9 +429,9 @@ class PPOTrainer:
                 new_lp, entropy, value = self.net.evaluate(
                     obs_flat[mb], act_flat[mb]
                 )
-                    # DEBUG — add this
-                print(f"old_lp: {lp_flat[mb][:3]}  new_lp: {new_lp[:3]}  ratio: {(new_lp - lp_flat[mb]).exp()[:3]}")
-                break  # only first minibatch
+                #     # DEBUG — add this
+                # print(f"old_lp: {lp_flat[mb][:3]}  new_lp: {new_lp[:3]}  ratio: {(new_lp - lp_flat[mb]).exp()[:3]}")
+                # break  # only first minibatch
 
 
                 ratio = (new_lp - lp_flat[mb]).exp()

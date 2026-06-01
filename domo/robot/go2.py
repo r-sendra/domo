@@ -350,12 +350,12 @@ class Go2WalkEnv:
           robot.get_dofs_position() -> (N, D)  all DOF positions
           robot.get_dofs_velocity() -> (N, D)  all DOF velocities
         """
-        base_pos    = self.robot.get_pos().numpy()           # (N, 3)
-        base_quat   = self.robot.get_quat().numpy()          # (N, 4)
-        vel_world   = self.robot.get_vel().numpy()           # (N, 3)
-        angv_world  = self.robot.get_ang().numpy()           # (N, 3)
-        dof_pos_all = self.robot.get_dofs_position().numpy() # (N, D)
-        dof_vel_all = self.robot.get_dofs_velocity().numpy() # (N, D)
+        base_pos    = self.robot.get_pos().cpu().numpy()           # (N, 3)
+        base_quat   = self.robot.get_quat().cpu().numpy()          # (N, 4)
+        vel_world   = self.robot.get_vel().cpu().numpy()           # (N, 3)
+        angv_world  = self.robot.get_ang().cpu().numpy()           # (N, 3)
+        dof_pos_all = self.robot.get_dofs_position().cpu().numpy() # (N, D)
+        dof_vel_all = self.robot.get_dofs_velocity().cpu().numpy() # (N, D)
 
         # World-frame velocities → body frame
         base_lin_vel = quat_rotate_inverse(base_quat, vel_world)    # (N, 3)
@@ -473,7 +473,7 @@ class Go2WalkEnv:
     # on the very first call to step(). Fixed by restoring correct 4-space
     # class-level indentation throughout this method.
     def _compute_done(self, obs: np.ndarray) -> np.ndarray:
-        height    = self.robot.get_pos().numpy()[:, 2]   # (N,)
+        height    = self.robot.get_pos().cpu().numpy()[:, 2]   # (N,)
         proj_grav = obs[:, 6:9]                          # (N, 3)
 
         done_fallen  = height < 0.15

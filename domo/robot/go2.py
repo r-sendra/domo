@@ -170,7 +170,8 @@ class Go2WalkEnv:
 
         backend = gs.cuda if device == "cuda" else gs.cpu
         # --- Genesis initialisation ---
-        gs.init(backend=gs.cuda, logging_level="warning")
+        gs.init(backend=gs.cpu, logging_level="warning")
+        # gs.init(backend=gs.cuda, logging_level="warning")
 
         self.scene = gs.Scene(
             viewer_options=gs.options.ViewerOptions(

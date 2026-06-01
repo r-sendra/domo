@@ -409,6 +409,11 @@ class PPOTrainer:
         cfg = self.cfg
 
         obs_flat, act_flat, lp_flat, adv_flat, ret_flat, val_flat = self.buf.get_flat()
+        # DEBUG
+        print(f"lp_flat  — mean: {lp_flat.mean():.4f}  std: {lp_flat.std():.4f}  device: {lp_flat.device}")
+        print(f"adv_flat — mean: {adv_flat.mean():.4f}  std: {adv_flat.std():.4f}")
+        print(f"ret_flat — mean: {ret_flat.mean():.4f}  std: {ret_flat.std():.4f}")
+        print(f"obs_flat — mean: {obs_flat.mean():.4f}  device: {obs_flat.device}")
 
         # Normalise advantages across the full rollout
         adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
@@ -517,7 +522,8 @@ class PPOTrainer:
 # ==========================================================================
 
 def evaluate(checkpoint_path: str, n_episodes: int = 10):
-    ckpt = torch.load(checkpoint_path, weights_only=False)
+    map_location = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt = torch.load(checkpoint_path, weights_only=False, map_location=map_location)
     cfg  = ckpt["config"]
 
     # FIX 3: Use renamed Go2WalkEnv

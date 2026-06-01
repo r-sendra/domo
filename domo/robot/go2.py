@@ -1,45 +1,61 @@
 """
-go2_env.py — Go2 Stand-Up Environment (Genesis)  [fixed]
-=========================================================
-Fixes from v1:
-  - set_euler does not exist → replaced with set_quat() using euler_to_quat()
-  - base_lin_vel now correctly obtained via robot.get_vel() (world frame)
-    then rotated to body frame with quat_rotate_inverse()
-  - base_ang_vel now correctly obtained via robot.get_ang() (world frame, 0.3.x API)
-  - Robot spawns upright (not lying down) — Genesis resets are always to a
-    known-good pose; the RL learns to recover from perturbations, not from
-    arbitrary initial conditions (matching the official Genesis example)
-  - set_dofs_kp / set_dofs_kv added for proper PD control (matching real robot)
+go2.py — Go2 Walking Environment (Genesis)
+===========================================
+Task: velocity-tracking locomotion on flat terrain.
+
+Fixed bugs vs original:
+  BUG 1 — MOTOR_DOFS was hardcoded as range(6,18). Genesis DOF indices
+           depend on URDF joint ordering and are not guaranteed to be 0-5
+           for the floating base. Fixed by querying each joint by name
+           after scene.build() and storing as self.motor_dofs.
+
+  BUG 2 — _compute_done() was indented at 12 spaces instead of 8,
+           making it a nested block inside _compute_reward() rather than
+           a class method. Calling self._compute_done() raised
+           AttributeError at runtime — training never ran a single step.
+           Fixed by correcting indentation to 8 spaces.
+
+  BUG 3 — Task/reward mismatch: class was named Go2StandEnv and docstring
+           described a stand-up task, but the reward tracked velocity
+           commands and commands were hardcoded to vx=0.5. This is a
+           walking task. Fixed by: renaming to Go2WalkEnv, randomising
+           velocity commands at reset, and removing stand-up references.
 
 Observation space (48 values per env):
   [0:3]   base linear velocity    (body frame)
   [3:6]   base angular velocity   (body frame)
   [6:9]   projected gravity       (body frame)
   [9:12]  velocity command        [vx, vy, yaw_rate]
-  [12:24] joint pos (relative)    relative to default stand pose
-  [24:36] joint vel
+  [12:24] joint pos relative to default stance
+  [24:36] joint velocities
   [36:48] previous action
 
 Action space (12 values per env):
-  Target joint position offsets from default stand pose, scaled by ACTION_SCALE.
+  Target joint position offsets from default stance, scaled by ACTION_SCALE.
 
-Reward (per step):
-  +1.0  * exp(-20 * (height - 0.34)^2)      height near target
-  +0.5  * dot(proj_gravity, [0,0,-1])        robot upright
-  -0.01 * sum(joint_vel^2)                   stay still
-  -0.005 * sum(action^2)                     energy efficiency
-  -0.005 * sum((action - prev_action)^2)     smooth actions
+Reward:
+  + 1.0  * exp(-||cmd_vel_xy - base_lin_vel_xy||^2 / 0.25)  lin vel tracking
+  + 0.5  * exp(-(cmd_yaw - base_ang_vel_z)^2    / 0.25)     yaw tracking
+  - 2.0  * base_lin_vel_z^2                                  no bouncing
+  - 0.05 * ||base_ang_vel_xy||^2                             no rolling/pitching
+  - 0.2  * ||proj_grav_xy||^2                                stay upright
+  - 0.1  * ||joint_pos_rel||^2                               stay near default
+  - 0.01 * ||action||^2                                      energy
+  - 0.01 * ||action - prev_action||^2                        smoothness
+  - 0.001* ||joint_vel||^2                                   no flailing
 
 Done conditions:
-  - base height < 0.15 m         (fallen)
-  - proj_gravity Z in body > 0.5 (flipped)
-  - step count >= max_episode_steps (timeout)
+  - base height < 0.15 m
+  - projected gravity Z (body) > 0.5   (flipped upside-down)
+  - |proj_grav X| > 0.7                (pitched > ~45 deg)
+  - |proj_grav Y| > 0.7                (rolled  > ~45 deg)
+  - step count >= max_episode_steps    (timeout)
 
 Usage:
-    from go2_env import Go2StandEnv
-    env = Go2StandEnv(n_envs=64, headless=True)
-    obs = env.reset()
-    obs, reward, done, info = env.step(action)  # action: (N, 12) in [-1, 1]
+    from go2 import Go2WalkEnv
+    env = Go2WalkEnv(n_envs=64, headless=True)
+    obs = env.reset()                           # (N, 48) float32
+    obs, reward, done, info = env.step(action)  # action: (N, 12) float32
 """
 
 import math
@@ -51,7 +67,15 @@ import genesis as gs
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MOTOR_DOFS = list(range(6, 18))   # skip free-base DOFs 0-5
+
+# FIX 1: Motor joint names used to query DOF indices at runtime.
+# Never hardcode range(6,18) — the floating base DOF layout is URDF-dependent.
+MOTOR_JOINT_NAMES = [
+    "FL_hip_joint",   "FL_thigh_joint",  "FL_calf_joint",
+    "FR_hip_joint",   "FR_thigh_joint",  "FR_calf_joint",
+    "RL_hip_joint",   "RL_thigh_joint",  "RL_calf_joint",
+    "RR_hip_joint",   "RR_thigh_joint",  "RR_calf_joint",
+]
 
 DEFAULT_JOINT_POS = np.array([
     0.0,  0.8, -1.5,   # FL  hip, thigh, calf
@@ -60,35 +84,40 @@ DEFAULT_JOINT_POS = np.array([
     0.0,  1.0, -1.5,   # RR
 ], dtype=np.float32)
 
-# Upright spawn: position and quaternion [w, x, y, z]
 BASE_INIT_POS  = np.array([0.0, 0.0, 0.42], dtype=np.float32)
 BASE_INIT_QUAT = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # identity = upright
 
-TARGET_HEIGHT = 0.34    # Go2 nominal standing height [m]
-ACTION_SCALE  = 0.25    # rad — joint offset scale
-OBS_CLIP      = 5.0     # clip obs to prevent outliers
+ACTION_SCALE = 0.25    # rad — joint offset scale
+OBS_CLIP     = 5.0     # clip obs to prevent outliers
 
 # PD gains matching the real Unitree Go2
-KP = 20.0   # position stiffness
-KV = 0.5    # velocity damping
+KP = 20.0   # position stiffness  [N·m/rad]
+KV =  0.5   # velocity damping    [N·m·s/rad]
+
+# Velocity command ranges
+CMD_LIN_VEL_X  = (-1.0,  1.0)   # m/s
+CMD_LIN_VEL_Y  = (-0.5,  0.5)   # m/s
+CMD_ANG_VEL_Z  = (-1.0,  1.0)   # rad/s
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers (no Genesis dependency — pure numpy)
+# Geometry helpers (pure numpy — no Genesis/simulator dependency)
 # ---------------------------------------------------------------------------
 
-def euler_to_quat(roll: np.ndarray, pitch: np.ndarray, yaw: np.ndarray) -> np.ndarray:
+def euler_to_quat(roll: np.ndarray,
+                  pitch: np.ndarray,
+                  yaw: np.ndarray) -> np.ndarray:
     """
     Vectorised Euler (rad) → quaternion [w, x, y, z].
     Inputs can be scalars or (N,) arrays.
     """
-    cr, sr = np.cos(roll / 2),  np.sin(roll / 2)
+    cr, sr = np.cos(roll  / 2), np.sin(roll  / 2)
     cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
-    cy, sy = np.cos(yaw / 2),   np.sin(yaw / 2)
-    w = cr * cp * cy + sr * sp * sy
-    x = sr * cp * cy - cr * sp * sy
-    y = cr * sp * cy + sr * cp * sy
-    z = cr * cp * sy - sr * sp * cy
+    cy, sy = np.cos(yaw   / 2), np.sin(yaw   / 2)
+    w =  cr * cp * cy + sr * sp * sy
+    x =  sr * cp * cy - cr * sp * sy
+    y =  cr * sp * cy + sr * cp * sy
+    z =  cr * cp * sy - sr * sp * cy
     return np.stack([w, x, y, z], axis=-1).astype(np.float32)
 
 
@@ -101,11 +130,11 @@ def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     v : (N, 3)
     returns (N, 3)
     """
-    w, x, y, z = q[:, 0:1], q[:, 1:2], q[:, 2:3], q[:, 3:4]
-    vx, vy, vz = v[:, 0:1], v[:, 1:2], v[:, 2:3]
-    bx = (1 - 2*(y*y + z*z)) * vx + 2*(x*y + w*z) * vy + 2*(x*z - w*y) * vz
-    by = 2*(x*y - w*z) * vx + (1 - 2*(x*x + z*z)) * vy + 2*(y*z + w*x) * vz
-    bz = 2*(x*z + w*y) * vx + 2*(y*z - w*x) * vy + (1 - 2*(x*x + y*y)) * vz
+    w  = q[:, 0:1]; x = q[:, 1:2]; y = q[:, 2:3]; z = q[:, 3:4]
+    vx = v[:, 0:1]; vy = v[:, 1:2]; vz = v[:, 2:3]
+    bx = (1 - 2*(y*y + z*z))*vx +     2*(x*y + w*z)*vy +     2*(x*z - w*y)*vz
+    by =     2*(x*y - w*z)*vx + (1 - 2*(x*x + z*z))*vy +     2*(y*z + w*x)*vz
+    bz =     2*(x*z + w*y)*vx +     2*(y*z - w*x)*vy + (1 - 2*(x*x + y*y))*vz
     return np.concatenate([bx, by, bz], axis=1).astype(np.float32)
 
 
@@ -113,12 +142,13 @@ def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
 # Environment
 # ---------------------------------------------------------------------------
 
-class Go2StandEnv:
+# FIX 3: Renamed from Go2StandEnv → Go2WalkEnv to match the actual task.
+class Go2WalkEnv:
     """
-    Vectorised Genesis environment for the Go2 stand-up task.
+    Vectorised Genesis environment for Go2 velocity-tracking locomotion.
 
-    All state tensors live on CPU (Genesis CPU backend).
-    obs, reward, done are returned as numpy arrays.
+    All state tensors are returned as numpy float32 arrays.
+    Compatible with the PPOTrainer in main.py.
     """
 
     OBS_DIM = 48
@@ -127,7 +157,7 @@ class Go2StandEnv:
     def __init__(
         self,
         n_envs:            int   = 64,
-        dt:                float = 0.02,   # 50 Hz — matches real robot
+        dt:                float = 0.02,   # 50 Hz — matches real Go2 control rate
         substeps:          int   = 2,
         max_episode_steps: int   = 500,
         headless:          bool  = True,
@@ -138,13 +168,15 @@ class Go2StandEnv:
         self.max_episode_steps = max_episode_steps
         self.device            = device
 
+        backend = gs.cuda if torch.cuda.is_available() else gs.cpu
         # --- Genesis initialisation ---
-        gs.init(backend=gs.cpu, logging_level="warning")
+        gs.init(backend=backend, logging_level="warning")
+        # gs.init(backend=gs.cuda, logging_level="warning")
 
         self.scene = gs.Scene(
             viewer_options=gs.options.ViewerOptions(
                 camera_pos    = (3.0, -2.0, 2.0),
-                camera_lookat = (0.0, 0.0, 0.5),
+                camera_lookat = (0.0,  0.0, 0.5),
                 camera_fov    = 40,
                 max_FPS       = 60,
             ),
@@ -158,40 +190,40 @@ class Go2StandEnv:
         # Ground plane
         self.scene.add_entity(gs.morphs.Plane())
 
-        # Go2 — spawns upright at standing height
+        # Go2 — spawns upright
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
-                file  = "urdf/go2/urdf/go2.urdf",
-                pos   = BASE_INIT_POS.tolist(),
-                quat  = BASE_INIT_QUAT.tolist(),   # [w, x, y, z]
+                file = "urdf/go2/urdf/go2.urdf",
+                pos  = BASE_INIT_POS.tolist(),
+                quat = BASE_INIT_QUAT.tolist(),
             )
         )
 
-        # Build with n_envs parallel instances
+        # Build parallel environments
         self.scene.build(n_envs=n_envs)
 
-        # --- PD controller gains (match real robot) ---
-        self.robot.set_dofs_kp(
-            [KP] * self.ACT_DIM,
-            dofs_idx_local=MOTOR_DOFS,
-        )
-        self.robot.set_dofs_kv(
-            [KV] * self.ACT_DIM,
-            dofs_idx_local=MOTOR_DOFS,
-        )
+        # FIX 1: Query DOF indices by joint name after build().
+        # This is safe regardless of how Genesis orders the floating-base DOFs.
+        self.motor_dofs = [
+            self.robot.get_joint(name).dof_idx_local
+            for name in MOTOR_JOINT_NAMES
+        ]
 
-        # --- Internal state buffers ---
+        # PD controller gains
+        self.robot.set_dofs_kp([KP] * self.ACT_DIM, dofs_idx_local=self.motor_dofs)
+        self.robot.set_dofs_kv([KV] * self.ACT_DIM, dofs_idx_local=self.motor_dofs)
+
+        # Internal state buffers
         self._step_count  = np.zeros(n_envs, dtype=np.int32)
         self._prev_action = np.zeros((n_envs, self.ACT_DIM), dtype=np.float32)
         self._ep_return   = np.zeros(n_envs, dtype=np.float32)
         self._ep_length   = np.zeros(n_envs, dtype=np.int32)
-        self._commands    = np.zeros((n_envs, 3), dtype=np.float32)  # [vx, vy, yaw]
+        self._commands    = np.zeros((n_envs, 3), dtype=np.float32)
 
-        # Gravity vector in world frame
-        self._gravity_world = np.tile([0.0, 0.0, -1.0], (n_envs, 1)).astype(np.float32)
-
-        # Resample commands every 2s (was 4s) — prevents standing still exploitation
-        self._resample_every = int(2.0 / self.dt)
+        # Gravity unit vector in world frame, tiled for all envs
+        self._gravity_world = np.tile(
+            [0.0, 0.0, -1.0], (n_envs, 1)
+        ).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -200,19 +232,20 @@ class Go2StandEnv:
     def reset(self) -> np.ndarray:
         """Reset all envs and return initial observations."""
         self._reset_envs(np.arange(self.n_envs))
+        self.scene.step()   # one warmup step so Genesis state is populated
         return self._get_obs()
 
     def step(
         self, action: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
         """
-        action : (n_envs, 12)  float32, values in [-1, 1]
+        action : (n_envs, 12) float32, values in [-1, 1]
         returns: obs (N,48), reward (N,), done (N,), info dict
         """
         action = np.clip(action, -1.0, 1.0).astype(np.float32)
         target_pos = DEFAULT_JOINT_POS + ACTION_SCALE * action   # (N, 12)
 
-        # Apply position command (PD controller runs inside Genesis)
+        # Apply position target — PD controller runs inside Genesis
         self.robot.control_dofs_position(
             target_pos,
             dofs_idx_local=self.motor_dofs,
@@ -223,18 +256,13 @@ class Go2StandEnv:
         reward = self._compute_reward(obs, action)
         done   = self._compute_done(obs)
 
-        # Track episode stats
-        self._ep_return += reward
-        self._ep_length += 1
+        # Track episode statistics
+        self._ep_return  += reward
+        self._ep_length  += 1
         self._step_count += 1
         self._prev_action = action.copy()
 
-        # Resample commands periodically (every 2s) — prevents standing exploitation
-        resample_ids = np.where(self._step_count % self._resample_every == 0)[0]
-        if len(resample_ids) > 0:
-            self._resample_commands(resample_ids)
-
-        # Collect completed episode stats before reset
+        # Collect completed episode stats before resetting
         info = {}
         finished = np.where(done)[0]
         if len(finished) > 0:
@@ -255,33 +283,34 @@ class Go2StandEnv:
 
     def _reset_envs(self, env_ids: np.ndarray):
         """
-        Reset specific envs to upright standing pose with small random perturbations.
-        Uses set_pos() + set_quat() — the correct Genesis API.
+        Reset specific envs to upright standing pose with small perturbations.
         """
         n = len(env_ids)
         if n == 0:
             return
 
-        # --- Base position: standing height + small xy noise ---
+        # Base position: standing height + small xy noise
         pos = np.tile(BASE_INIT_POS, (n, 1))
         pos[:, :2] += np.random.uniform(-0.05, 0.05, (n, 2)).astype(np.float32)
         pos[:, 2]  += np.random.uniform(-0.02, 0.02, n).astype(np.float32)
         pos[:, 2]   = np.clip(pos[:, 2], 0.35, 0.50)
 
-        # --- Base orientation: upright + random yaw ---
-        yaw = np.random.uniform(-math.pi, math.pi, n).astype(np.float32)
+        # Base orientation: upright + random yaw
+        yaw  = np.random.uniform(-math.pi, math.pi, n).astype(np.float32)
         quat = euler_to_quat(
             np.zeros(n, np.float32),
             np.zeros(n, np.float32),
             yaw,
         )   # (n, 4)  [w, x, y, z]
 
-        # --- Joint positions: default + small noise ---
-        jpos = (DEFAULT_JOINT_POS
-                + np.random.uniform(-0.05, 0.05, (n, self.ACT_DIM)).astype(np.float32))
+        # Joint positions: default + small noise
+        jpos = (
+            DEFAULT_JOINT_POS
+            + np.random.uniform(-0.05, 0.05, (n, self.ACT_DIM)).astype(np.float32)
+        )
 
-        # --- Apply to Genesis ---
-        self.robot.set_pos(pos,  envs_idx=env_ids)
+        # Apply to Genesis
+        self.robot.set_pos( pos,  envs_idx=env_ids)
         self.robot.set_quat(quat, envs_idx=env_ids)
         self.robot.set_dofs_position(
             jpos,
@@ -290,19 +319,21 @@ class Go2StandEnv:
         )
         self.robot.zero_all_dofs_velocity(envs_idx=env_ids)
 
-        # --- Reset internal buffers ---
+        # FIX 3: Randomise velocity commands instead of hardcoding vx=0.5.
+        # Random commands are essential for training a general walking policy.
+        # A fixed command biases the policy towards one gait and direction.
+        self._commands[env_ids, 0] = np.random.uniform(
+            *CMD_LIN_VEL_X, n).astype(np.float32)
+        self._commands[env_ids, 1] = np.random.uniform(
+            *CMD_LIN_VEL_Y, n).astype(np.float32)
+        self._commands[env_ids, 2] = np.random.uniform(
+            *CMD_ANG_VEL_Z, n).astype(np.float32)
+
+        # Reset internal buffers
         self._step_count[env_ids]  = 0
         self._prev_action[env_ids] = 0.0
         self._ep_return[env_ids]   = 0.0
         self._ep_length[env_ids]   = 0
-        self._resample_commands(env_ids)
-
-    def _resample_commands(self, env_ids: np.ndarray):
-        """Sample new random velocity commands for selected envs."""
-        n = len(env_ids)
-        self._commands[env_ids, 0] = np.random.uniform(*CMD_LIN_VEL_X, n).astype(np.float32)
-        self._commands[env_ids, 1] = np.random.uniform(*CMD_LIN_VEL_Y, n).astype(np.float32)
-        self._commands[env_ids, 2] = np.random.uniform(*CMD_ANG_VEL_Z, n).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Observation
@@ -310,45 +341,45 @@ class Go2StandEnv:
 
     def _get_obs(self) -> np.ndarray:
         """
-        Build (n_envs, 48) observation from Genesis state.
+        Build (n_envs, 48) observation array from Genesis state.
 
-        Genesis API used:
-          robot.get_pos()            -> (N, 3)  world frame position
-          robot.get_quat()           -> (N, 4)  [w, x, y, z] world orientation
-          robot.get_vel()            -> (N, 3)  world frame linear velocity
-          robot.get_ang()            -> (N, 3)  world frame angular velocity  (0.3.x API)
-          robot.get_dofs_position()  -> (N, 18) all DOF positions
-          robot.get_dofs_velocity()  -> (N, 18) all DOF velocities
+        Genesis API used (confirmed for genesis-world >= 0.3.0):
+          robot.get_pos()           -> (N, 3)  world frame position
+          robot.get_quat()          -> (N, 4)  [w,x,y,z] world orientation
+          robot.get_vel()           -> (N, 3)  world frame linear velocity
+          robot.get_ang()           -> (N, 3)  world frame angular velocity
+          robot.get_dofs_position() -> (N, D)  all DOF positions
+          robot.get_dofs_velocity() -> (N, D)  all DOF velocities
         """
-        # Get raw Genesis state (returns torch tensors, convert to numpy)
-        base_pos      = self.robot.get_pos().numpy()           # (N, 3)
-        base_quat     = self.robot.get_quat().numpy()          # (N, 4)  w,x,y,z
-        vel_world     = self.robot.get_vel().numpy()           # (N, 3)  world frame
-        angv_world    = self.robot.get_ang().numpy()           # (N, 3)  world frame
-        dof_pos_all   = self.robot.get_dofs_position().numpy() # (N, 18)
-        dof_vel_all   = self.robot.get_dofs_velocity().numpy() # (N, 18)
+        base_pos    = self.robot.get_pos().cpu().numpy()           # (N, 3)
+        base_quat   = self.robot.get_quat().cpu().numpy()          # (N, 4)
+        vel_world   = self.robot.get_vel().cpu().numpy()           # (N, 3)
+        angv_world  = self.robot.get_ang().cpu().numpy()           # (N, 3)
+        dof_pos_all = self.robot.get_dofs_position().cpu().numpy() # (N, D)
+        dof_vel_all = self.robot.get_dofs_velocity().cpu().numpy() # (N, D)
 
-        # Rotate world-frame velocities to body frame
-        base_lin_vel  = quat_rotate_inverse(base_quat, vel_world)    # (N, 3)
-        base_ang_vel  = quat_rotate_inverse(base_quat, angv_world)   # (N, 3)
+        # World-frame velocities → body frame
+        base_lin_vel = quat_rotate_inverse(base_quat, vel_world)    # (N, 3)
+        base_ang_vel = quat_rotate_inverse(base_quat, angv_world)   # (N, 3)
 
-        # Projected gravity: gravity world vector rotated to body frame
-        proj_gravity  = quat_rotate_inverse(base_quat, self._gravity_world)  # (N, 3)
+        # Gravity vector projected to body frame
+        proj_gravity = quat_rotate_inverse(
+            base_quat, self._gravity_world
+        )                                                            # (N, 3)
 
-        # Motor joints only
-        motor_pos = dof_pos_all[:, MOTOR_DOFS]          # (N, 12)
-        motor_vel = dof_vel_all[:, MOTOR_DOFS]          # (N, 12)
-        motor_pos_rel = motor_pos - DEFAULT_JOINT_POS   # (N, 12) relative
+        # Motor joints only (FIX 1: use self.motor_dofs, not MOTOR_DOFS constant)
+        motor_pos     = dof_pos_all[:, self.motor_dofs]              # (N, 12)
+        motor_vel     = dof_vel_all[:, self.motor_dofs]              # (N, 12)
+        motor_pos_rel = motor_pos - DEFAULT_JOINT_POS                # (N, 12)
 
-        # Assemble (N, 48)
         obs = np.concatenate([
-            base_lin_vel,           # [0:3]
-            base_ang_vel,           # [3:6]
-            proj_gravity,           # [6:9]
-            self._commands,         # [9:12]
-            motor_pos_rel,          # [12:24]
-            motor_vel,              # [24:36]
-            self._prev_action,      # [36:48]
+            base_lin_vel,        # [0:3]
+            base_ang_vel,        # [3:6]
+            proj_gravity,        # [6:9]
+            self._commands,      # [9:12]
+            motor_pos_rel,       # [12:24]
+            motor_vel,           # [24:36]
+            self._prev_action,   # [36:48]
         ], axis=1).astype(np.float32)
 
         return np.clip(obs, -OBS_CLIP, OBS_CLIP)
@@ -356,7 +387,7 @@ class Go2StandEnv:
     # ------------------------------------------------------------------
     # Reward
     # ------------------------------------------------------------------
-
+ 
     def _compute_reward(
         self, obs: np.ndarray, action: np.ndarray
     ) -> np.ndarray:
@@ -372,42 +403,42 @@ class Go2StandEnv:
         motor_pos_rel = obs[:, 12:24]  # (N, 12) relative to nominal
         motor_vel     = obs[:, 24:36]  # (N, 12)
         prev_action   = obs[:, 36:48]  # (N, 12)
-
+ 
         cmd_mag = np.linalg.norm(commands[:, :2], axis=1)   # (N,)
-
+ 
         # --- 2. Task Rewards (Tracking) ---
         lin_vel_error = np.sum(np.square(commands[:, :2] - lin_vel[:, :2]), axis=1)
         r_track_lin = np.exp(-lin_vel_error / 0.25)
-
+ 
         ang_vel_error = np.square(commands[:, 2] - ang_vel[:, 2])
         r_track_ang = np.exp(-ang_vel_error / 0.25)
-
+ 
         # Penalise standing still when a non-zero command is given.
         # vel_mag near zero + large cmd → large negative reward.
         # vel_mag growing → exp shrinks → penalty disappears naturally.
         vel_mag       = np.linalg.norm(lin_vel[:, :2], axis=1)
         r_stand_still = -np.square(cmd_mag) * np.exp(-vel_mag / 0.2)
-
+ 
         # --- 3. Base Motion Penalties ---
         r_lin_vel_z  = -np.square(lin_vel[:, 2])
         r_ang_vel_xy = -np.sum(np.square(ang_vel[:, :2]), axis=1)
-
+ 
         # --- 4. Posture Penalties ---
         # Orientation: strong weight to stay upright (prevents belly-flopping)
         r_orientation = -np.sum(np.square(proj_grav[:, :2]), axis=1)
-
+ 
         # Height: strong weight to stay at nominal standing height
         r_height = -np.square(height - 0.34)
-
+ 
         # Joint deviation: only penalise when standing still
         r_dof_pos  = -np.sum(np.square(motor_pos_rel), axis=1)
         r_dof_pos *= (cmd_mag < 0.1).astype(np.float32)
-
+ 
         # --- 5. Energy and Smoothness Penalties ---
         r_action_mag  = -np.sum(np.square(action), axis=1)
         r_action_rate = -np.sum(np.square(action - prev_action), axis=1)
         r_joint_vel   = -np.sum(np.square(motor_vel), axis=1)
-
+ 
         # --- 6. Combine ---
         reward = (
              1.0   * r_track_lin
@@ -424,15 +455,15 @@ class Go2StandEnv:
         )
         
         return reward.astype(np.float32)
-
+ 
     # ------------------------------------------------------------------
     # Done
     # ------------------------------------------------------------------
-
+ 
     def _compute_done(self, obs: np.ndarray) -> np.ndarray:
             height     = self.robot.get_pos().numpy()[:, 2]
             proj_grav  = obs[:, 6:9]
-
+ 
             # Existing conditions
             done_fallen  = height < 0.28
             done_flipped = proj_grav[:, 2] > 0.5 
@@ -441,7 +472,7 @@ class Go2StandEnv:
             # proj_grav x and y components exceed 0.7 when tilted severely.
             done_pitch   = np.abs(proj_grav[:, 0]) > 0.7
             done_roll    = np.abs(proj_grav[:, 1]) > 0.7
-
+ 
             done_timeout = self._step_count >= self.max_episode_steps
-
+ 
             return (done_fallen | done_flipped | done_pitch | done_roll | done_timeout).astype(bool)

@@ -576,11 +576,11 @@ def get_config(args) -> dict:
         # Environment
         n_envs             = n_envs,
         dt                 = 0.02,
-        max_episode_steps  = 2000,
+        max_episode_steps  = 1000,
         headless           = args.headless,
 
         # Network
-        hidden_size        = 256,
+        hidden_size        = 512,
 
         # PPO
         total_steps        = args.total_steps,
@@ -590,9 +590,9 @@ def get_config(args) -> dict:
         gamma              = 0.99,
         lam                = 0.95,
         clip_eps           = 0.2,
-        lr                 = 1e-4,
+        lr                 = 3e-4,
         vf_coef            = 0.5,
-        ent_coef           = 0.005,
+        ent_coef           = 0.01,
         max_grad_norm      = 1.0,
 
         # Logging

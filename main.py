@@ -354,7 +354,7 @@ class PPOTrainer:
                 action_np = action_t.cpu().numpy()
 
                 self.buf.store_step(
-                    obs       = obs_t.detach()cpu().numpy(),
+                    obs       = obs_t.detach().cpu().numpy(),
                     actions   = action_np,
                     log_probs = log_prob_t.detach().cpu().numpy(),
                     values    = value_t.detach().cpu().numpy(),

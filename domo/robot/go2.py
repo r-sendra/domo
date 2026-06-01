@@ -395,7 +395,7 @@ class Go2WalkEnv:
         Walking Reward Function based on standard Legged Locomotion RL.
         """
         # --- 1. Extract states from observation ---
-        height        = self.robot.get_pos().cpu().numpy()[:, 2]   # (N,)
+        height        = self.robot.get_pos().detach().cpu().numpy()[:, 2]   # (N,)
         lin_vel       = obs[:, 0:3]    # (N, 3) body frame
         ang_vel       = obs[:, 3:6]    # (N, 3) body frame
         proj_grav     = obs[:, 6:9]    # (N, 3) projected gravity
@@ -461,7 +461,7 @@ class Go2WalkEnv:
     # ------------------------------------------------------------------
  
     def _compute_done(self, obs: np.ndarray) -> np.ndarray:
-            height     = self.robot.get_pos().numpy()[:, 2]
+            height     = self.robot.get_pos().detach().numpy()[:, 2]
             proj_grav  = obs[:, 6:9]
  
             # Existing conditions

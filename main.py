@@ -194,6 +194,7 @@ class PPOTrainer:
             max_episode_steps = cfg["max_episode_steps"],
             headless          = cfg["headless"],
             device            = cfg["device"],
+            terrain           = cfg["terrain"]
         )
 
         self.net = ActorCritic(
@@ -502,6 +503,7 @@ def get_config(args) -> dict:
         dt                 = 0.02,
         max_episode_steps  = 1000,
         headless           = args.headless,
+        terrain            = args.terrain,
 
         # Network
         hidden_size        = 512,
@@ -538,6 +540,8 @@ def main():
     parser.add_argument("--headless",      action="store_true", default=True)
     parser.add_argument("--resume",        type=str,  default=None)
     parser.add_argument("--eval",          type=str,  default=None)
+    parser.add_argument("--terrain", type=str, default="flat",
+                    choices=["flat", "rough"])
     args = parser.parse_args()
 
     if args.eval:

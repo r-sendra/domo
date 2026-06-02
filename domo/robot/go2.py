@@ -124,12 +124,15 @@ class Go2WalkEnv:
         max_episode_steps: int   = 1000,
         headless:          bool  = True,
         device:            str   = "cuda",
+        terrain:           str   = "flat", # Flat or Rough 
     ):
         self.n_envs            = n_envs
         self.num_envs          = n_envs   # alias used by some callers
         self.dt                = dt
         self.max_episode_steps = max_episode_steps
         self.device            = torch.device(device)
+        self.terrain_type = terrain
+        print(self.terrain_type)
 
         self.simulate_action_latency = True   # matches real Go2 hardware
 
@@ -217,10 +220,22 @@ class Go2WalkEnv:
         )
 
         # Ground
-        self.scene.add_entity(
-            gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True)
-        )
-
+        if self.terrain_type == "flat":
+            self.scene.add_entity(
+                gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True)
+            )
+        else:
+            self.terrain_entity = self.scene.add_entity(
+                gs.morphs.Terrain(
+                    n_subterrains    = (4, 4),
+                    subterrain_size  = (8.0, 8.0),     # larger tiles
+                    horizontal_scale = 0.25,
+                    vertical_scale   = 0.005,
+                    randomize        = True,
+                    pos              = (-16.0, -16.0, 0.0),  # center the 4×4 grid at origin
+                    subterrain_types = "random_uniform_terrain",  # all rough for now
+                )
+            )
         # Robot
         self.base_init_pos  = torch.tensor(
             self.env_cfg["base_init_pos"],  device=self.device
@@ -239,6 +254,23 @@ class Go2WalkEnv:
         )
 
         self.scene.build(n_envs=n_envs)
+
+        if self.terrain_type != "flat":
+            n_cols, n_rows = 4, 4
+            tile_w, tile_h = 8.0, 8.0
+            offsets = []
+            for i in range(self.n_envs):
+                row = (i // n_cols) % n_rows
+                col = i % n_cols
+                # Spawn in centre of each tile, accounting for terrain pos offset
+                x = -16.0 + (col + 0.5) * tile_w
+                y = -16.0 + (row + 0.5) * tile_h
+                offsets.append([x, y, 0.5])
+            self.spawn_positions = torch.tensor(
+                offsets, device=self.device, dtype=gs.tc_float
+            )
+        else:
+            self.spawn_positions = None
 
         # Motor DOF indices
         self.motor_dofs = [
@@ -362,6 +394,8 @@ class Go2WalkEnv:
             torch.abs(self.base_euler[:, 0])
             > self.env_cfg["termination_if_roll_greater_than"]
         )
+        if self.terrain_type == "flat":
+            self.reset_buf |= self.base_pos[:, 2] < 0.20
 
         time_out_idx = (
             (self.episode_length_buf > self.max_episode_length)
@@ -397,6 +431,26 @@ class Go2WalkEnv:
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]
 
+        # if self.scene.viewer is not None:
+        #     robot_pos    = self.base_pos[0].cpu().numpy()
+        #     yaw          = self.base_euler[0, 2].item()
+        #     yaw = 90
+        #     cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+        #
+        #     # Side offset: 4m to the left of the robot's heading, 1.5m up
+        #     offset = np.array([
+        #         # -.0 * sin_y,   # perpendicular to heading
+        #         # .0 * cos_y,
+        #         1,
+        #         -1,
+        #         4.5,
+        #     ])
+        #     self.scene.viewer.set_camera_pose(
+        #         pos    = robot_pos + offset,
+        #         lookat = robot_pos,
+        #     )
+
+
         return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
 
     def reset(self):
@@ -429,7 +483,11 @@ class Go2WalkEnv:
         )
 
         # Reset base pose
-        self.base_pos[envs_idx]  = self.base_init_pos
+        if self.spawn_positions is not None:
+            self.base_pos[envs_idx] = self.spawn_positions[envs_idx]
+        else:
+            self.base_pos[envs_idx] = self.base_init_pos
+
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
         self.robot.set_pos(
             self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx

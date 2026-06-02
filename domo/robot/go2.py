@@ -3,476 +3,503 @@ go2.py — Go2 Walking Environment (Genesis)
 ===========================================
 Task: velocity-tracking locomotion on flat terrain.
 
-Fixed bugs vs original:
-  BUG 1 — MOTOR_DOFS was hardcoded as range(6,18). Genesis DOF indices
-           depend on URDF joint ordering and are not guaranteed to be 0-5
-           for the floating base. Fixed by querying each joint by name
-           after scene.build() and storing as self.motor_dofs.
+This version closely follows the official Genesis locomotion example
+(Genesis-Embodied-AI/Genesis/examples/locomotion/go2_env.py) while
+preserving our class name (Go2WalkEnv) and import structure.
 
-  BUG 2 — _compute_done() was indented at 12 spaces instead of 8,
-           making it a nested block inside _compute_reward() rather than
-           a class method. Calling self._compute_done() raised
-           AttributeError at runtime — training never ran a single step.
-           Fixed by correcting indentation to 8 spaces.
+Key differences from previous version that prevented walking:
+  1. Everything stays on GPU as torch tensors — no .numpy() in the
+     hot path. The previous version converted to numpy every step,
+     breaking GPU-native computation and causing subtle dtype issues.
 
-  BUG 3 — Task/reward mismatch: class was named Go2StandEnv and docstring
-           described a stand-up task, but the reward tracked velocity
-           commands and commands were hardcoded to vx=0.5. This is a
-           walking task. Fixed by: renaming to Go2WalkEnv, randomising
-           velocity commands at reset, and removing stand-up references.
+  2. simulate_action_latency = True — the real Go2 has a 1-step
+     delay between command and execution. Without this the policy
+     learns to exploit instantaneous control which does not transfer.
 
-Observation space (48 values per env):
-  [0:3]   base linear velocity    (body frame)
-  [3:6]   base angular velocity   (body frame)
-  [6:9]   projected gravity       (body frame)
-  [9:12]  velocity command        [vx, vy, yaw_rate]
-  [12:24] joint pos relative to default stance
-  [24:36] joint velocities
-  [36:48] previous action
+  3. base_init_quat = [0,0,0,1] — Genesis uses [x,y,z,w] quaternion
+     convention internally. The previous [1,0,0,0] was wrong for
+     Genesis and caused the robot to spawn with a twisted orientation.
+
+  4. RigidOptions with Newton constraint solver — matches the official
+     example and gives more stable contact simulation.
+
+  5. Termination uses base_euler (roll/pitch angles) from quat_to_xyz,
+     not projected gravity thresholds. More numerically stable.
+
+  6. Reward scales multiplied by dt at init — makes weights
+     timestep-independent (standard legged_gym practice).
+
+  7. Observation scaling: lin_vel*2.0, ang_vel*0.25, dof_vel*0.05.
+     Without scaling the obs values are in very different ranges which
+     hurts network learning.
+
+  8. performance_mode=True in gs.init for maximum GPU throughput.
+
+Observation space (45 values per env):
+  [0:3]   base angular velocity   (body frame, scaled *0.25)
+  [3:6]   projected gravity       (body frame)
+  [6:9]   velocity command        (scaled)
+  [9:21]  joint pos relative to default (scaled *1.0)
+  [21:33] joint velocities        (scaled *0.05)
+  [33:45] previous action
 
 Action space (12 values per env):
-  Target joint position offsets from default stance, scaled by ACTION_SCALE.
+  Target joint position offsets from default stance * action_scale.
 
-Reward:
-  + 1.0  * exp(-||cmd_vel_xy - base_lin_vel_xy||^2 / 0.25)  lin vel tracking
-  + 0.5  * exp(-(cmd_yaw - base_ang_vel_z)^2    / 0.25)     yaw tracking
-  - 2.0  * base_lin_vel_z^2                                  no bouncing
-  - 0.05 * ||base_ang_vel_xy||^2                             no rolling/pitching
-  - 0.2  * ||proj_grav_xy||^2                                stay upright
-  - 0.1  * ||joint_pos_rel||^2                               stay near default
-  - 0.01 * ||action||^2                                      energy
-  - 0.01 * ||action - prev_action||^2                        smoothness
-  - 0.001* ||joint_vel||^2                                   no flailing
+Reward (official Genesis 6-term set):
+  + 1.0  * exp(-||cmd_xy - lin_vel_xy||^2 / sigma)  lin vel tracking
+  + 0.2  * exp(-(cmd_yaw - ang_vel_z)^2  / sigma)   ang vel tracking
+  - 1.0  * lin_vel_z^2                               no bouncing
+  - 50.0 * (base_height - 0.34)^2                   stay at height
+  - 0.005* ||action - last_action||^2               smoothness
+  - 0.1  * ||dof_pos - default||                    near default pose
 
 Done conditions:
-  - base height < 0.15 m
-  - projected gravity Z (body) > 0.5   (flipped upside-down)
-  - |proj_grav X| > 0.7                (pitched > ~45 deg)
-  - |proj_grav Y| > 0.7                (rolled  > ~45 deg)
-  - step count >= max_episode_steps    (timeout)
-
-Usage:
-    from go2 import Go2WalkEnv
-    env = Go2WalkEnv(n_envs=64, headless=True)
-    obs = env.reset()                           # (N, 48) float32
-    obs, reward, done, info = env.step(action)  # action: (N, 12) float32
+  - episode_length > max_episode_length  (timeout)
+  - |pitch| > termination_if_pitch_greater_than (1.0 rad)
+  - |roll|  > termination_if_roll_greater_than  (1.0 rad)
 """
 
 import math
-import numpy as np
 import torch
+import numpy as np
 import genesis as gs
+from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat, transform_quat_by_quat
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# FIX 1: Motor joint names used to query DOF indices at runtime.
-# Never hardcode range(6,18) — the floating base DOF layout is URDF-dependent.
 MOTOR_JOINT_NAMES = [
-    "FL_hip_joint",   "FL_thigh_joint",  "FL_calf_joint",
     "FR_hip_joint",   "FR_thigh_joint",  "FR_calf_joint",
-    "RL_hip_joint",   "RL_thigh_joint",  "RL_calf_joint",
+    "FL_hip_joint",   "FL_thigh_joint",  "FL_calf_joint",
     "RR_hip_joint",   "RR_thigh_joint",  "RR_calf_joint",
+    "RL_hip_joint",   "RL_thigh_joint",  "RL_calf_joint",
 ]
 
-DEFAULT_JOINT_POS = np.array([
-    0.0,  0.8, -1.5,   # FL  hip, thigh, calf
-    0.0,  0.8, -1.5,   # FR
-    0.0,  1.0, -1.5,   # RL
-    0.0,  1.0, -1.5,   # RR
-], dtype=np.float32)
+# Default joint angles in MOTOR_JOINT_NAMES order
+DEFAULT_JOINT_ANGLES = {
+    "FR_hip_joint":    0.0,
+    "FR_thigh_joint":  0.8,
+    "FR_calf_joint":  -1.5,
+    "FL_hip_joint":    0.0,
+    "FL_thigh_joint":  0.8,
+    "FL_calf_joint":  -1.5,
+    "RR_hip_joint":    0.0,
+    "RR_thigh_joint":  1.0,
+    "RR_calf_joint":  -1.5,
+    "RL_hip_joint":    0.0,
+    "RL_thigh_joint":  1.0,
+    "RL_calf_joint":  -1.5,
+}
 
-BASE_INIT_POS  = np.array([0.0, 0.0, 0.42], dtype=np.float32)
-BASE_INIT_QUAT = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # identity = upright
-
-ACTION_SCALE = 0.25    # rad — joint offset scale
-OBS_CLIP     = 5.0     # clip obs to prevent outliers
-
-# PD gains matching the real Unitree Go2
-KP = 20.0   # position stiffness  [N·m/rad]
-KV =  0.5   # velocity damping    [N·m·s/rad]
-
-# Velocity command ranges
-CMD_LIN_VEL_X  = (-1.0,  1.0)   # m/s
-CMD_LIN_VEL_Y  = (-0.5,  0.5)   # m/s
-CMD_ANG_VEL_Z  = (-1.0,  1.0)   # rad/s
+# NOTE: Genesis uses [x, y, z, w] quaternion convention
+BASE_INIT_POS  = [0.0, 0.0, 0.42]
+BASE_INIT_QUAT = [0.0, 0.0, 0.0, 1.0]   # identity in [x,y,z,w]
 
 
-# ---------------------------------------------------------------------------
-# Geometry helpers (pure numpy — no Genesis/simulator dependency)
-# ---------------------------------------------------------------------------
-
-def euler_to_quat(roll: np.ndarray,
-                  pitch: np.ndarray,
-                  yaw: np.ndarray) -> np.ndarray:
-    """
-    Vectorised Euler (rad) → quaternion [w, x, y, z].
-    Inputs can be scalars or (N,) arrays.
-    """
-    cr, sr = np.cos(roll  / 2), np.sin(roll  / 2)
-    cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
-    cy, sy = np.cos(yaw   / 2), np.sin(yaw   / 2)
-    w =  cr * cp * cy + sr * sp * sy
-    x =  sr * cp * cy - cr * sp * sy
-    y =  cr * sp * cy + sr * cp * sy
-    z =  cr * cp * sy - sr * sp * cy
-    return np.stack([w, x, y, z], axis=-1).astype(np.float32)
-
-
-def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """
-    Rotate world-frame vectors v into body frame using quaternion q.
-    Equivalent to R(q)^T @ v.
-
-    q : (N, 4)  [w, x, y, z]
-    v : (N, 3)
-    returns (N, 3)
-    """
-    w  = q[:, 0:1]; x = q[:, 1:2]; y = q[:, 2:3]; z = q[:, 3:4]
-    vx = v[:, 0:1]; vy = v[:, 1:2]; vz = v[:, 2:3]
-    bx = (1 - 2*(y*y + z*z))*vx +     2*(x*y + w*z)*vy +     2*(x*z - w*y)*vz
-    by =     2*(x*y - w*z)*vx + (1 - 2*(x*x + z*z))*vy +     2*(y*z + w*x)*vz
-    bz =     2*(x*z + w*y)*vx +     2*(y*z - w*x)*vy + (1 - 2*(x*x + y*y))*vz
-    return np.concatenate([bx, by, bz], axis=1).astype(np.float32)
+def gs_rand_float(lower, upper, shape, device):
+    return (upper - lower) * torch.rand(size=shape, device=device) + lower
 
 
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
 
-# FIX 3: Renamed from Go2StandEnv → Go2WalkEnv to match the actual task.
 class Go2WalkEnv:
     """
     Vectorised Genesis environment for Go2 velocity-tracking locomotion.
-
-    All state tensors are returned as numpy float32 arrays.
-    Compatible with the PPOTrainer in main.py.
+    Follows the official Genesis go2_env.py example closely.
+    All internal state is kept as torch tensors on the simulation device.
     """
 
-    OBS_DIM = 48
+    OBS_DIM = 45
     ACT_DIM = 12
 
     def __init__(
         self,
-        n_envs:            int   = 64,
-        dt:                float = 0.02,   # 50 Hz — matches real Go2 control rate
-        substeps:          int   = 2,
-        max_episode_steps: int   = 500,
+        n_envs:            int   = 4096,
+        dt:                float = 0.02,
+        max_episode_steps: int   = 1000,
         headless:          bool  = True,
-        device:            str   = "cpu",
+        device:            str   = "cuda",
     ):
         self.n_envs            = n_envs
+        self.num_envs          = n_envs   # alias used by some callers
         self.dt                = dt
         self.max_episode_steps = max_episode_steps
-        self.device            = device
+        self.device            = torch.device(device)
 
+        self.simulate_action_latency = True   # matches real Go2 hardware
+
+        # ---- configs (mirrors official get_cfgs structure) ----
+        self.env_cfg = {
+            "num_actions":   12,
+            "base_init_pos":  BASE_INIT_POS,
+            "base_init_quat": BASE_INIT_QUAT,
+            "episode_length_s": max_episode_steps * dt,
+            "resampling_time_s": 4.0,
+            "action_scale":  0.25,
+            "clip_actions":  100.0,
+            "kp": 20.0,
+            "kd":  0.5,
+            "dof_names": MOTOR_JOINT_NAMES,
+            "default_joint_angles": DEFAULT_JOINT_ANGLES,
+            "termination_if_pitch_greater_than": 1.0,
+            "termination_if_roll_greater_than":  1.0,
+        }
+        self.obs_cfg = {
+            "num_obs": 45,
+            "obs_scales": {
+                "lin_vel":  2.0,
+                "ang_vel":  0.25,
+                "dof_pos":  1.0,
+                "dof_vel":  0.05,
+            },
+        }
+        self.reward_cfg = {
+            "tracking_sigma":     0.25,
+            "base_height_target": 0.34,
+            "reward_scales": {
+                "tracking_lin_vel": 1.0,
+                "tracking_ang_vel": 0.2,
+                "lin_vel_z":       -1.0,
+                "base_height":    -50.0,
+                "action_rate":    -0.005,
+                "similar_to_default": -0.1,
+            },
+        }
+        self.command_cfg = {
+            "num_commands": 3,
+            "lin_vel_x_range": [0.5, 0.5],   # fixed forward command (official)
+            "lin_vel_y_range": [0.0, 0.0],
+            "ang_vel_range":   [0.0, 0.0],
+        }
+
+        self.num_obs     = self.obs_cfg["num_obs"]
+        self.num_actions = self.env_cfg["num_actions"]
+        self.num_commands= self.command_cfg["num_commands"]
+        self.obs_scales  = self.obs_cfg["obs_scales"]
+        self.reward_scales = {
+            k: v * dt
+            for k, v in self.reward_cfg["reward_scales"].items()
+        }
+        self.max_episode_length = math.ceil(
+            self.env_cfg["episode_length_s"] / self.dt
+        )
+
+        # ---- Genesis init ----
         backend = gs.cuda if torch.cuda.is_available() else gs.cpu
-        # --- Genesis initialisation ---
-        gs.init(backend=backend, logging_level="warning")
-        # gs.init(backend=gs.cuda, logging_level="warning")
+        gs.init(
+            backend=backend,
+            precision="32",
+            logging_level="warning",
+            performance_mode=True,
+        )
 
         self.scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
             viewer_options=gs.options.ViewerOptions(
-                camera_pos    = (3.0, -2.0, 2.0),
-                camera_lookat = (0.0,  0.0, 0.5),
-                camera_fov    = 40,
-                max_FPS       = 60,
+                max_FPS=int(0.5 / self.dt),
+                camera_pos=(2.0, 0.0, 2.5),
+                camera_lookat=(0.0, 0.0, 0.5),
+                camera_fov=40,
             ),
-            sim_options=gs.options.SimOptions(
-                dt       = dt,
-                substeps = substeps,
+            vis_options=gs.options.VisOptions(n_rendered_envs=1),
+            rigid_options=gs.options.RigidOptions(
+                dt=self.dt,
+                constraint_solver=gs.constraint_solver.Newton,
+                enable_collision=True,
+                enable_joint_limit=True,
             ),
             show_viewer=not headless,
         )
 
-        # Ground plane
-        self.scene.add_entity(gs.morphs.Plane())
+        # Ground
+        self.scene.add_entity(
+            gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True)
+        )
 
-        # Go2 — spawns upright
+        # Robot
+        self.base_init_pos  = torch.tensor(
+            self.env_cfg["base_init_pos"],  device=self.device
+        )
+        self.base_init_quat = torch.tensor(
+            self.env_cfg["base_init_quat"], device=self.device
+        )
+        self.inv_base_init_quat = inv_quat(self.base_init_quat)
+
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
-                file = "urdf/go2/urdf/go2.urdf",
-                pos  = BASE_INIT_POS.tolist(),
-                quat = BASE_INIT_QUAT.tolist(),
+                file="urdf/go2/urdf/go2.urdf",
+                pos=self.base_init_pos.cpu().numpy(),
+                quat=self.base_init_quat.cpu().numpy(),
             )
         )
 
-        # Build parallel environments
         self.scene.build(n_envs=n_envs)
 
-        # FIX 1: Query DOF indices by joint name after build().
-        # This is safe regardless of how Genesis orders the floating-base DOFs.
+        # Motor DOF indices
         self.motor_dofs = [
             self.robot.get_joint(name).dof_idx_local
-            for name in MOTOR_JOINT_NAMES
+            for name in self.env_cfg["dof_names"]
         ]
 
-        # PD controller gains
-        self.robot.set_dofs_kp([KP] * self.ACT_DIM, dofs_idx_local=self.motor_dofs)
-        self.robot.set_dofs_kv([KV] * self.ACT_DIM, dofs_idx_local=self.motor_dofs)
+        # PD gains
+        self.robot.set_dofs_kp(
+            [self.env_cfg["kp"]] * self.num_actions, self.motor_dofs
+        )
+        self.robot.set_dofs_kv(
+            [self.env_cfg["kd"]] * self.num_actions, self.motor_dofs
+        )
 
-        # Internal state buffers
-        self._step_count  = np.zeros(n_envs, dtype=np.int32)
-        self._prev_action = np.zeros((n_envs, self.ACT_DIM), dtype=np.float32)
-        self._ep_return   = np.zeros(n_envs, dtype=np.float32)
-        self._ep_length   = np.zeros(n_envs, dtype=np.int32)
-        self._commands    = np.zeros((n_envs, 3), dtype=np.float32)
+        # Default joint positions tensor
+        self.default_dof_pos = torch.tensor(
+            [self.env_cfg["default_joint_angles"][n]
+             for n in self.env_cfg["dof_names"]],
+            device=self.device, dtype=gs.tc_float,
+        )
 
-        # Gravity unit vector in world frame, tiled for all envs
-        self._gravity_world = np.tile(
-            [0.0, 0.0, -1.0], (n_envs, 1)
-        ).astype(np.float32)
+        # Reward function registry
+        self.reward_functions = {}
+        self.episode_sums     = {}
+        for name in self.reward_scales:
+            self.reward_functions[name] = getattr(self, f"_reward_{name}")
+            self.episode_sums[name] = torch.zeros(
+                (n_envs,), device=self.device, dtype=gs.tc_float
+            )
+
+        # State buffers — all torch tensors on device
+        N = n_envs
+        f = gs.tc_float
+        self.base_lin_vel      = torch.zeros((N, 3), device=self.device, dtype=f)
+        self.base_ang_vel      = torch.zeros((N, 3), device=self.device, dtype=f)
+        self.projected_gravity = torch.zeros((N, 3), device=self.device, dtype=f)
+        self.global_gravity    = torch.tensor(
+            [0.0, 0.0, -1.0], device=self.device, dtype=f
+        ).repeat(N, 1)
+
+        self.obs_buf           = torch.zeros((N, self.num_obs), device=self.device, dtype=f)
+        self.rew_buf           = torch.zeros((N,),              device=self.device, dtype=f)
+        self.reset_buf         = torch.ones( (N,),              device=self.device, dtype=gs.tc_int)
+        self.episode_length_buf= torch.zeros((N,),              device=self.device, dtype=gs.tc_int)
+
+        self.commands          = torch.zeros((N, self.num_commands), device=self.device, dtype=f)
+        self.commands_scale    = torch.tensor(
+            [self.obs_scales["lin_vel"],
+             self.obs_scales["lin_vel"],
+             self.obs_scales["ang_vel"]],
+            device=self.device, dtype=f,
+        )
+
+        self.actions      = torch.zeros((N, self.num_actions), device=self.device, dtype=f)
+        self.last_actions = torch.zeros_like(self.actions)
+        self.dof_pos      = torch.zeros_like(self.actions)
+        self.dof_vel      = torch.zeros_like(self.actions)
+        self.last_dof_vel = torch.zeros_like(self.actions)
+        self.base_pos     = torch.zeros((N, 3), device=self.device, dtype=f)
+        self.base_quat    = torch.zeros((N, 4), device=self.device, dtype=f)
+        self.extras       = {}
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
-    def reset(self) -> np.ndarray:
-        """Reset all envs and return initial observations."""
-        self._reset_envs(np.arange(self.n_envs))
-        self.scene.step()   # one warmup step so Genesis state is populated
-        return self._get_obs()
-
-    def step(
-        self, action: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    def step(self, actions):
         """
-        action : (n_envs, 12) float32, values in [-1, 1]
-        returns: obs (N,48), reward (N,), done (N,), info dict
+        actions : Tensor [N, 12]  (torch, on device)
+        returns : obs_buf, None, rew_buf, reset_buf, extras
         """
-        action = np.clip(action, -1.0, 1.0).astype(np.float32)
-        target_pos = DEFAULT_JOINT_POS + ACTION_SCALE * action   # (N, 12)
-
-        # Apply position target — PD controller runs inside Genesis
-        self.robot.control_dofs_position(
-            target_pos,
-            dofs_idx_local=self.motor_dofs,
+        self.actions = torch.clip(
+            actions,
+            -self.env_cfg["clip_actions"],
+             self.env_cfg["clip_actions"],
         )
+
+        # 1-step action latency: execute last step's actions
+        exec_actions = (
+            self.last_actions if self.simulate_action_latency else self.actions
+        )
+        target_dof_pos = (
+            exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
+        )
+        self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
         self.scene.step()
 
-        obs    = self._get_obs()
-        reward = self._compute_reward(obs, action)
-        done   = self._compute_done(obs)
+        # Update state buffers
+        self.episode_length_buf += 1
+        self.base_pos[:]  = self.robot.get_pos()
+        self.base_quat[:] = self.robot.get_quat()
+        self.base_euler   = quat_to_xyz(
+            transform_quat_by_quat(
+                torch.ones_like(self.base_quat) * self.inv_base_init_quat,
+                self.base_quat,
+            )
+        )
+        inv_base_quat = inv_quat(self.base_quat)
+        self.base_lin_vel[:]      = transform_by_quat(self.robot.get_vel(), inv_base_quat)
+        self.base_ang_vel[:]      = transform_by_quat(self.robot.get_ang(), inv_base_quat)
+        self.projected_gravity[:] = transform_by_quat(self.global_gravity, inv_base_quat)
+        self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
+        self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
 
-        # Track episode statistics
-        self._ep_return  += reward
-        self._ep_length  += 1
-        self._step_count += 1
-        self._prev_action = action.copy()
+        # Resample commands periodically
+        resample_every = int(self.env_cfg["resampling_time_s"] / self.dt)
+        envs_idx = (
+            (self.episode_length_buf % resample_every == 0)
+            .nonzero(as_tuple=False).flatten()
+        )
+        self._resample_commands(envs_idx)
 
-        # Collect completed episode stats before resetting
-        info = {}
-        finished = np.where(done)[0]
-        if len(finished) > 0:
-            info["episode"] = {
-                "return": float(self._ep_return[finished].mean()),
-                "length": float(self._ep_length[finished].mean()),
-            }
-            self._reset_envs(finished)
+        # Termination
+        self.reset_buf = self.episode_length_buf > self.max_episode_length
+        self.reset_buf |= (
+            torch.abs(self.base_euler[:, 1])
+            > self.env_cfg["termination_if_pitch_greater_than"]
+        )
+        self.reset_buf |= (
+            torch.abs(self.base_euler[:, 0])
+            > self.env_cfg["termination_if_roll_greater_than"]
+        )
 
-        return obs, reward, done, info
+        time_out_idx = (
+            (self.episode_length_buf > self.max_episode_length)
+            .nonzero(as_tuple=False).flatten()
+        )
+        self.extras["time_outs"] = torch.zeros_like(
+            self.reset_buf, device=self.device, dtype=gs.tc_float
+        )
+        self.extras["time_outs"][time_out_idx] = 1.0
 
-    def close(self):
-        pass   # Genesis cleans up on process exit
+        self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
+
+        # Reward
+        self.rew_buf[:] = 0.0
+        for name, fn in self.reward_functions.items():
+            rew = fn() * self.reward_scales[name]
+            self.rew_buf += rew
+            self.episode_sums[name] += rew
+
+        # Observation
+        self.obs_buf = torch.cat(
+            [
+                self.base_ang_vel * self.obs_scales["ang_vel"],            # 3
+                self.projected_gravity,                                     # 3
+                self.commands * self.commands_scale,                        # 3
+                (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
+                self.dof_vel * self.obs_scales["dof_vel"],                  # 12
+                self.actions,                                               # 12
+            ],
+            axis=-1,
+        )
+
+        self.last_actions[:] = self.actions[:]
+        self.last_dof_vel[:] = self.dof_vel[:]
+
+        return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
+
+    def reset(self):
+        self.reset_buf[:] = True
+        self.reset_idx(torch.arange(self.n_envs, device=self.device))
+        return self.obs_buf, None
+
+    def get_observations(self):
+        return self.obs_buf
+
+    def get_privileged_observations(self):
+        return None
 
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
 
-    def _reset_envs(self, env_ids: np.ndarray):
-        """
-        Reset specific envs to upright standing pose with small perturbations.
-        """
-        n = len(env_ids)
-        if n == 0:
+    def reset_idx(self, envs_idx):
+        if len(envs_idx) == 0:
             return
 
-        # Base position: standing height + small xy noise
-        pos = np.tile(BASE_INIT_POS, (n, 1))
-        pos[:, :2] += np.random.uniform(-0.05, 0.05, (n, 2)).astype(np.float32)
-        pos[:, 2]  += np.random.uniform(-0.02, 0.02, n).astype(np.float32)
-        pos[:, 2]   = np.clip(pos[:, 2], 0.35, 0.50)
-
-        # Base orientation: upright + random yaw
-        yaw  = np.random.uniform(-math.pi, math.pi, n).astype(np.float32)
-        quat = euler_to_quat(
-            np.zeros(n, np.float32),
-            np.zeros(n, np.float32),
-            yaw,
-        )   # (n, 4)  [w, x, y, z]
-
-        # Joint positions: default + small noise
-        jpos = (
-            DEFAULT_JOINT_POS
-            + np.random.uniform(-0.05, 0.05, (n, self.ACT_DIM)).astype(np.float32)
-        )
-
-        # Apply to Genesis
-        self.robot.set_pos( pos,  envs_idx=env_ids)
-        self.robot.set_quat(quat, envs_idx=env_ids)
+        # Reset joints
+        self.dof_pos[envs_idx] = self.default_dof_pos
+        self.dof_vel[envs_idx] = 0.0
         self.robot.set_dofs_position(
-            jpos,
+            position=self.dof_pos[envs_idx],
             dofs_idx_local=self.motor_dofs,
-            envs_idx=env_ids,
+            zero_velocity=True,
+            envs_idx=envs_idx,
         )
-        self.robot.zero_all_dofs_velocity(envs_idx=env_ids)
 
-        # FIX 3: Randomise velocity commands instead of hardcoding vx=0.5.
-        # Random commands are essential for training a general walking policy.
-        # A fixed command biases the policy towards one gait and direction.
-        self._commands[env_ids, 0] = np.random.uniform(
-            *CMD_LIN_VEL_X, n).astype(np.float32)
-        self._commands[env_ids, 1] = np.random.uniform(
-            *CMD_LIN_VEL_Y, n).astype(np.float32)
-        self._commands[env_ids, 2] = np.random.uniform(
-            *CMD_ANG_VEL_Z, n).astype(np.float32)
-
-        # Reset internal buffers
-        self._step_count[env_ids]  = 0
-        self._prev_action[env_ids] = 0.0
-        self._ep_return[env_ids]   = 0.0
-        self._ep_length[env_ids]   = 0
-
-    # ------------------------------------------------------------------
-    # Observation
-    # ------------------------------------------------------------------
-
-    def _get_obs(self) -> np.ndarray:
-        """
-        Build (n_envs, 48) observation array from Genesis state.
-
-        Genesis API used (confirmed for genesis-world >= 0.3.0):
-          robot.get_pos()           -> (N, 3)  world frame position
-          robot.get_quat()          -> (N, 4)  [w,x,y,z] world orientation
-          robot.get_vel()           -> (N, 3)  world frame linear velocity
-          robot.get_ang()           -> (N, 3)  world frame angular velocity
-          robot.get_dofs_position() -> (N, D)  all DOF positions
-          robot.get_dofs_velocity() -> (N, D)  all DOF velocities
-        """
-        base_pos    = self.robot.get_pos().cpu().numpy()           # (N, 3)
-        base_quat   = self.robot.get_quat().cpu().numpy()          # (N, 4)
-        vel_world   = self.robot.get_vel().cpu().numpy()           # (N, 3)
-        angv_world  = self.robot.get_ang().cpu().numpy()           # (N, 3)
-        dof_pos_all = self.robot.get_dofs_position().cpu().numpy() # (N, D)
-        dof_vel_all = self.robot.get_dofs_velocity().cpu().numpy() # (N, D)
-
-        # World-frame velocities → body frame
-        base_lin_vel = quat_rotate_inverse(base_quat, vel_world)    # (N, 3)
-        base_ang_vel = quat_rotate_inverse(base_quat, angv_world)   # (N, 3)
-
-        # Gravity vector projected to body frame
-        proj_gravity = quat_rotate_inverse(
-            base_quat, self._gravity_world
-        )                                                            # (N, 3)
-
-        # Motor joints only (FIX 1: use self.motor_dofs, not MOTOR_DOFS constant)
-        motor_pos     = dof_pos_all[:, self.motor_dofs]              # (N, 12)
-        motor_vel     = dof_vel_all[:, self.motor_dofs]              # (N, 12)
-        motor_pos_rel = motor_pos - DEFAULT_JOINT_POS                # (N, 12)
-
-        obs = np.concatenate([
-            base_lin_vel,        # [0:3]
-            base_ang_vel,        # [3:6]
-            proj_gravity,        # [6:9]
-            self._commands,      # [9:12]
-            motor_pos_rel,       # [12:24]
-            motor_vel,           # [24:36]
-            self._prev_action,   # [36:48]
-        ], axis=1).astype(np.float32)
-
-        return np.clip(obs, -OBS_CLIP, OBS_CLIP)
-
-    # ------------------------------------------------------------------
-    # Reward
-    # ------------------------------------------------------------------
- 
-    def _compute_reward(
-        self, obs: np.ndarray, action: np.ndarray
-    ) -> np.ndarray:
-        """
-        Walking Reward Function based on standard Legged Locomotion RL.
-        """
-        # --- 1. Extract states from observation ---
-        height        = self.robot.get_pos().detach().cpu().numpy()[:, 2]   # (N,)
-        lin_vel       = obs[:, 0:3]    # (N, 3) body frame
-        ang_vel       = obs[:, 3:6]    # (N, 3) body frame
-        proj_grav     = obs[:, 6:9]    # (N, 3) projected gravity
-        commands      = obs[:, 9:12]   # (N, 3) [vx, vy, yaw_rate]
-        motor_pos_rel = obs[:, 12:24]  # (N, 12) relative to nominal
-        motor_vel     = obs[:, 24:36]  # (N, 12)
-        prev_action   = obs[:, 36:48]  # (N, 12)
- 
-        cmd_mag = np.linalg.norm(commands[:, :2], axis=1)   # (N,)
- 
-        # --- 2. Task Rewards (Tracking) ---
-        lin_vel_error = np.sum(np.square(commands[:, :2] - lin_vel[:, :2]), axis=1)
-        r_track_lin = np.exp(-lin_vel_error / 0.25)
- 
-        ang_vel_error = np.square(commands[:, 2] - ang_vel[:, 2])
-        r_track_ang = np.exp(-ang_vel_error / 0.25)
- 
-        # Penalise standing still when a non-zero command is given.
-        # vel_mag near zero + large cmd → large negative reward.
-        # vel_mag growing → exp shrinks → penalty disappears naturally.
-        vel_mag       = np.linalg.norm(lin_vel[:, :2], axis=1)
-        r_stand_still = -np.square(cmd_mag) * np.exp(-vel_mag / 0.2)
- 
-        # --- 3. Base Motion Penalties ---
-        r_lin_vel_z  = -np.square(lin_vel[:, 2])
-        r_ang_vel_xy = -np.sum(np.square(ang_vel[:, :2]), axis=1)
- 
-        # --- 4. Posture Penalties ---
-        # Orientation: strong weight to stay upright (prevents belly-flopping)
-        r_orientation = -np.sum(np.square(proj_grav[:, :2]), axis=1)
- 
-        # Height: strong weight to stay at nominal standing height
-        r_height = -np.square(height - 0.34)
- 
-        # Joint deviation: only penalise when standing still
-        r_dof_pos  = -np.sum(np.square(motor_pos_rel), axis=1)
-        r_dof_pos *= (cmd_mag < 0.1).astype(np.float32)
- 
-        # --- 5. Energy and Smoothness Penalties ---
-        r_action_mag  = -np.sum(np.square(action), axis=1)
-        r_action_rate = -np.sum(np.square(action - prev_action), axis=1)
-        r_joint_vel   = -np.sum(np.square(motor_vel), axis=1)
- 
-        # --- 6. Combine ---
-        reward = (
-             1.0   * r_track_lin
-           + 0.2   * r_track_ang
-           + 2.0   * r_stand_still   # break standing local optimum
-           + 2.0   * r_lin_vel_z
-           + 0.05  * r_ang_vel_xy
-           + 2.5   * r_orientation   # was 0.2 — strong upright signal
-           + 50.0  * r_height        # was 2.0 — prevents belly-flopping
-           + 0.1   * r_dof_pos       # command-masked
-           + 0.005 * r_action_mag
-           + 0.005 * r_action_rate
-           + 0.001 * r_joint_vel
+        # Reset base pose
+        self.base_pos[envs_idx]  = self.base_init_pos
+        self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
+        self.robot.set_pos(
+            self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx
         )
-        
-        return reward.astype(np.float32)
- 
+        self.robot.set_quat(
+            self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx
+        )
+        self.base_lin_vel[envs_idx] = 0
+        self.base_ang_vel[envs_idx] = 0
+        self.robot.zero_all_dofs_velocity(envs_idx)
+
+        # Reset buffers
+        self.last_actions[envs_idx]       = 0.0
+        self.last_dof_vel[envs_idx]       = 0.0
+        self.episode_length_buf[envs_idx] = 0
+        self.reset_buf[envs_idx]          = True
+
+        # Log episode sums
+        self.extras["episode"] = {}
+        for key in self.episode_sums:
+            self.extras["episode"]["rew_" + key] = (
+                torch.mean(self.episode_sums[key][envs_idx]).item()
+                / self.env_cfg["episode_length_s"]
+            )
+            self.episode_sums[key][envs_idx] = 0.0
+
+        self._resample_commands(envs_idx)
+
+    def _resample_commands(self, envs_idx):
+        if len(envs_idx) == 0:
+            return
+        n = len(envs_idx)
+        self.commands[envs_idx, 0] = gs_rand_float(
+            *self.command_cfg["lin_vel_x_range"], (n,), self.device
+        )
+        self.commands[envs_idx, 1] = gs_rand_float(
+            *self.command_cfg["lin_vel_y_range"], (n,), self.device
+        )
+        self.commands[envs_idx, 2] = gs_rand_float(
+            *self.command_cfg["ang_vel_range"], (n,), self.device
+        )
+
     # ------------------------------------------------------------------
-    # Done
+    # Reward functions (official Genesis 6-term set)
     # ------------------------------------------------------------------
- 
-    def _compute_done(self, obs: np.ndarray) -> np.ndarray:
-            height     = self.robot.get_pos().detach().cpu().numpy()[:, 2]
-            proj_grav  = obs[:, 6:9]
- 
-            # Existing conditions
-            done_fallen  = height < 0.28
-            done_flipped = proj_grav[:, 2] > 0.5 
-            
-            # NEW: Terminate if the robot pitches or rolls more than ~45 degrees.
-            # proj_grav x and y components exceed 0.7 when tilted severely.
-            done_pitch   = np.abs(proj_grav[:, 0]) > 0.7
-            done_roll    = np.abs(proj_grav[:, 1]) > 0.7
- 
-            done_timeout = self._step_count >= self.max_episode_steps
- 
-            return (done_fallen | done_flipped | done_pitch | done_roll | done_timeout).astype(bool)
+
+    def _reward_tracking_lin_vel(self):
+        error = torch.sum(
+            torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1
+        )
+        return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+
+    def _reward_tracking_ang_vel(self):
+        error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+
+    def _reward_lin_vel_z(self):
+        return torch.square(self.base_lin_vel[:, 2])
+
+    def _reward_base_height(self):
+        return torch.square(
+            self.base_pos[:, 2] - self.reward_cfg["base_height_target"]
+        )
+
+    def _reward_action_rate(self):
+        return torch.sum(
+            torch.square(self.last_actions - self.actions), dim=1
+        )
+
+    def _reward_similar_to_default(self):
+        return torch.sum(
+            torch.abs(self.dof_pos - self.default_dof_pos), dim=1
+        )

@@ -1,4 +1,3 @@
-
 import os
 import time
 import argparse
@@ -7,7 +6,6 @@ import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
-# FIX 3: Updated import to match renamed class Go2WalkEnv
 from domo.robot.go2 import Go2WalkEnv
 
 
@@ -28,7 +26,7 @@ class ActorCritic(nn.Module):
     Orthogonal init with small gain on actor output for stable early training.
     """
 
-    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 256):
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 512):
         super().__init__()
 
         self.trunk = nn.Sequential(
@@ -50,7 +48,6 @@ class ActorCritic(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 nn.init.zeros_(m.bias)
-        # Small init on output layers — keeps early actions near zero
         nn.init.orthogonal_(self.actor_head[-1].weight,  gain=0.01)
         nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.00)
 
@@ -69,8 +66,6 @@ class ActorCritic(nn.Module):
         log_prob = dist.log_prob(action).sum(-1)
         return action, log_prob, value
 
-    # FIX 6: Dedicated value-only method avoids sampling an action when
-    # only the bootstrap value is needed (cleaner and slightly faster).
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         """Return critic value estimate without sampling an action."""
         h = self.trunk(obs)
@@ -98,10 +93,9 @@ class RolloutBuffer:
     Stores one rollout (T steps × N envs) and computes GAE advantages.
     All tensors are pre-allocated on device for efficiency.
 
-    FIX 4: Storage is now split into two calls per timestep:
-      store_step()       — called BEFORE env.step() with obs/action/logp/value
-      store_outcome()    — called AFTER  env.step() with reward/done
-    This ensures each field is stored at the correct moment in time.
+    Storage is split into two calls per timestep:
+      store_step()    — called BEFORE env.step() with obs/action/logp/value
+      store_outcome() — called AFTER  env.step() with reward/done
     """
 
     def __init__(
@@ -131,36 +125,27 @@ class RolloutBuffer:
 
     def store_step(
         self,
-        obs:       np.ndarray,
-        actions:   np.ndarray,
-        log_probs: np.ndarray,
-        values:    np.ndarray,
+        obs:       torch.Tensor,
+        actions:   torch.Tensor,
+        log_probs: torch.Tensor,
+        values:    torch.Tensor,
     ):
-        """
-        Store the pre-step quantities at the current buffer position.
-        Called BEFORE env.step().
-        """
+        """Store pre-step quantities. Called BEFORE env.step()."""
         t = self.ptr
-        self.obs[t]       = torch.as_tensor(obs,       device=self.device)
-        self.actions[t]   = torch.as_tensor(actions,   device=self.device)
-        self.log_probs[t] = torch.as_tensor(log_probs, device=self.device)
-        self.values[t]    = torch.as_tensor(values,    device=self.device)
+        self.obs[t]       = obs.detach()
+        self.actions[t]   = actions.detach()
+        self.log_probs[t] = log_probs.detach()
+        self.values[t]    = values.detach()
 
     def store_outcome(
         self,
-        rewards: np.ndarray,
-        dones:   np.ndarray,
+        rewards: torch.Tensor,
+        dones:   torch.Tensor,
     ):
-        """
-        Store the post-step outcome at the current buffer position,
-        then advance the pointer.
-        Called AFTER env.step().
-        """
+        """Store post-step outcome. Called AFTER env.step()."""
         t = self.ptr
-        self.rewards[t] = torch.as_tensor(
-            rewards.astype(np.float32), device=self.device)
-        self.dones[t]   = torch.as_tensor(
-            dones.astype(np.float32),   device=self.device)
+        self.rewards[t] = rewards.detach().float()
+        self.dones[t]   = dones.detach().float()
         self.ptr += 1
 
     def compute_gae(
@@ -169,15 +154,7 @@ class RolloutBuffer:
         gamma: float = 0.99,
         lam:   float = 0.95,
     ):
-        """
-        Generalised Advantage Estimation (GAE-λ).
-
-        FIX 7 (documented): The env auto-resets done environments and
-        returns the new episode's first observation. The done flag at
-        step t is 1 for those envs, which zeroes the bootstrap via
-        `mask = 1 - done[t]`. This is the standard approach for
-        auto-resetting vectorised envs and is correct.
-        """
+        """Generalised Advantage Estimation (GAE-λ)."""
         gae = torch.zeros(self.N, device=self.device)
         for t in reversed(range(self.T)):
             next_val = last_value if t == self.T - 1 else self.values[t + 1]
@@ -186,7 +163,7 @@ class RolloutBuffer:
             gae      = delta + gamma * lam * mask * gae
             self.advantages[t] = gae
         self.returns = self.advantages + self.values
-        self.ptr = 0   # reset for next rollout
+        self.ptr = 0
 
     def get_flat(self):
         """Flatten (T, N, ...) → (T*N, ...) for minibatch sampling."""
@@ -197,7 +174,7 @@ class RolloutBuffer:
             self.log_probs.view(T * N),
             self.advantages.view(T * N),
             self.returns.view(T * N),
-            self.values.view(T * N),    # ← add this
+            self.values.view(T * N),
         )
 
 
@@ -211,16 +188,14 @@ class PPOTrainer:
         self.cfg    = cfg
         self.device = cfg["device"]
 
-        # Environment
-        # FIX 3: Use renamed Go2WalkEnv
         self.env = Go2WalkEnv(
             n_envs            = cfg["n_envs"],
             dt                = cfg["dt"],
             max_episode_steps = cfg["max_episode_steps"],
             headless          = cfg["headless"],
+            device            = cfg["device"],
         )
 
-        # Network
         self.net = ActorCritic(
             obs_dim = Go2WalkEnv.OBS_DIM,
             act_dim = Go2WalkEnv.ACT_DIM,
@@ -229,14 +204,12 @@ class PPOTrainer:
 
         print(f"Network parameters: {self.net.num_parameters:,}")
 
-        # Optimiser
         self.opt = torch.optim.Adam(
             self.net.parameters(),
             lr  = cfg["lr"],
             eps = 1e-5,
         )
 
-        # Rollout buffer
         self.buf = RolloutBuffer(
             rollout_steps = cfg["rollout_steps"],
             n_envs        = cfg["n_envs"],
@@ -245,18 +218,15 @@ class PPOTrainer:
             device        = self.device,
         )
 
-        # Logging
         os.makedirs(cfg["run_dir"], exist_ok=True)
         self.writer      = SummaryWriter(cfg["run_dir"])
         self.global_step = 0
         self.start_time  = time.time()
 
-        # FIX 10: Per-env episode tracking buffers so we never miss a
-        # completed episode even when no env finishes in a given rollout.
         self.ep_returns = []
         self.ep_lengths = []
-        self._env_ep_return = np.zeros(cfg["n_envs"], dtype=np.float32)
-        self._env_ep_length = np.zeros(cfg["n_envs"], dtype=np.int32)
+        self._env_ep_return = torch.zeros(cfg["n_envs"], device=self.device)
+        self._env_ep_length = torch.zeros(cfg["n_envs"], device=self.device, dtype=torch.int32)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -264,8 +234,7 @@ class PPOTrainer:
 
     def train(self):
         cfg = self.cfg
-        obs = self.env.reset()
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        obs, _ = self.env.reset()
 
         print(f"\n{'='*55}")
         print(f"  Go2 Walking PPO Training")
@@ -282,26 +251,16 @@ class PPOTrainer:
         n_updates = cfg["total_steps"] // steps_per_rollout
 
         for update in range(1, n_updates + 1):
-
-            # Collect rollout
-            t0 = time.time()
-            obs_t = self._collect_rollout(obs_t)
-            collect_time = time.time() - t0
-
-            # PPO update
-            t0 = time.time()
+            obs = self._collect_rollout(obs)
             metrics = self._ppo_update()
-            update_time = time.time() - t0
-
             self.global_step += steps_per_rollout
 
-            # Logging
             if update % cfg["log_interval"] == 0:
                 elapsed   = time.time() - self.start_time
                 steps_sec = self.global_step / elapsed
 
-                mean_ret = np.mean(self.ep_returns[-20:]) if self.ep_returns else 0.0
-                mean_len = np.mean(self.ep_lengths[-20:]) if self.ep_lengths else 0.0
+                mean_ret = float(np.mean(self.ep_returns[-20:])) if self.ep_returns else 0.0
+                mean_len = float(np.mean(self.ep_lengths[-20:])) if self.ep_lengths else 0.0
 
                 print(
                     f"  step {self.global_step:>10,} | "
@@ -321,7 +280,6 @@ class PPOTrainer:
                 self.writer.add_scalar("train/clip_fraction", metrics["clip_frac"],   self.global_step)
                 self.writer.add_scalar("train/steps_per_sec", steps_sec,              self.global_step)
 
-            # Checkpoint
             if update % cfg["save_interval"] == 0:
                 self._save_checkpoint()
 
@@ -333,81 +291,55 @@ class PPOTrainer:
     # Rollout collection
     # ------------------------------------------------------------------
 
-    def _collect_rollout(self, obs_t: torch.Tensor) -> torch.Tensor:
+    def _collect_rollout(self, obs: torch.Tensor) -> torch.Tensor:
         """
-        Run rollout_steps steps across all envs, storing transitions.
-
-        FIX 4+5: store_step() is called BEFORE env.step() and
-        store_outcome() AFTER, so obs/action/logp/value are stored
-        at the same timestep as their corresponding reward/done.
-
-        FIX 5+6: last_value is computed with get_value() (no action
-        sampling) from the final obs_t. For done envs, obs_t is the
-        reset observation — the GAE done-mask zeroes the bootstrap
-        for those envs, which is correct (FIX 7).
+        Collect rollout_steps steps. obs is a torch Tensor on device.
+        The env now returns torch tensors directly — no numpy conversion.
         """
         self.net.eval()
         with torch.no_grad():
             for _ in range(self.cfg["rollout_steps"]):
 
-                action_t, log_prob_t, value_t = self.net.get_action(obs_t)
-                action_np = action_t.cpu().numpy()
+                action, log_prob, value = self.net.get_action(obs)
 
-                self.buf.store_step(
-                    obs       = obs_t.detach().cpu().numpy(),
-                    actions   = action_np,
-                    log_probs = log_prob_t.detach().cpu().numpy(),
-                    values    = value_t.detach().cpu().numpy(),
-                )
+                # Store BEFORE step
+                self.buf.store_step(obs, action, log_prob, value)
 
-                obs_np, reward_np, done_np, info = self.env.step(action_np)
+                next_obs, _, reward, reset_buf, extras = self.env.step(action)
 
-                self.buf.store_outcome(
-                    rewards = reward_np,
-                    dones   = done_np,
-                )
+                # Store AFTER step
+                self.buf.store_outcome(reward, reset_buf.float())
 
-                # FIX 10: Track per-env episode stats every step.
-                # This guarantees we never miss a completed episode.
-                self._env_ep_return += reward_np
+                # Track episode stats per env
+                self._env_ep_return += reward
                 self._env_ep_length += 1
-                finished = np.where(done_np)[0]
-                for idx in finished:
+                done_idx = reset_buf.nonzero(as_tuple=False).flatten()
+                for idx in done_idx:
                     self.ep_returns.append(float(self._env_ep_return[idx]))
                     self.ep_lengths.append(int(self._env_ep_length[idx]))
-                self._env_ep_return[finished] = 0.0
-                self._env_ep_length[finished] = 0
+                self._env_ep_return[done_idx] = 0.0
+                self._env_ep_length[done_idx] = 0
 
-                obs_t = torch.as_tensor(
-                    obs_np, dtype=torch.float32, device=self.device
-                )
+                obs = next_obs
 
-            # FIX 6: Use get_value() for clean bootstrap — no action
-            # sampled, no unnecessary computation.
-            last_value_t = self.net.get_value(obs_t)
-
+            last_value = self.net.get_value(obs)
             self.buf.compute_gae(
-                last_value = last_value_t,
+                last_value = last_value,
                 gamma      = self.cfg["gamma"],
                 lam        = self.cfg["lam"],
             )
 
-        return obs_t
+        return obs
 
     # ------------------------------------------------------------------
     # PPO update
     # ------------------------------------------------------------------
 
     def _ppo_update(self) -> dict:
-        """
-        Run n_epochs passes over the rollout buffer with minibatch sampling.
-        Returns dict of mean losses for logging.
-        """
         self.net.train()
         cfg = self.cfg
 
         obs_flat, act_flat, lp_flat, adv_flat, ret_flat, val_flat = self.buf.get_flat()
-        # Normalise advantages across the full rollout
         adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
         total_samples = obs_flat.shape[0]
@@ -429,10 +361,6 @@ class PPOTrainer:
                 new_lp, entropy, value = self.net.evaluate(
                     obs_flat[mb], act_flat[mb]
                 )
-                #     # DEBUG — add this
-                # print(f"old_lp: {lp_flat[mb][:3]}  new_lp: {new_lp[:3]}  ratio: {(new_lp - lp_flat[mb]).exp()[:3]}")
-                # break  # only first minibatch
-
 
                 ratio = (new_lp - lp_flat[mb]).exp()
 
@@ -442,7 +370,6 @@ class PPOTrainer:
                 ) * adv_flat[mb]
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # value_loss   = (ret_flat[mb] - value).pow(2).mean()
                 value_pred_clipped = mb_old_values + (value - mb_old_values).clamp(
                     -cfg["clip_eps"], cfg["clip_eps"]
                 )
@@ -450,6 +377,7 @@ class PPOTrainer:
                     (value - mb_ret).pow(2),
                     (value_pred_clipped - mb_ret).pow(2),
                 ).mean()
+
                 entropy_loss = -entropy.mean()
 
                 loss = (
@@ -481,8 +409,6 @@ class PPOTrainer:
     # ------------------------------------------------------------------
 
     def _save_checkpoint(self, tag: str = None):
-        # FIX 8: Removed dead variable chk_dir which was computed but
-        # never used. Checkpoints always save to cfg["run_dir"].
         name = f"checkpoint_step_{self.global_step:09d}"
         if tag:
             name = f"checkpoint_{tag}"
@@ -501,7 +427,8 @@ class PPOTrainer:
 
     @classmethod
     def load_checkpoint(cls, path: str) -> "PPOTrainer":
-        ckpt    = torch.load(path, weights_only=False)
+        map_location = "cuda" if torch.cuda.is_available() else "cpu"
+        ckpt    = torch.load(path, weights_only=False, map_location=map_location)
         trainer = cls(ckpt["config"])
         trainer.net.load_state_dict(ckpt["model_state"])
         trainer.opt.load_state_dict(ckpt["optim_state"])
@@ -522,33 +449,33 @@ def evaluate(checkpoint_path: str, n_episodes: int = 10):
     ckpt = torch.load(checkpoint_path, weights_only=False, map_location=map_location)
     cfg  = ckpt["config"]
 
-    # FIX 3: Use renamed Go2WalkEnv
     env = Go2WalkEnv(
         n_envs            = 1,
         headless          = False,
         max_episode_steps = cfg["max_episode_steps"],
         dt                = cfg["dt"],
+        device            = map_location,
     )
     net = ActorCritic(Go2WalkEnv.OBS_DIM, Go2WalkEnv.ACT_DIM, cfg["hidden_size"])
     net.load_state_dict(ckpt["model_state"])
     net.eval()
+    net = net.to(map_location)
 
     returns, lengths = [], []
     for ep in range(n_episodes):
-        obs    = env.reset()
-        done   = np.array([False])
+        obs, _ = env.reset()
+        done   = torch.zeros(1, dtype=torch.bool)
         ep_ret = 0.0
         ep_len = 0
 
         while not done[0]:
             with torch.no_grad():
-                obs_t = torch.as_tensor(obs, dtype=torch.float32)
-                act, _, _ = net.get_action(obs_t, deterministic=False)
-                action = act.numpy()
+                act, _, _ = net.get_action(obs, deterministic=False)
 
-            obs, reward, done, _ = env.step(action)
-            ep_ret += reward[0]
+            obs, _, reward, reset_buf, _ = env.step(act)
+            ep_ret += reward[0].item()
             ep_len += 1
+            done = reset_buf.bool()
 
         returns.append(ep_ret)
         lengths.append(ep_len)
@@ -565,9 +492,6 @@ def evaluate(checkpoint_path: str, n_episodes: int = 10):
 def get_config(args) -> dict:
     n_envs = args.n_envs
 
-    # FIX 9: Always use n_minibatches=4 so each epoch has 4 gradient
-    # steps regardless of scale. The original code could produce a single
-    # huge minibatch per epoch (very noisy updates at large n_envs).
     total_buffer   = n_envs * args.rollout_steps
     n_minibatches  = 4
     minibatch_size = max(total_buffer // n_minibatches, 256)
@@ -586,12 +510,12 @@ def get_config(args) -> dict:
         total_steps        = args.total_steps,
         rollout_steps      = args.rollout_steps,
         minibatch_size     = minibatch_size,
-        n_epochs           = 3,
+        n_epochs           = 5,
         gamma              = 0.99,
         lam                = 0.95,
         clip_eps           = 0.2,
         lr                 = 3e-4,
-        vf_coef            = 0.5,
+        vf_coef            = 1.0,
         ent_coef           = 0.01,
         max_grad_norm      = 1.0,
 
@@ -605,17 +529,15 @@ def get_config(args) -> dict:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-envs",        type=int,  default=100)
-    parser.add_argument("--total-steps",   type=int,  default=10_000_000)
+    parser.add_argument("--n-envs",        type=int,  default=4096)
+    parser.add_argument("--total-steps",   type=int,  default=100_000_000)
     parser.add_argument("--rollout-steps", type=int,  default=24)
-    parser.add_argument("--device",        type=str,  default="cpu",
+    parser.add_argument("--device",        type=str,  default="cuda",
                         choices=["cpu", "cuda", "mps"])
     parser.add_argument("--run-dir",       type=str,  default="runs/go2_walk")
     parser.add_argument("--headless",      action="store_true", default=True)
-    parser.add_argument("--resume",        type=str,  default=None,
-                        help="Path to checkpoint to resume from")
-    parser.add_argument("--eval",          type=str,  default=None,
-                        help="Path to checkpoint to evaluate (no training)")
+    parser.add_argument("--resume",        type=str,  default=None)
+    parser.add_argument("--eval",          type=str,  default=None)
     args = parser.parse_args()
 
     if args.eval:

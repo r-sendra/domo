@@ -255,9 +255,12 @@ class Go2LidarNavEnv:
         # Determine LiDAR output dimension from a dummy read after build
         # SphericalPattern default: 64 horizontal × 128 vertical = 8192
         _dummy = self.lidar.read()
-        self.n_lidar_raw = _dummy.distances.shape[-1]
-        self.OBS_DIM     = OBS_DIM   # 45 + 36 = 81 (fixed, after sector aggregation)
+        self.n_lidar_raw     = _dummy.distances.shape[-1]
+        self.rays_per_sector = self.n_lidar_raw // N_SECTORS
+        self.n_trim          = self.rays_per_sector * N_SECTORS
+        self.OBS_DIM         = OBS_DIM   # 45 + 36 = 81
         print(f"  LiDAR raw rays : {self.n_lidar_raw}")
+        print(f"  Rays/sector    : {self.rays_per_sector}  (trimmed to {self.n_trim})")
         print(f"  LiDAR sectors  : {N_SECTORS}  (min per sector)")
         print(f"  Total obs dim  : {self.OBS_DIM}")
 
@@ -365,12 +368,10 @@ class Go2LidarNavEnv:
         raw        = lidar_data.distances          # [N, n_lidar_raw]
 
         # Aggregate: reshape into N_SECTORS groups, take minimum per sector
-        # This maps 8192 rays → 36 sector minimums
-        # Each sector covers 360°/36 = 10° of horizontal sweep
-        rays_per_sector = self.n_lidar_raw // N_SECTORS
+        # Trim to largest multiple of N_SECTORS to allow clean reshape
         self.lidar_sectors[:] = raw[
-            :, :rays_per_sector * N_SECTORS
-        ].view(self.n_envs, N_SECTORS, rays_per_sector).min(dim=2).values
+            :, :self.n_trim
+        ].view(self.n_envs, N_SECTORS, self.rays_per_sector).min(dim=2).values
 
         # ── Resample commands ─────────────────────────────────────────────
         resample_every = int(self.env_cfg["resampling_time_s"] / self.dt)
@@ -950,7 +951,7 @@ def main():
     parser.add_argument("--rollout-steps", type=int,  default=24)
     parser.add_argument("--device",        type=str,  default="cuda",
                         choices=["cpu", "cuda", "mps"])
-    parser.add_argument("--run-dir",       type=str,  default="../../runs/rl_walk_house")
+    parser.add_argument("--run-dir",       type=str,  default="../../runs/go2_lidar")
     parser.add_argument("--headless",      action="store_true", default=True)
     parser.add_argument("--resume",        type=str,  default=None)
     parser.add_argument("--eval",          type=str,  default=None)

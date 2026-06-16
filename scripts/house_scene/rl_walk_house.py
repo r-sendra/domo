@@ -4,25 +4,27 @@ go2_lidar_nav.py
 Self-contained RL experiment: Go2 locomotion with LiDAR-based
 obstacle avoidance on flat terrain with random obstacles.
 
-Extends the working Go2WalkEnv (genesis official example style) with:
-  1. LiDAR sensor    — gs.sensors.Lidar with default SphericalPattern
-  2. Sector obs      — 8192 raw rays → 36 sector minimums (81-dim total)
-  3. Obstacles       — random cylinders placed in the scene each episode
-  4. Extra reward    — penalty for approaching obstacles too closely
+Curriculum learning (3 phases):
+  Phase 1 — Walk (0 → phase1_steps):
+    No obstacles, no avoidance reward. Robot learns/reinforces walking.
+    Pretrained walking checkpoint is loaded if --pretrained is given.
 
-LiDAR pre-processing (sector aggregation):
-  8192 raw rays → min per 36 horizontal sectors → 36 values → [0,1]
-  This is the approach used in Omni-Perception (HKUST 2025) and is
-  the standard for locomotion + obstacle avoidance RL.
+  Phase 2 — Obstacles appear (phase1_steps → phase2_steps):
+    Obstacles present, still no avoidance penalty.
+    Robot learns to navigate around them to keep walking.
 
-Everything else (PPO, RolloutBuffer, ActorCritic, checkpointing) is
-identical to main.py so checkpoints are cross-compatible.
+  Phase 3 — Avoidance reward (phase2_steps → end):
+    Full avoidance penalty enabled. Robot learns to actively avoid.
 
 Usage:
-    # Train on H200
+    # Train from scratch with curriculum
     python go2_lidar_nav.py --n-envs 4096 --device cuda --headless
 
-    # Evaluate on Mac (loads checkpoint, opens viewer)
+    # Warm-start from pretrained walking policy (recommended)
+    python go2_lidar_nav.py --n-envs 4096 --device cuda --headless \\
+        --pretrained ../../runs/go2_walk/checkpoint_final.pt
+
+    # Evaluate on Mac
     python go2_lidar_nav.py --eval ../../runs/go2_lidar/checkpoint_final.pt
 
     # Resume training
@@ -79,10 +81,18 @@ OBS_DIM   = PROP_DIM + N_SECTORS   # 45 + 36 = 81
 
 # Obstacle configuration
 N_OBSTACLES        = 8      # cylinders per environment
-OBSTACLE_RING_MIN  = 1.0    # metres from spawn — inner exclusion zone
+OBSTACLE_RING_MIN  = 1.5    # metres from spawn — inner exclusion (increased from 1.0)
 OBSTACLE_RING_MAX  = 4.0    # metres from spawn — outer boundary
 OBSTACLE_HEIGHT    = 1.2    # metres
 OBSTACLE_RADIUS    = 0.25   # metres
+
+# Curriculum phases (in environment steps)
+# Phase 1: walk only — no obstacles, no avoidance reward
+# Phase 2: obstacles appear — no avoidance reward (robot learns to navigate)
+# Phase 3: full avoidance reward enabled
+CURRICULUM_PHASE1_STEPS = 30_000_000   # 0 → 30M: walk only
+CURRICULUM_PHASE2_STEPS = 80_000_000   # 30M → 80M: obstacles, no penalty
+# Phase 3: 80M → end: full avoidance reward
 
 
 def gs_rand_float(lower, upper, shape, device):
@@ -171,6 +181,11 @@ class Go2LidarNavEnv:
             self.env_cfg["episode_length_s"] / self.dt
         )
         self.num_commands = self.command_cfg["num_commands"]
+
+        # Curriculum state — controlled by PPOTrainer
+        self.curriculum_phase    = 1   # 1=walk only, 2=obstacles, 3=full avoidance
+        self.obstacles_active    = False
+        self.avoidance_active    = False
 
         # ── Genesis init ──────────────────────────────────────────────────
         backend = gs.cuda if torch.cuda.is_available() else gs.cpu
@@ -512,23 +527,53 @@ class Go2LidarNavEnv:
             *self.command_cfg["ang_vel_range"],   (n,), self.device
         )
 
+    def set_curriculum_phase(self, phase: int):
+        """
+        Set the curriculum phase from the trainer.
+        Phase 1: walk only      — obstacles parked off-scene, no avoidance reward
+        Phase 2: obstacles      — obstacles randomised each reset, no avoidance reward
+        Phase 3: full avoidance — obstacles + avoidance penalty enabled
+        """
+        if phase == self.curriculum_phase:
+            return
+        self.curriculum_phase = phase
+        self.obstacles_active = phase >= 2
+        self.avoidance_active = phase >= 3
+        print(f"\n  [Curriculum] → Phase {phase}  "
+              f"obstacles={'ON' if self.obstacles_active else 'OFF'}  "
+              f"avoidance={'ON' if self.avoidance_active else 'OFF'}\n")
+
     def _randomise_obstacles(self, envs_idx):
         """
         Place obstacles at random positions around each reset env's spawn.
-        Each env in envs_idx gets a new random obstacle layout.
+        In Phase 1: park all obstacles far off-scene (no obstacles).
+        In Phase 2+: randomise within the ring around spawn.
         """
         if len(envs_idx) == 0:
             return
+
+        if not self.obstacles_active:
+            # Phase 1 — park obstacles far away, out of simulation range
+            for obs_entity in self.obstacles:
+                far = torch.full(
+                    (len(envs_idx), 3), 999.0, device=self.device
+                )
+                far[:, 2] = OBSTACLE_HEIGHT / 2
+                obs_entity.set_pos(far, envs_idx=envs_idx)
+            return
+
+        # Phase 2 and 3 — random ring placement
         for obs_entity in self.obstacles:
-            # Random angle and radius in the annulus
             angles = torch.rand(len(envs_idx), device=self.device) * 2 * math.pi
             radii  = (
                 OBSTACLE_RING_MIN
                 + torch.rand(len(envs_idx), device=self.device)
                 * (OBSTACLE_RING_MAX - OBSTACLE_RING_MIN)
             )
-            x = radii * torch.cos(angles)
-            y = radii * torch.sin(angles)
+            # Place relative to spawn position
+            spawn = self.base_init_pos
+            x = spawn[0] + radii * torch.cos(angles)
+            y = spawn[1] + radii * torch.sin(angles)
             z = torch.full((len(envs_idx),), OBSTACLE_HEIGHT / 2, device=self.device)
             pos = torch.stack([x, y, z], dim=-1)
             obs_entity.set_pos(pos, envs_idx=envs_idx)
@@ -568,27 +613,24 @@ class Go2LidarNavEnv:
     def _reward_obstacle_avoidance(self):
         """
         Penalty based on minimum LiDAR distance.
-        In danger zone (<LIDAR_DANGER_ZONE): strong quadratic penalty
-        In caution zone (<LIDAR_CAUTION_ZONE): weaker linear penalty
-        Beyond caution zone: zero penalty
+        Only active in Phase 3. Returns zero in earlier phases.
         """
-        min_dist = self.lidar_sectors.min(dim=1).values   # [N]
+        if not self.avoidance_active:
+            return torch.zeros(self.n_envs, device=self.device, dtype=gs.tc_float)
+
+        min_dist = self.lidar_sectors.min(dim=1).values
         min_dist = torch.clamp(min_dist, 0.0, LIDAR_MAX_RANGE)
 
-        # Danger zone penalty (quadratic — grows sharply near obstacles)
         danger_pen = torch.where(
             min_dist < LIDAR_DANGER_ZONE,
             torch.square(min_dist - LIDAR_DANGER_ZONE),
             torch.zeros_like(min_dist),
         )
-
-        # Caution zone penalty (linear — gentle warning further away)
         caution_pen = torch.where(
             (min_dist >= LIDAR_DANGER_ZONE) & (min_dist < LIDAR_CAUTION_ZONE),
             (LIDAR_CAUTION_ZONE - min_dist) * 0.2,
             torch.zeros_like(min_dist),
         )
-
         return danger_pen + caution_pen
 
 
@@ -732,6 +774,14 @@ class PPOTrainer:
         print(f"  Network params : {self.net.num_parameters:,}")
         print(f"  Obs dim        : {obs_dim}  (45 proprioception + {N_SECTORS} LiDAR sectors)")
 
+        # Load pretrained walking policy if provided
+        # The pretrained network has obs_dim=45, ours is 81.
+        # We load only the trunk and actor/critic heads — the extra 36 LiDAR
+        # input weights are initialised to near-zero so the policy ignores
+        # LiDAR initially and gradually learns to use it.
+        if cfg.get("pretrained"):
+            self._load_pretrained(cfg["pretrained"])
+
         self.opt = torch.optim.Adam(
             self.net.parameters(), lr=cfg["lr"], eps=1e-5
         )
@@ -752,6 +802,47 @@ class PPOTrainer:
         self._env_ret    = torch.zeros(cfg["n_envs"], device=self.device)
         self._env_len    = torch.zeros(cfg["n_envs"], device=self.device, dtype=torch.int32)
 
+    def _load_pretrained(self, path: str):
+        """
+        Load trunk + heads from a pretrained flat-terrain walking checkpoint.
+        The pretrained network has obs_dim=45; ours is 81 (45+36 LiDAR).
+        Strategy: copy matching weights, leave the 36 LiDAR input weights
+        near zero so the policy initially ignores sensor data and relies
+        on the walking behaviour it already learned.
+        """
+        print(f"\n  Loading pretrained weights: {path}")
+        ckpt        = torch.load(path, weights_only=False, map_location=self.device)
+        src_state   = ckpt["model_state"]
+        dst_state   = self.net.state_dict()
+
+        n_loaded = 0
+        for key, dst_param in dst_state.items():
+            if key not in src_state:
+                continue
+            src_param = src_state[key]
+            if src_param.shape == dst_param.shape:
+                # Exact match — copy directly (trunk layers 1+, heads)
+                dst_state[key] = src_param.clone()
+                n_loaded += 1
+            elif key == "trunk.0.weight":
+                # First trunk layer: [hidden, obs_dim_new] vs [hidden, obs_dim_old]
+                # Copy the proprioception columns, leave LiDAR columns at ~0
+                dst_param[:, :src_param.shape[1]] = src_param.clone()
+                dst_state[key] = dst_param
+                n_loaded += 1
+
+        self.net.load_state_dict(dst_state)
+        print(f"  Loaded {n_loaded}/{len(dst_state)} parameter tensors from pretrained\n")
+
+    def _update_curriculum(self, global_step: int):
+        """Update curriculum phase based on global step count."""
+        if global_step < CURRICULUM_PHASE1_STEPS:
+            self.env.set_curriculum_phase(1)
+        elif global_step < CURRICULUM_PHASE2_STEPS:
+            self.env.set_curriculum_phase(2)
+        else:
+            self.env.set_curriculum_phase(3)
+
     def train(self):
         cfg = self.cfg
         obs, _ = self.env.reset()
@@ -764,12 +855,19 @@ class PPOTrainer:
         print(f"  Total steps   : {cfg['total_steps']:,}")
         print(f"  Device        : {self.device}")
         print(f"  Run dir       : {cfg['run_dir']}")
+        print(f"  Curriculum:")
+        print(f"    Phase 1 (walk only) :    0 → {CURRICULUM_PHASE1_STEPS:,}")
+        print(f"    Phase 2 (obstacles) : {CURRICULUM_PHASE1_STEPS:,} → {CURRICULUM_PHASE2_STEPS:,}")
+        print(f"    Phase 3 (avoidance) : {CURRICULUM_PHASE2_STEPS:,} → end")
         print(f"{'='*55}\n")
 
         steps_per_rollout = cfg["rollout_steps"] * cfg["n_envs"]
         n_updates         = cfg["total_steps"] // steps_per_rollout
 
         for update in range(1, n_updates + 1):
+            # Update curriculum phase before collecting rollout
+            self._update_curriculum(self.global_step)
+
             obs     = self._collect_rollout(obs)
             metrics = self._ppo_update()
             self.global_step += steps_per_rollout
@@ -782,6 +880,7 @@ class PPOTrainer:
 
                 print(
                     f"  step {self.global_step:>10,} | "
+                    f"ph {self.env.curriculum_phase} | "
                     f"ret {mean_ret:>7.3f} | "
                     f"len {mean_len:>5.0f} | "
                     f"ploss {metrics['policy_loss']:>7.4f} | "
@@ -796,6 +895,7 @@ class PPOTrainer:
                 self.writer.add_scalar("loss/entropy",        metrics["entropy"],     self.global_step)
                 self.writer.add_scalar("train/clip_fraction", metrics["clip_frac"],   self.global_step)
                 self.writer.add_scalar("train/sps",           sps,                    self.global_step)
+                self.writer.add_scalar("curriculum/phase",    self.env.curriculum_phase, self.global_step)
 
             if update % cfg["save_interval"] == 0:
                 self._save_checkpoint()
@@ -877,8 +977,9 @@ class PPOTrainer:
             "model_state": self.net.state_dict(),
             "optim_state": self.opt.state_dict(),
             "config":      self.cfg,
-            "obs_dim":     self.env.OBS_DIM,
-            "n_sectors":   N_SECTORS,
+            "obs_dim":          self.env.OBS_DIM,
+            "n_sectors":        N_SECTORS,
+            "curriculum_phase": self.env.curriculum_phase,
             "metrics": {
                 "mean_return": np.mean(self.ep_returns[-20:]) if self.ep_returns else 0.0,
                 "mean_length": np.mean(self.ep_lengths[-20:]) if self.ep_lengths else 0.0,
@@ -961,6 +1062,7 @@ def get_config(args):
         run_dir            = args.run_dir,
         log_interval       = 10,
         save_interval      = 100,
+        pretrained         = args.pretrained,   # path to flat-terrain checkpoint
     )
 
 
@@ -975,6 +1077,8 @@ def main():
     parser.add_argument("--headless",      action="store_true", default=True)
     parser.add_argument("--resume",        type=str,  default=None)
     parser.add_argument("--eval",          type=str,  default=None)
+    parser.add_argument("--pretrained",    type=str,  default=None,
+                        help="Path to flat-terrain walking checkpoint for warm-start")
     args = parser.parse_args()
 
     if args.eval:

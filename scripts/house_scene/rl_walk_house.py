@@ -365,13 +365,29 @@ class Go2LidarNavEnv:
         # ── LiDAR read + sector aggregation ──────────────────────────────
         # scene.step() already computed all rays — this is just a memory read
         lidar_data = self.lidar.read()
-        raw        = lidar_data.distances          # [N, n_lidar_raw]
+        raw        = lidar_data.distances          # [N, n_rays]
 
-        # Aggregate: reshape into N_SECTORS groups, take minimum per sector
-        # Trim to largest multiple of N_SECTORS to allow clean reshape
-        self.lidar_sectors[:] = raw[
-            :, :self.n_trim
-        ].view(self.n_envs, N_SECTORS, self.rays_per_sector).min(dim=2).values
+        # One-time debug print to show actual runtime shape
+        if not hasattr(self, '_lidar_shape_printed'):
+            print(f"  [LiDAR runtime] distances.shape = {raw.shape}  "
+                  f"({raw.shape[1]} rays per env)")
+            self._lidar_shape_printed = True
+
+        # Aggregate raw rays into N_SECTORS sector minimums.
+        # Handles any ray count gracefully — no assumption about divisibility.
+        batch, n_raw = raw.shape
+        if n_raw >= N_SECTORS:
+            # Enough rays — reshape into N_SECTORS groups and take min
+            rays_ps = n_raw // N_SECTORS
+            n_trim  = rays_ps * N_SECTORS
+            self.lidar_sectors[:] = raw[
+                :, :n_trim
+            ].view(batch, N_SECTORS, rays_ps).min(dim=2).values
+        else:
+            # Fewer rays than sectors — repeat-pad to fill sectors
+            # Each sector gets the same small set of rays
+            padded = raw.repeat(1, math.ceil(N_SECTORS / n_raw))[:, :N_SECTORS]
+            self.lidar_sectors[:] = padded
 
         # ── Resample commands ─────────────────────────────────────────────
         resample_every = int(self.env_cfg["resampling_time_s"] / self.dt)

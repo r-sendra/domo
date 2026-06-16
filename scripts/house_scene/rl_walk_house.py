@@ -5,10 +5,15 @@ Self-contained RL experiment: Go2 locomotion with LiDAR-based
 obstacle avoidance on flat terrain with random obstacles.
 
 Extends the working Go2WalkEnv (genesis official example style) with:
-  1. LiDAR sensor  — gs.sensors.Lidar with default SphericalPattern
-  2. Expanded obs  — 45 (proprioception) + N_lidar (LiDAR distances)
-  3. Obstacles     — random cylinders placed in the scene each episode
-  4. Extra reward  — penalty for approaching obstacles too closely
+  1. LiDAR sensor    — gs.sensors.Lidar with default SphericalPattern
+  2. Sector obs      — 8192 raw rays → 36 sector minimums (81-dim total)
+  3. Obstacles       — random cylinders placed in the scene each episode
+  4. Extra reward    — penalty for approaching obstacles too closely
+
+LiDAR pre-processing (sector aggregation):
+  8192 raw rays → min per 36 horizontal sectors → 36 values → [0,1]
+  This is the approach used in Omni-Perception (HKUST 2025) and is
+  the standard for locomotion + obstacle avoidance RL.
 
 Everything else (PPO, RolloutBuffer, ActorCritic, checkpointing) is
 identical to main.py so checkpoints are cross-compatible.
@@ -18,10 +23,10 @@ Usage:
     python go2_lidar_nav.py --n-envs 4096 --device cuda --headless
 
     # Evaluate on Mac (loads checkpoint, opens viewer)
-    python go2_lidar_nav.py --eval runs/go2_lidar/checkpoint_final.pt
+    python go2_lidar_nav.py --eval ../../runs/go2_lidar/checkpoint_final.pt
 
     # Resume training
-    python go2_lidar_nav.py --resume runs/go2_lidar/checkpoint_step_050000000.pt
+    python go2_lidar_nav.py --resume ../../runs/go2_lidar/checkpoint_step_050000000.pt
 """
 
 import os
@@ -64,6 +69,13 @@ BASE_INIT_QUAT = [0.0, 0.0, 0.0, 1.0]   # [x,y,z,w] identity
 LIDAR_MAX_RANGE    = 5.0    # metres
 LIDAR_DANGER_ZONE  = 0.8    # metres — penalise if closer than this
 LIDAR_CAUTION_ZONE = 1.5    # metres — smaller penalty
+
+# Sector aggregation: 8192 rays → 36 sector minimums
+# Each sector covers 360°/36 = 10° horizontal slice
+# Min distance per sector is the relevant signal for avoidance
+N_SECTORS = 36
+PROP_DIM  = 45               # proprioception dims (unchanged from walking env)
+OBS_DIM   = PROP_DIM + N_SECTORS   # 45 + 36 = 81
 
 # Obstacle configuration
 N_OBSTACLES        = 8      # cylinders per environment
@@ -243,9 +255,11 @@ class Go2LidarNavEnv:
         # Determine LiDAR output dimension from a dummy read after build
         # SphericalPattern default: 64 horizontal × 128 vertical = 8192
         _dummy = self.lidar.read()
-        self.n_lidar = _dummy.distances.shape[-1]
-        self.OBS_DIM = 45 + self.n_lidar
-        print(f"  LiDAR rays: {self.n_lidar}  total obs dim: {self.OBS_DIM}")
+        self.n_lidar_raw = _dummy.distances.shape[-1]
+        self.OBS_DIM     = OBS_DIM   # 45 + 36 = 81 (fixed, after sector aggregation)
+        print(f"  LiDAR raw rays : {self.n_lidar_raw}")
+        print(f"  LiDAR sectors  : {N_SECTORS}  (min per sector)")
+        print(f"  Total obs dim  : {self.OBS_DIM}")
 
         # ── Motor DOFs ────────────────────────────────────────────────────
         self.motor_dofs = [
@@ -304,9 +318,10 @@ class Go2LidarNavEnv:
         self.base_pos     = torch.zeros((N, 3), device=self.device, dtype=f)
         self.base_quat    = torch.zeros((N, 4), device=self.device, dtype=f)
 
-        # LiDAR distances buffer — shape [N, n_lidar]
-        self.lidar_distances = torch.zeros(
-            (N, self.n_lidar), device=self.device, dtype=f
+        # LiDAR sector buffer — shape [N, N_SECTORS]
+        # Aggregated from raw rays: min distance per 36 horizontal sectors
+        self.lidar_sectors = torch.zeros(
+            (N, N_SECTORS), device=self.device, dtype=f
         )
 
         self.extras = {}
@@ -344,10 +359,18 @@ class Go2LidarNavEnv:
         self.dof_pos[:]            = self.robot.get_dofs_position(self.motor_dofs)
         self.dof_vel[:]            = self.robot.get_dofs_velocity(self.motor_dofs)
 
-        # ── LiDAR read ────────────────────────────────────────────────────
-        # scene.step() already computed the rays — this is just a memory read
-        lidar_data               = self.lidar.read()
-        self.lidar_distances[:]  = lidar_data.distances   # [N, n_lidar]
+        # ── LiDAR read + sector aggregation ──────────────────────────────
+        # scene.step() already computed all rays — this is just a memory read
+        lidar_data = self.lidar.read()
+        raw        = lidar_data.distances          # [N, n_lidar_raw]
+
+        # Aggregate: reshape into N_SECTORS groups, take minimum per sector
+        # This maps 8192 rays → 36 sector minimums
+        # Each sector covers 360°/36 = 10° of horizontal sweep
+        rays_per_sector = self.n_lidar_raw // N_SECTORS
+        self.lidar_sectors[:] = raw[
+            :, :rays_per_sector * N_SECTORS
+        ].view(self.n_envs, N_SECTORS, rays_per_sector).min(dim=2).values
 
         # ── Resample commands ─────────────────────────────────────────────
         resample_every = int(self.env_cfg["resampling_time_s"] / self.dt)
@@ -381,9 +404,9 @@ class Go2LidarNavEnv:
             self.episode_sums[name] += rew
 
         # ── Observation ───────────────────────────────────────────────────
-        # Proprioception (45) + LiDAR distances normalised to [0,1] (n_lidar)
+        # Proprioception (45) + sector minimums normalised to [0,1] (36)
         lidar_norm = torch.clamp(
-            self.lidar_distances / LIDAR_MAX_RANGE, 0.0, 1.0
+            self.lidar_sectors / LIDAR_MAX_RANGE, 0.0, 1.0
         )
         self.obs_buf = torch.cat(
             [
@@ -393,7 +416,7 @@ class Go2LidarNavEnv:
                 (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
                 self.dof_vel * self.obs_scales["dof_vel"],                         # 12
                 self.actions,                                                      # 12
-                lidar_norm,                                                        # n_lidar
+                lidar_norm,                                                        # 36 sectors
             ],
             dim=-1,
         )
@@ -528,7 +551,7 @@ class Go2LidarNavEnv:
         In caution zone (<LIDAR_CAUTION_ZONE): weaker linear penalty
         Beyond caution zone: zero penalty
         """
-        min_dist = self.lidar_distances.min(dim=1).values   # [N]
+        min_dist = self.lidar_sectors.min(dim=1).values   # [N]
         min_dist = torch.clamp(min_dist, 0.0, LIDAR_MAX_RANGE)
 
         # Danger zone penalty (quadratic — grows sharply near obstacles)
@@ -686,7 +709,7 @@ class PPOTrainer:
             hidden  = cfg["hidden_size"],
         ).to(self.device)
         print(f"  Network params : {self.net.num_parameters:,}")
-        print(f"  Obs dim        : {obs_dim}  (45 proprioception + {self.env.n_lidar} LiDAR)")
+        print(f"  Obs dim        : {obs_dim}  (45 proprioception + {N_SECTORS} LiDAR sectors)")
 
         self.opt = torch.optim.Adam(
             self.net.parameters(), lr=cfg["lr"], eps=1e-5
@@ -834,7 +857,7 @@ class PPOTrainer:
             "optim_state": self.opt.state_dict(),
             "config":      self.cfg,
             "obs_dim":     self.env.OBS_DIM,
-            "n_lidar":     self.env.n_lidar,
+            "n_sectors":   N_SECTORS,
             "metrics": {
                 "mean_return": np.mean(self.ep_returns[-20:]) if self.ep_returns else 0.0,
                 "mean_length": np.mean(self.ep_lengths[-20:]) if self.ep_lengths else 0.0,
@@ -927,7 +950,7 @@ def main():
     parser.add_argument("--rollout-steps", type=int,  default=24)
     parser.add_argument("--device",        type=str,  default="cuda",
                         choices=["cpu", "cuda", "mps"])
-    parser.add_argument("--run-dir",       type=str,  default="../../runs/house_walk")
+    parser.add_argument("--run-dir",       type=str,  default="../../runs/rl_walk_house")
     parser.add_argument("--headless",      action="store_true", default=True)
     parser.add_argument("--resume",        type=str,  default=None)
     parser.add_argument("--eval",          type=str,  default=None)

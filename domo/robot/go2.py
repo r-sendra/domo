@@ -449,7 +449,7 @@ class Go2WalkEnv:
         #         pos    = robot_pos + offset,
         #         lookat = robot_pos,
         #     )
-
+        #
 
         return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
 

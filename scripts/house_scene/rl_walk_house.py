@@ -61,7 +61,7 @@ DEFAULT_JOINT_ANGLES = {
     "RL_hip_joint":   0.0, "RL_thigh_joint":  1.0, "RL_calf_joint": -1.5,
 }
 
-BASE_INIT_POS  = [0.0, 0.0, 0.42]
+BASE_INIT_POS  = [3.0, -2.0, 0.42]
 BASE_INIT_QUAT = [0.0, 0.0, 0.0, 1.0]   # [x,y,z,w] identity
 
 # LiDAR — default SphericalPattern (n_points=(64,128) = 8192 rays on GPU)
@@ -254,8 +254,9 @@ class Go2LidarNavEnv:
 
         # Determine LiDAR output dimension from a dummy read after build
         # SphericalPattern default: 64 horizontal × 128 vertical = 8192
-        _dummy = self.lidar.read()
-        self.n_lidar_raw     = _dummy.distances.shape[-1]
+        _dummy           = self.lidar.read()
+        _dummy_flat      = _dummy.distances.reshape(_dummy.distances.shape[0], -1)
+        self.n_lidar_raw     = _dummy_flat.shape[-1]
         self.rays_per_sector = self.n_lidar_raw // N_SECTORS
         self.n_trim          = self.rays_per_sector * N_SECTORS
         self.OBS_DIM         = OBS_DIM   # 45 + 36 = 81
@@ -365,18 +366,20 @@ class Go2LidarNavEnv:
         # ── LiDAR read + sector aggregation ──────────────────────────────
         # scene.step() already computed all rays — this is just a memory read
         lidar_data = self.lidar.read()
-        raw_        = lidar_data.distances          # [N, n_rays]
+        raw_       = lidar_data.distances   # [N, channels, horizontal] or [N, n_rays]
 
         # One-time debug print to show actual runtime shape
         if not hasattr(self, '_lidar_shape_printed'):
-            print(f"  [LiDAR runtime] distances.shape = {raw_.shape}  "
-                  f"({raw_.shape[1]} rays per env)")
+            print(f"  [LiDAR runtime] distances.shape = {raw_.shape}")
             self._lidar_shape_printed = True
+
+        # Flatten to [N, total_rays] regardless of whether Genesis returns
+        # a 2D [N, rays] or 3D [N, channels, horizontal] tensor
+        raw = raw_.reshape(raw_.shape[0], -1)   # [N, total_rays]
 
         # Aggregate raw rays into N_SECTORS sector minimums.
         # Handles any ray count gracefully — no assumption about divisibility.
-        raw = raw_.reshape(raw_.shape[0], -1)   # [2000, 128, 64] → [2000, 8192]
-        batch, n_raw = raw.shape                 # now works: 2 values
+        batch, n_raw = raw.shape
         if n_raw >= N_SECTORS:
             # Enough rays — reshape into N_SECTORS groups and take min
             rays_ps = n_raw // N_SECTORS

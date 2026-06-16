@@ -365,17 +365,18 @@ class Go2LidarNavEnv:
         # ── LiDAR read + sector aggregation ──────────────────────────────
         # scene.step() already computed all rays — this is just a memory read
         lidar_data = self.lidar.read()
-        raw        = lidar_data.distances          # [N, n_rays]
+        raw_        = lidar_data.distances          # [N, n_rays]
 
         # One-time debug print to show actual runtime shape
         if not hasattr(self, '_lidar_shape_printed'):
-            print(f"  [LiDAR runtime] distances.shape = {raw.shape}  "
-                  f"({raw.shape[1]} rays per env)")
+            print(f"  [LiDAR runtime] distances.shape = {raw_.shape}  "
+                  f"({raw_.shape[1]} rays per env)")
             self._lidar_shape_printed = True
 
         # Aggregate raw rays into N_SECTORS sector minimums.
         # Handles any ray count gracefully — no assumption about divisibility.
-        batch, n_raw = raw.shape
+        raw = raw_.reshape(raw_.shape[0], -1)   # [2000, 128, 64] → [2000, 8192]
+        batch, n_raw = raw.shape                 # now works: 2 values
         if n_raw >= N_SECTORS:
             # Enough rays — reshape into N_SECTORS groups and take min
             rays_ps = n_raw // N_SECTORS

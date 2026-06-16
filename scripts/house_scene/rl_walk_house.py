@@ -32,6 +32,7 @@ Usage:
 """
 
 import os
+import json
 import time
 import math
 import argparse
@@ -100,6 +101,98 @@ def gs_rand_float(lower, upper, shape, device):
 
 
 # ==========================================================================
+#  ReplicaCAD scene loader (same as replica_rl_locomotion.py)
+# ==========================================================================
+
+def _convert_habitat_to_genesis(pos, quat_wxyz):
+    x, y, z = pos
+    qw, qx, qy, qz = quat_wxyz
+    return [x, -z, y], [qw, qx, -qz, qy]
+
+
+def _resolve_asset_path(template_path, root_dir):
+    base_name  = os.path.basename(template_path)
+    search_dir = os.path.join(root_dir, "configs")
+    if not os.path.exists(search_dir):
+        search_dir = root_dir
+    for subdir, _, files in os.walk(search_dir):
+        for f in files:
+            if f.startswith(base_name) and f.endswith(".json"):
+                path = os.path.join(subdir, f)
+                try:
+                    with open(path) as fp:
+                        cfg = json.load(fp)
+                    asset = cfg.get("urdf_filepath") or cfg.get("render_asset")
+                    if asset:
+                        abs_p = os.path.abspath(
+                            os.path.join(os.path.dirname(path), asset)
+                        )
+                        if os.path.exists(abs_p):
+                            return abs_p
+                except Exception:
+                    pass
+    return None
+
+
+def _spawn_entity(scene, template_name, asset_path, pos, quat, is_fixed, scale=1.0):
+    try:
+        if asset_path.endswith(".urdf"):
+            scene.add_entity(gs.morphs.URDF(
+                file=asset_path, pos=pos, quat=quat, fixed=is_fixed
+            ))
+        elif asset_path.endswith((".glb", ".obj")):
+            scene.add_entity(gs.morphs.Mesh(
+                file=asset_path, pos=pos, quat=quat, fixed=is_fixed,
+                scale=(scale, scale, scale)
+            ))
+        print(f"  ✅  {os.path.basename(template_name)}")
+    except Exception as e:
+        print(f"  ❌  {os.path.basename(template_name)}: {e}")
+
+
+def _load_replica_scene(scene, scene_json, asset_root):
+    """Load a ReplicaCAD scene into a Genesis scene object."""
+    import json as _json
+    with open(scene_json) as f:
+        config = _json.load(f)
+
+    print("\n── Stage ──")
+    stage = config.get("stage_instance", {})
+    tmpl  = stage.get("template_name")
+    if tmpl:
+        asset = _resolve_asset_path(tmpl, asset_root)
+        if asset:
+            p, q = _convert_habitat_to_genesis(
+                stage.get("translation", [0, 0, 0]),
+                stage.get("rotation",    [1, 0, 0, 0]),
+            )
+            p[2] -= 0.05   # nudge to prevent z-fighting
+            _spawn_entity(scene, tmpl, asset, p, q, True)
+        else:
+            print(f"  ⚠️  Could not resolve stage: {tmpl}")
+
+    print("\n── Rigid objects ──")
+    for obj in config.get("object_instances", []):
+        tmpl  = obj["template_name"]
+        asset = _resolve_asset_path(tmpl, asset_root)
+        if asset:
+            p, q = _convert_habitat_to_genesis(obj["translation"], obj["rotation"])
+            _spawn_entity(scene, tmpl, asset, p, q,
+                          obj.get("motion_type") == "STATIC",
+                          obj.get("uniform_scale", 1.0))
+
+    print("\n── Articulated objects ──")
+    for obj in config.get("articulated_object_instances", []):
+        tmpl  = obj["template_name"]
+        asset = _resolve_asset_path(tmpl, asset_root)
+        if asset:
+            p, q = _convert_habitat_to_genesis(obj["translation"], obj["rotation"])
+            _spawn_entity(scene, tmpl, asset, p, q,
+                          obj.get("fixed_base", True),
+                          obj.get("uniform_scale", 1.0))
+
+
+# ==========================================================================
 #  Environment
 # ==========================================================================
 
@@ -121,12 +214,17 @@ class Go2LidarNavEnv:
         max_episode_steps: int   = 1000,
         headless:          bool  = True,
         device:            str   = "cuda",
+        scene_json:        str   = None,    # path to ReplicaCAD scene JSON
+        asset_root:        str   = None,    # path to ReplicaCAD root dir
     ):
         self.n_envs            = n_envs
         self.num_envs          = n_envs
         self.dt                = dt
         self.max_episode_steps = max_episode_steps
         self.device            = torch.device(device)
+        self.scene_json        = scene_json
+        self.asset_root        = os.path.abspath(asset_root) if asset_root else None
+        self.use_house         = scene_json is not None
 
         self.simulate_action_latency = True
 
@@ -200,39 +298,49 @@ class Go2LidarNavEnv:
             sim_options    = gs.options.SimOptions(dt=self.dt, substeps=2),
             viewer_options = gs.options.ViewerOptions(
                 max_FPS      = int(0.5 / self.dt),
-                camera_pos   = (3.0, 0.0, 3.0),
-                camera_lookat= (0.0, 0.0, 0.5),
+                camera_pos   = (BASE_INIT_POS[0] + 2.0,
+                                BASE_INIT_POS[1] - 2.0, 1.5),
+                camera_lookat= (BASE_INIT_POS[0],
+                                BASE_INIT_POS[1], 0.4),
                 camera_fov   = 50,
             ),
             vis_options    = gs.options.VisOptions(n_rendered_envs=1),
             rigid_options  = gs.options.RigidOptions(
-                dt                = self.dt,
-                constraint_solver = gs.constraint_solver.Newton,
-                enable_collision  = True,
-                enable_joint_limit= True,
+                dt                               = self.dt,
+                constraint_solver                = gs.constraint_solver.Newton,
+                enable_collision                 = True,
+                enable_joint_limit               = True,
+                multiplier_collision_broad_phase = 50,
+                max_collision_pairs              = 10000,
+                iterations                       = 100,
             ),
             show_viewer = not headless,
         )
 
-        # ── Ground ────────────────────────────────────────────────────────
-        self.scene.add_entity(
-            gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True)
-        )
-
-        # ── Obstacles ─────────────────────────────────────────────────────
-        # Static cylinders placed in the scene.
-        # Position is randomised at reset via set_pos().
-        self.obstacles = []
-        for _ in range(N_OBSTACLES):
-            obs_entity = self.scene.add_entity(
-                gs.morphs.Cylinder(
-                    height = OBSTACLE_HEIGHT,
-                    radius = OBSTACLE_RADIUS,
-                    pos    = (5.0, 5.0, OBSTACLE_HEIGHT / 2),  # off-scene initially
-                    fixed  = True,
-                )
+        # ── Scene: house or flat terrain + cylinders ─────────────────────
+        if self.use_house:
+            print(f"\nLoading house scene: {self.scene_json}")
+            _load_replica_scene(self.scene, self.scene_json, self.asset_root)
+            # In house mode obstacles are the room itself — no cylinders needed
+            self.obstacles = []
+            print()
+        else:
+            # Flat terrain
+            self.scene.add_entity(
+                gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True)
             )
-            self.obstacles.append(obs_entity)
+            # Random cylinders — parked off-scene until Phase 2
+            self.obstacles = []
+            for _ in range(N_OBSTACLES):
+                obs_entity = self.scene.add_entity(
+                    gs.morphs.Cylinder(
+                        height = OBSTACLE_HEIGHT,
+                        radius = OBSTACLE_RADIUS,
+                        pos    = (999.0, 999.0, OBSTACLE_HEIGHT / 2),
+                        fixed  = True,
+                    )
+                )
+                self.obstacles.append(obs_entity)
 
         # ── Robot ─────────────────────────────────────────────────────────
         self.base_init_pos  = torch.tensor(BASE_INIT_POS,  device=self.device)
@@ -530,17 +638,30 @@ class Go2LidarNavEnv:
     def set_curriculum_phase(self, phase: int):
         """
         Set the curriculum phase from the trainer.
-        Phase 1: walk only      — obstacles parked off-scene, no avoidance reward
-        Phase 2: obstacles      — obstacles randomised each reset, no avoidance reward
-        Phase 3: full avoidance — obstacles + avoidance penalty enabled
+
+        Flat mode:
+          Phase 1: walk only      — cylinders parked off-scene, no avoidance reward
+          Phase 2: obstacles      — cylinders randomised each reset, no avoidance reward
+          Phase 3: full avoidance — cylinders + avoidance penalty
+
+        House mode:
+          Phase 1: walk only      — no avoidance reward (house walls already present)
+          Phase 2: same as phase 1 (no movable obstacles to add)
+          Phase 3: full avoidance — avoidance penalty enabled
         """
         if phase == self.curriculum_phase:
             return
         self.curriculum_phase = phase
-        self.obstacles_active = phase >= 2
-        self.avoidance_active = phase >= 3
+        if self.use_house:
+            # House walls are always present — only avoidance reward changes
+            self.obstacles_active = False   # no movable cylinders
+            self.avoidance_active = phase >= 3
+        else:
+            self.obstacles_active = phase >= 2
+            self.avoidance_active = phase >= 3
         print(f"\n  [Curriculum] → Phase {phase}  "
-              f"obstacles={'ON' if self.obstacles_active else 'OFF'}  "
+              f"mode={'house' if self.use_house else 'flat'}  "
+              f"obstacles={'ON' if self.obstacles_active else 'room' if self.use_house else 'OFF'}  "
               f"avoidance={'ON' if self.avoidance_active else 'OFF'}\n")
 
     def _randomise_obstacles(self, envs_idx):
@@ -763,6 +884,8 @@ class PPOTrainer:
             max_episode_steps = cfg["max_episode_steps"],
             headless          = cfg["headless"],
             device            = cfg["device"],
+            scene_json        = cfg.get("scene_json"),
+            asset_root        = cfg.get("asset_root"),
         )
 
         obs_dim = self.env.OBS_DIM
@@ -1015,6 +1138,8 @@ def evaluate(checkpoint_path, n_episodes=5):
         max_episode_steps = cfg["max_episode_steps"],
         dt                = cfg["dt"],
         device            = device,
+        scene_json        = cfg.get("scene_json"),
+        asset_root        = cfg.get("asset_root"),
     )
     net = ActorCritic(env.OBS_DIM, Go2LidarNavEnv.ACT_DIM, cfg["hidden_size"])
     net.load_state_dict(ckpt["model_state"])
@@ -1062,7 +1187,9 @@ def get_config(args):
         run_dir            = args.run_dir,
         log_interval       = 10,
         save_interval      = 100,
-        pretrained         = args.pretrained,   # path to flat-terrain checkpoint
+        pretrained         = args.pretrained,
+        scene_json         = args.scene,
+        asset_root         = args.asset_root,
     )
 
 
@@ -1079,6 +1206,10 @@ def main():
     parser.add_argument("--eval",          type=str,  default=None)
     parser.add_argument("--pretrained",    type=str,  default=None,
                         help="Path to flat-terrain walking checkpoint for warm-start")
+    parser.add_argument("--scene",         type=str,  default=None,
+                        help="Path to ReplicaCAD scene JSON (e.g. data/replica_cad/configs/scenes/apt_0.scene_instance.json)")
+    parser.add_argument("--asset-root",    type=str,  default="data/replica_cad/",
+                        help="Root directory of ReplicaCAD dataset")
     args = parser.parse_args()
 
     if args.eval:

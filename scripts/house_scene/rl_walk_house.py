@@ -92,7 +92,7 @@ OBSTACLE_RADIUS    = 0.25   # metres
 # Curriculum phases (in environment steps)
 # Phase 1: walk only — no avoidance reward (robot reinforces walking)
 # Phase 2: full avoidance reward enabled
-CURRICULUM_PHASE1_STEPS = 10_000_000   # 0 → 10M: walk only (short warm-up)
+CURRICULUM_PHASE1_STEPS = 1_000_000   # 0 → 10M: walk only (short warm-up)
 # Phase 2: 10M → end: full avoidance reward
 
 
@@ -198,7 +198,7 @@ def _load_replica_scene(scene, scene_json, asset_root, use_heightfield=True):
             )
             p[2] -= 0.05   # nudge to prevent z-fighting
 
-            if use_heightfield:
+            if False: #use_heightfield:
                 loaded = _load_stage_as_heightfield(scene, asset, p)
                 if not loaded:
                     # Fallback to full mesh

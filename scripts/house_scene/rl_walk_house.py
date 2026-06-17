@@ -4,31 +4,33 @@ go2_lidar_nav.py
 Self-contained RL experiment: Go2 locomotion with LiDAR-based
 obstacle avoidance on flat terrain with random obstacles.
 
-Curriculum learning (3 phases):
-  Phase 1 — Walk (0 → phase1_steps):
-    No obstacles, no avoidance reward. Robot learns/reinforces walking.
-    Pretrained walking checkpoint is loaded if --pretrained is given.
+Curriculum learning (2 phases):
+  Phase 1 — Walk (0 → 10M steps):
+    No avoidance reward. Robot reinforces walking with pretrained weights.
 
-  Phase 2 — Obstacles appear (phase1_steps → phase2_steps):
-    Obstacles present, still no avoidance penalty.
-    Robot learns to navigate around them to keep walking.
+  Phase 2 — Avoidance (10M → end):
+    Full avoidance penalty enabled. LiDAR rays are horizontal-only,
+    positioned above the chassis so they detect room walls and furniture
+    rather than the robot's own body.
 
-  Phase 3 — Avoidance reward (phase2_steps → end):
-    Full avoidance penalty enabled. Robot learns to actively avoid.
+LiDAR setup:
+  - 128 horizontal rays at 0° elevation (flat ring)
+  - pos_offset z=0.35m (above chassis, clears legs)
+  - return_world_frame=True (stable sector ordering as robot rotates)
+  - 128 rays → 36 sector minimums → 81-dim obs (45 prop + 36 LiDAR)
 
 Usage:
-    # Train from scratch with curriculum
-    python go2_lidar_nav.py --n-envs 4096 --device cuda --headless
-
-    # Warm-start from pretrained walking policy (recommended)
-    python go2_lidar_nav.py --n-envs 4096 --device cuda --headless \\
+    # Train in house (recommended)
+    python go2_lidar_nav.py --n-envs 512 --device cuda --headless \\
+        --scene data/replica_cad/configs/scenes/apt_0.scene_instance.json \\
+        --asset-root data/replica_cad/ \\
         --pretrained ../../runs/go2_walk/checkpoint_final.pt
 
     # Evaluate on Mac
     python go2_lidar_nav.py --eval ../../runs/go2_lidar/checkpoint_final.pt
 
-    # Resume training
-    python go2_lidar_nav.py --resume ../../runs/go2_lidar/checkpoint_step_050000000.pt
+    # Resume
+    python go2_lidar_nav.py --resume ../../runs/go2_lidar/checkpoint_step_010000000.pt
 """
 
 import os
@@ -88,12 +90,10 @@ OBSTACLE_HEIGHT    = 1.2    # metres
 OBSTACLE_RADIUS    = 0.25   # metres
 
 # Curriculum phases (in environment steps)
-# Phase 1: walk only — no obstacles, no avoidance reward
-# Phase 2: obstacles appear — no avoidance reward (robot learns to navigate)
-# Phase 3: full avoidance reward enabled
-CURRICULUM_PHASE1_STEPS = 30_000_000   # 0 → 30M: walk only
-CURRICULUM_PHASE2_STEPS = 80_000_000   # 30M → 80M: obstacles, no penalty
-# Phase 3: 80M → end: full avoidance reward
+# Phase 1: walk only — no avoidance reward (robot reinforces walking)
+# Phase 2: full avoidance reward enabled
+CURRICULUM_PHASE1_STEPS = 10_000_000   # 0 → 10M: walk only (short warm-up)
+# Phase 2: 10M → end: full avoidance reward
 
 
 def gs_rand_float(lower, upper, shape, device):
@@ -356,18 +356,18 @@ class Go2LidarNavEnv:
         )
 
         # ── LiDAR sensor ──────────────────────────────────────────────────
-        # Default SphericalPattern — let Genesis choose the resolution.
-        # On GPU (H200) this is vectorised and fast.
-        # On CPU (Mac) it is slower — reduce n_points if needed.
+        # Horizontal-only rays at robot body height to avoid hitting own legs.
+        # pos_offset z=0.35 clears the robot chassis.
+        # return_world_frame=True so sector ordering is stable as robot rotates.
         self.lidar = self.scene.add_sensor(
             gs.sensors.Lidar(
                 pattern = gs.sensors.SphericalPattern(
-                    # Default: n_points=(64, 128) = 8192 rays
-                    # Reduce for CPU: n_points=(16, 32) = 512 rays
+                    fov      = (360.0, 0.0),   # flat horizontal — avoids hitting legs
+                    n_points = (128, 1),        # 128 rays × 1 elevation = 128 rays
                 ),
                 entity_idx         = self.robot.idx,
-                pos_offset         = (0.0, 0.0, 0.15),
-                return_world_frame = False,   # body frame for RL
+                pos_offset         = (0.0, 0.0, 0.35),   # above chassis
+                return_world_frame = True,                # stable sector ordering
                 draw_debug         = (not headless),
             )
         )
@@ -639,29 +639,24 @@ class Go2LidarNavEnv:
         """
         Set the curriculum phase from the trainer.
 
-        Flat mode:
-          Phase 1: walk only      — cylinders parked off-scene, no avoidance reward
-          Phase 2: obstacles      — cylinders randomised each reset, no avoidance reward
-          Phase 3: full avoidance — cylinders + avoidance penalty
+        Two phases:
+          Phase 1: walk only — no avoidance reward (short warm-up)
+          Phase 2: full avoidance reward enabled
 
-        House mode:
-          Phase 1: walk only      — no avoidance reward (house walls already present)
-          Phase 2: same as phase 1 (no movable obstacles to add)
-          Phase 3: full avoidance — avoidance penalty enabled
+        Flat mode: cylinders parked in Phase 1, randomised in Phase 2.
+        House mode: walls always present, only avoidance reward changes.
         """
         if phase == self.curriculum_phase:
             return
         self.curriculum_phase = phase
         if self.use_house:
-            # House walls are always present — only avoidance reward changes
-            self.obstacles_active = False   # no movable cylinders
-            self.avoidance_active = phase >= 3
+            self.obstacles_active = False       # no movable cylinders in house
+            self.avoidance_active = phase >= 2
         else:
             self.obstacles_active = phase >= 2
-            self.avoidance_active = phase >= 3
+            self.avoidance_active = phase >= 2
         print(f"\n  [Curriculum] → Phase {phase}  "
               f"mode={'house' if self.use_house else 'flat'}  "
-              f"obstacles={'ON' if self.obstacles_active else 'room' if self.use_house else 'OFF'}  "
               f"avoidance={'ON' if self.avoidance_active else 'OFF'}\n")
 
     def _randomise_obstacles(self, envs_idx):
@@ -734,7 +729,7 @@ class Go2LidarNavEnv:
     def _reward_obstacle_avoidance(self):
         """
         Penalty based on minimum LiDAR distance.
-        Only active in Phase 3. Returns zero in earlier phases.
+        Only active in Phase 2+. Returns zero in Phase 1.
         """
         if not self.avoidance_active:
             return torch.zeros(self.n_envs, device=self.device, dtype=gs.tc_float)
@@ -961,10 +956,8 @@ class PPOTrainer:
         """Update curriculum phase based on global step count."""
         if global_step < CURRICULUM_PHASE1_STEPS:
             self.env.set_curriculum_phase(1)
-        elif global_step < CURRICULUM_PHASE2_STEPS:
-            self.env.set_curriculum_phase(2)
         else:
-            self.env.set_curriculum_phase(3)
+            self.env.set_curriculum_phase(2)
 
     def train(self):
         cfg = self.cfg
@@ -980,8 +973,7 @@ class PPOTrainer:
         print(f"  Run dir       : {cfg['run_dir']}")
         print(f"  Curriculum:")
         print(f"    Phase 1 (walk only) :    0 → {CURRICULUM_PHASE1_STEPS:,}")
-        print(f"    Phase 2 (obstacles) : {CURRICULUM_PHASE1_STEPS:,} → {CURRICULUM_PHASE2_STEPS:,}")
-        print(f"    Phase 3 (avoidance) : {CURRICULUM_PHASE2_STEPS:,} → end")
+        print(f"    Phase 2 (avoidance) : {CURRICULUM_PHASE1_STEPS:,} → end")
         print(f"{'='*55}\n")
 
         steps_per_rollout = cfg["rollout_steps"] * cfg["n_envs"]
@@ -1132,6 +1124,12 @@ def evaluate(checkpoint_path, n_episodes=5):
     ckpt   = torch.load(checkpoint_path, weights_only=False, map_location=device)
     cfg    = ckpt["config"]
 
+    # Read actual obs_dim from checkpoint weights — don't rely on env
+    obs_dim = ckpt["model_state"]["trunk.0.weight"].shape[1]
+    act_dim = ckpt["model_state"]["actor_head.2.weight"].shape[0]
+    hidden  = cfg.get("hidden_size", 512)
+    print(f"  Checkpoint: obs_dim={obs_dim} act_dim={act_dim} hidden={hidden}")
+
     env = Go2LidarNavEnv(
         n_envs            = 1,
         headless          = False,
@@ -1141,22 +1139,77 @@ def evaluate(checkpoint_path, n_episodes=5):
         scene_json        = cfg.get("scene_json"),
         asset_root        = cfg.get("asset_root"),
     )
-    net = ActorCritic(env.OBS_DIM, Go2LidarNavEnv.ACT_DIM, cfg["hidden_size"])
+
+    net = ActorCritic(obs_dim, act_dim, hidden)
     net.load_state_dict(ckpt["model_state"])
     net.eval().to(device)
 
     for ep in range(n_episodes):
         obs, _ = env.reset()
+
+        # Pad or trim obs to match checkpoint obs_dim if env returns different size
+        # This handles the case where LiDAR gives different ray counts on CPU vs GPU
+        if obs.shape[-1] != obs_dim:
+            print(f"  ⚠️  obs dim mismatch: env={obs.shape[-1]} checkpoint={obs_dim}")
+            print(f"     Padding/trimming to match checkpoint.")
+            if obs.shape[-1] < obs_dim:
+                pad = torch.zeros(obs.shape[0], obs_dim - obs.shape[-1], device=device)
+                obs = torch.cat([obs, pad], dim=-1)
+            else:
+                obs = obs[:, :obs_dim]
+
+        # One-time full sector breakdown at start of episode 1
+        if ep == 0:
+            sectors = env.lidar_sectors[0].cpu().numpy()
+            print(f"\n  LiDAR sector breakdown (episode 1 start):")
+            print(f"  {'Sector':>6}  {'Angle':>7}  {'Distance':>10}")
+            for i, d in enumerate(sectors):
+                angle = i * (360.0 / N_SECTORS)
+                flag  = " ← CLOSE" if d < 1.0 else " ← caution" if d < 2.0 else ""
+                print(f"  {i:>6}  {angle:>6.0f}°  {d:>8.2f}m{flag}")
+            print(f"  Min: {sectors.min():.2f}m  Mean: {sectors.mean():.2f}m  "
+                  f"Max: {sectors.max():.2f}m")
+            print(f"  All at max range ({LIDAR_MAX_RANGE}m)? "
+                  f"{'YES — sensor may not be detecting walls' if sectors.min() > LIDAR_MAX_RANGE * 0.99 else 'NO — sensor working'}\n")
+
         done   = torch.zeros(1, dtype=torch.bool)
         ep_ret, ep_len = 0.0, 0
+        lidar_mins = []
+
         while not done[0]:
             with torch.no_grad():
                 act, _, _ = net.get_action(obs, deterministic=True)
             obs, _, reward, reset_buf, _ = env.step(act)
+
+            # Apply same dim correction each step
+            if obs.shape[-1] != obs_dim:
+                if obs.shape[-1] < obs_dim:
+                    pad = torch.zeros(obs.shape[0], obs_dim - obs.shape[-1], device=device)
+                    obs = torch.cat([obs, pad], dim=-1)
+                else:
+                    obs = obs[:, :obs_dim]
+
+            # Track LiDAR diagnostics
+            min_dist  = env.lidar_sectors.min().item()
+            mean_dist = env.lidar_sectors.mean().item()
+            lidar_mins.append(min_dist)
+
             ep_ret += reward[0].item()
             ep_len += 1
             done    = reset_buf.bool()
+
+            # Print LiDAR every 50 steps
+            if ep_len % 50 == 0:
+                print(f"    step {ep_len:4d}  "
+                      f"min_lidar={min_dist:.2f}m  "
+                      f"mean_lidar={mean_dist:.2f}m  "
+                      f"reward={reward[0].item():.3f}")
+
         print(f"  Episode {ep+1} | return={ep_ret:.2f} | length={ep_len}")
+        if lidar_mins:
+            print(f"    LiDAR stats — min={min(lidar_mins):.2f}m  "
+                  f"mean={sum(lidar_mins)/len(lidar_mins):.2f}m  "
+                  f"max={max(lidar_mins):.2f}m")
 
 
 # ==========================================================================

@@ -92,7 +92,7 @@ OBSTACLE_RADIUS    = 0.25   # metres
 # Curriculum phases (in environment steps)
 # Phase 1: walk only — no avoidance reward (robot reinforces walking)
 # Phase 2: full avoidance reward enabled
-CURRICULUM_PHASE1_STEPS = 1_000_000   # 0 → 10M: walk only (short warm-up)
+CURRICULUM_PHASE1_STEPS = 5_000_000   # 0 → 10M: walk only (short warm-up)
 # Phase 2: 10M → end: full avoidance reward
 
 

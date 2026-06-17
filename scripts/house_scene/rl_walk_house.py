@@ -150,8 +150,38 @@ def _spawn_entity(scene, template_name, asset_path, pos, quat, is_fixed, scale=1
         print(f"  ❌  {os.path.basename(template_name)}: {e}")
 
 
-def _load_replica_scene(scene, scene_json, asset_root):
-    """Load a ReplicaCAD scene into a Genesis scene object."""
+def _load_stage_as_heightfield(scene, asset_path, pos):
+    """
+    Fast floor: add a Genesis infinite plane at Z=0 for collision,
+    and load the stage mesh as visual-only (no collision geometry).
+    This avoids the expensive mesh collision while keeping visuals.
+    """
+    try:
+        # Infinite plane — zero collision cost, guaranteed floor at Z=0
+        scene.add_entity(gs.morphs.Plane())
+        print(f"  ✅  Floor: infinite plane at Z=0 (fast collision)")
+
+        # Stage mesh visual only — no collision, just for rendering
+        scene.add_entity(gs.morphs.Mesh(
+            file          = asset_path,
+            pos           = pos,
+            fixed         = True,
+            collision     = False,   # visual only
+        ))
+        print(f"  ✅  Stage mesh: visual only (no collision)")
+        return True
+
+    except Exception as e:
+        print(f"  ⚠️  Fast floor failed: {e} — falling back to full mesh")
+        return False
+
+
+def _load_replica_scene(scene, scene_json, asset_root, use_heightfield=True):
+    """Load a ReplicaCAD scene into a Genesis scene object.
+
+    use_heightfield: if True, converts the stage mesh to a heightfield
+                     for faster collision. Falls back to mesh on failure.
+    """
     import json as _json
     with open(scene_json) as f:
         config = _json.load(f)
@@ -167,7 +197,14 @@ def _load_replica_scene(scene, scene_json, asset_root):
                 stage.get("rotation",    [1, 0, 0, 0]),
             )
             p[2] -= 0.05   # nudge to prevent z-fighting
-            _spawn_entity(scene, tmpl, asset, p, q, True)
+
+            if use_heightfield:
+                loaded = _load_stage_as_heightfield(scene, asset, p)
+                if not loaded:
+                    # Fallback to full mesh
+                    _spawn_entity(scene, tmpl, asset, p, q, True)
+            else:
+                _spawn_entity(scene, tmpl, asset, p, q, True)
         else:
             print(f"  ⚠️  Could not resolve stage: {tmpl}")
 
@@ -214,8 +251,9 @@ class Go2LidarNavEnv:
         max_episode_steps: int   = 1000,
         headless:          bool  = True,
         device:            str   = "cuda",
-        scene_json:        str   = None,    # path to ReplicaCAD scene JSON
-        asset_root:        str   = None,    # path to ReplicaCAD root dir
+        scene_json:        str   = None,
+        asset_root:        str   = None,
+        use_heightfield:   bool  = True,   # convert stage mesh to heightfield
     ):
         self.n_envs            = n_envs
         self.num_envs          = n_envs
@@ -295,9 +333,9 @@ class Go2LidarNavEnv:
         )
 
         self.scene = gs.Scene(
-            sim_options    = gs.options.SimOptions(dt=0.01, substeps=2),
+            sim_options    = gs.options.SimOptions(dt=self.dt, substeps=2),
             viewer_options = gs.options.ViewerOptions(
-                max_FPS      = 60, 
+                max_FPS      = int(0.5 / self.dt),
                 camera_pos   = (BASE_INIT_POS[0] + 2.0,
                                 BASE_INIT_POS[1] - 2.0, 1.5),
                 camera_lookat= (BASE_INIT_POS[0],
@@ -306,10 +344,13 @@ class Go2LidarNavEnv:
             ),
             vis_options    = gs.options.VisOptions(n_rendered_envs=1),
             rigid_options  = gs.options.RigidOptions(
-                dt                = self.dt,
-                constraint_solver = gs.constraint_solver.Newton,
-                enable_collision  = True,
-                enable_joint_limit= True
+                dt                               = self.dt,
+                constraint_solver                = gs.constraint_solver.Newton,
+                enable_collision                 = True,
+                enable_joint_limit               = True,
+                multiplier_collision_broad_phase = 10,   # reduced from 50
+                max_collision_pairs              = 1000, # reduced from 10000
+                iterations                       = 100,  # restored — needed for stability
             ),
             show_viewer = not headless,
         )
@@ -317,8 +358,10 @@ class Go2LidarNavEnv:
         # ── Scene: house or flat terrain + cylinders ─────────────────────
         if self.use_house:
             print(f"\nLoading house scene: {self.scene_json}")
-            _load_replica_scene(self.scene, self.scene_json, self.asset_root)
-            # In house mode obstacles are the room itself — no cylinders needed
+            _load_replica_scene(
+                self.scene, self.scene_json, self.asset_root,
+                use_heightfield = use_heightfield,
+            )
             self.obstacles = []
             print()
         else:
@@ -878,6 +921,7 @@ class PPOTrainer:
             device            = cfg["device"],
             scene_json        = cfg.get("scene_json"),
             asset_root        = cfg.get("asset_root"),
+            use_heightfield   = cfg.get("use_heightfield", True),
         )
 
         obs_dim = self.env.OBS_DIM
@@ -1135,6 +1179,7 @@ def evaluate(checkpoint_path, n_episodes=5):
         device            = device,
         scene_json        = cfg.get("scene_json"),
         asset_root        = cfg.get("asset_root"),
+        use_heightfield   = cfg.get("use_heightfield", True),
     )
 
     net = ActorCritic(obs_dim, act_dim, hidden)
@@ -1240,6 +1285,7 @@ def get_config(args):
         pretrained         = args.pretrained,
         scene_json         = args.scene,
         asset_root         = args.asset_root,
+        use_heightfield    = not args.no_heightfield,
     )
 
 
@@ -1260,6 +1306,8 @@ def main():
                         help="Path to ReplicaCAD scene JSON (e.g. data/replica_cad/configs/scenes/apt_0.scene_instance.json)")
     parser.add_argument("--asset-root",    type=str,  default="data/replica_cad/",
                         help="Root directory of ReplicaCAD dataset")
+    parser.add_argument("--no-heightfield", action="store_true", default=False,
+                        help="Disable heightfield conversion, use raw mesh (slower)")
     args = parser.parse_args()
 
     if args.eval:

@@ -295,9 +295,9 @@ class Go2LidarNavEnv:
         )
 
         self.scene = gs.Scene(
-            sim_options    = gs.options.SimOptions(dt=self.dt, substeps=2),
+            sim_options    = gs.options.SimOptions(dt=0.01, substeps=2),
             viewer_options = gs.options.ViewerOptions(
-                max_FPS      = int(0.5 / self.dt),
+                max_FPS      = 60, 
                 camera_pos   = (BASE_INIT_POS[0] + 2.0,
                                 BASE_INIT_POS[1] - 2.0, 1.5),
                 camera_lookat= (BASE_INIT_POS[0],
@@ -306,13 +306,10 @@ class Go2LidarNavEnv:
             ),
             vis_options    = gs.options.VisOptions(n_rendered_envs=1),
             rigid_options  = gs.options.RigidOptions(
-                dt                               = self.dt,
-                constraint_solver                = gs.constraint_solver.Newton,
-                enable_collision                 = True,
-                enable_joint_limit               = True,
-                multiplier_collision_broad_phase = 50,
-                max_collision_pairs              = 10000,
-                iterations                       = 100,
+                dt                = self.dt,
+                constraint_solver = gs.constraint_solver.Newton,
+                enable_collision  = True,
+                enable_joint_limit= True
             ),
             show_viewer = not headless,
         )

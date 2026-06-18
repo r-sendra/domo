@@ -10,12 +10,13 @@ Features:
 - Adaptive KL-divergence Learning Rate Schedule
 - Automatic Velocity Command Curriculum
 - Paper Parity Hyperparameters (100Hz Control, [512, 256, 128] MLP)
+- Paper 1:1 Reward Function (with mechanical work & rate penalties)
 
 Usage:
     # Train locally/HPC (defaults to 150M steps)
     python go2_cpg_rl.py --n-envs 4096 --device cuda --headless
 
-    # Evaluate (Automatically falls back to CPU/Metal on Mac)
+    # Evaluate
     python go2_cpg_rl.py --eval runs/go2_cpg/checkpoint_final.pt
 """
 
@@ -56,9 +57,7 @@ BASE_INIT_QUAT = [0.0, 0.0, 0.0, 1.0]
 # ==========================================================================
 
 def compute_go2_ik(x, y, z, is_left_leg):
-    """
-    Batched Analytical Inverse Kinematics for Unitree Go2.
-    """
+    """Batched Analytical Inverse Kinematics for Unitree Go2."""
     L_HIP = 0.0955
     L_THIGH = 0.213
     L_CALF = 0.213
@@ -129,6 +128,8 @@ class Go2CPGEnv:
                 "dof_vel": 1.5
             }
         }
+        
+        # Paper 1:1 Reward Config
         self.reward_cfg = {
             "tracking_sigma": 0.25,
             "reward_scales": {
@@ -140,6 +141,7 @@ class Go2CPGEnv:
                 "work_penalty": -0.001,
             },
         }
+        
         self.command_cfg = {
             "num_commands": 3,
             "lin_vel_x_range": [0.0, 1.0],
@@ -240,6 +242,8 @@ class Go2CPGEnv:
         self.last_actions = torch.zeros_like(self.actions)
         self.dof_pos = torch.zeros_like(self.actions)
         self.dof_vel = torch.zeros_like(self.actions)
+        self.last_dof_vel = torch.zeros_like(self.actions) # ADDED: Buffer for work penalty
+        
         self.base_pos = torch.zeros((N, 3), device=self.device, dtype=f)
         self.base_quat = torch.zeros((N, 4), device=self.device, dtype=f)
         self.extras = {}
@@ -351,7 +355,10 @@ class Go2CPGEnv:
             cpg_obs
         ], dim=-1)
 
+        # ADDED: Store exact velocities for the work penalty to use next step
         self.last_actions[:] = self.actions[:]
+        self.last_dof_vel[:] = self.dof_vel[:]
+        
         return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
 
     def reset(self):
@@ -382,6 +389,7 @@ class Go2CPGEnv:
         self.cpg_theta[envs_idx, 3] = 0.0       # RL
 
         self.last_actions[envs_idx] = 0.0
+        self.last_dof_vel[envs_idx] = 0.0       # ADDED: Clear buffer on reset
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
 
@@ -412,20 +420,18 @@ class Go2CPGEnv:
         return torch.exp(-error / self.reward_cfg["tracking_sigma"])
 
     def _reward_lin_vel_z_penalty(self):
-        # Penalizes bouncing up and down (replaces static height target)
         return torch.square(self.base_lin_vel[:, 2])
 
     def _reward_ang_vel_xy_penalty(self):
-        # Penalizes body roll and pitch rates to keep the chassis flat
         return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
 
     def _reward_work_penalty(self):
-        # Work ζ : -|tau * (q_dot_t - q_dot_t-1)|
-        # Extract torques calculated by the physics engine in the previous step
+        # Extract instantaneous torques calculated by Genesis PD controller
         torques = self.robot.get_dofs_force(self.motor_dofs)
         dof_vel_delta = self.dof_vel - self.last_dof_vel
         work = torch.sum(torch.abs(torques * dof_vel_delta), dim=1)
         return work
+
 
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower

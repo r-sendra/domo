@@ -133,12 +133,12 @@ class Go2CPGEnv:
         self.reward_cfg = {
             "tracking_sigma": 0.25,
             "reward_scales": {
-                "tracking_lin_vel_x": 0.75,
+                "tracking_lin_vel_x": 1,
                 "tracking_lin_vel_y": 0.75,
                 "tracking_ang_vel_z": 0.5,
                 "lin_vel_z_penalty": -2.0,
                 "ang_vel_xy_penalty": -0.05,
-                "work_penalty": -0.0001,
+                "work_penalty": -0.00005,
             },
         }
         
@@ -249,17 +249,20 @@ class Go2CPGEnv:
         self.extras = {}
 
     def update_curriculum(self, global_step):
-        """Gradually widen the command distribution to stabilize early learning."""
-        if global_step < 20_000_000:
-            self.command_cfg["lin_vel_x_range"] = [0.3, 0.5]
-            self.command_cfg["lin_vel_y_range"] = [-0.1, 0.1]
-            self.command_cfg["ang_vel_range"] = [-0.1, 0.1]
-        elif global_step < 50_000_000:
-            self.command_cfg["lin_vel_x_range"] = [0.0, 0.8]
-            self.command_cfg["lin_vel_y_range"] = [-0.3, 0.3]
+        """Force strict forward trotting first, unlock omnidirectional later."""
+        if global_step < 30_000_000:
+            # PHASE 1: Only steady forward movement. No turning, no standing still.
+            self.command_cfg["lin_vel_x_range"] = [0.4, 0.6]
+            self.command_cfg["lin_vel_y_range"] = [0.0, 0.0]
+            self.command_cfg["ang_vel_range"] = [0.0, 0.0]
+        elif global_step < 70_000_000:
+            # PHASE 2: Introduce variable speeds and gentle turns
+            self.command_cfg["lin_vel_x_range"] = [0.2, 0.8]
+            self.command_cfg["lin_vel_y_range"] = [-0.2, 0.2]
             self.command_cfg["ang_vel_range"] = [-0.3, 0.3]
         else:
-            self.command_cfg["lin_vel_x_range"] = [0.0, 1.0]
+            # PHASE 3: Full Omnidirectional
+            self.command_cfg["lin_vel_x_range"] = [-0.2, 1.0]
             self.command_cfg["lin_vel_y_range"] = [-0.5, 0.5]
             self.command_cfg["ang_vel_range"] = [-0.5, 0.5]
 
@@ -283,9 +286,9 @@ class Go2CPGEnv:
         self.cpg_theta = torch.fmod(self.cpg_theta, 2 * math.pi)
 
         # 3. Map to Cartesian trajectories in Leg Frame
-        d_step = 0.10
+        d_step = 0.15
         h_robot = 0.32
-        g_c = 0.12  # Clearance
+        g_c = 0.14  # Clearance
         g_p = 0.02  # Penetration
 
         r_minus_1 = self.cpg_r - 1.0

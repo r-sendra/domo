@@ -83,8 +83,21 @@ PROP_DIM  = 45               # proprioception dims (unchanged from walking env)
 OBS_DIM   = PROP_DIM + N_SECTORS   # 45 + 36 = 81
 
 # Obstacle configuration
-N_OBSTACLES        = 8      # cylinders per environment
-OBSTACLE_RING_MIN  = 1.5    # metres from spawn — inner exclusion (increased from 1.0)
+# Fixed safe spawn positions inside apt_0.
+# These are known-clear floor positions verified visually in the viewer.
+# Add or remove positions to match your specific scene layout.
+# Format: (x, y) — z is always SPAWN_Z
+SPAWN_Z = 0.45
+SAFE_SPAWN_POSITIONS = [
+    (3.0, -2.0),   # verified working — open living area
+    (2.0, -2.0),   # living area left
+    (.0, -1),   # living area back
+    # (2.0, -3.0),   # near rug corner
+    # (4.0, -3.0),   # open area right-back
+    # (2.5, -1.5),   # centre-left
+    # (3.5, -1.5),   # centre-right
+    # (3.5, -2.5),   # centre-back-right
+]
 OBSTACLE_RING_MAX  = 4.0    # metres from spawn — outer boundary
 OBSTACLE_HEIGHT    = 1.2    # metres
 OBSTACLE_RADIUS    = 0.25   # metres
@@ -92,7 +105,7 @@ OBSTACLE_RADIUS    = 0.25   # metres
 # Curriculum phases (in environment steps)
 # Phase 1: walk only — no avoidance reward (robot reinforces walking)
 # Phase 2: full avoidance reward enabled
-CURRICULUM_PHASE1_STEPS = 5_000_000   # 0 → 10M: walk only (short warm-up)
+CURRICULUM_PHASE1_STEPS = 1_000_000    # 0 → 1M: walk only (minimal warm-up)
 # Phase 2: 10M → end: full avoidance reward
 
 
@@ -198,7 +211,7 @@ def _load_replica_scene(scene, scene_json, asset_root, use_heightfield=True):
             )
             p[2] -= 0.05   # nudge to prevent z-fighting
 
-            if False: #use_heightfield:
+            if use_heightfield:
                 loaded = _load_stage_as_heightfield(scene, asset, p)
                 if not loaded:
                     # Fallback to full mesh
@@ -253,7 +266,7 @@ class Go2LidarNavEnv:
         device:            str   = "cuda",
         scene_json:        str   = None,
         asset_root:        str   = None,
-        use_heightfield:   bool  = True,   # convert stage mesh to heightfield
+        use_heightfield:   bool  = False,  # disabled — walls not present without stage collision
     ):
         self.n_envs            = n_envs
         self.num_envs          = n_envs
@@ -633,9 +646,28 @@ class Go2LidarNavEnv:
             envs_idx      = envs_idx,
         )
 
-        # Reset base pose
-        self.base_pos[envs_idx]  = self.base_init_pos
+        # Sample spawn positions from safe position table
+        if self.use_house and len(envs_idx) > 0:
+            valid_pos = self._sample_spawn_positions(len(envs_idx))
+            self.base_pos[envs_idx] = valid_pos
+        else:
+            self.base_pos[envs_idx] = self.base_init_pos
+
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
+
+        # Randomise yaw so robot doesn't always face same direction
+        if self.use_house:
+            yaws = gs_rand_float(
+                -math.pi, math.pi, (len(envs_idx),), self.device
+            )
+            # Build quaternions [x, y, z, w] for each yaw
+            half = yaws * 0.5
+            quat_yaw = torch.zeros(
+                (len(envs_idx), 4), device=self.device, dtype=gs.tc_float
+            )
+            quat_yaw[:, 2] = torch.sin(half)   # z
+            quat_yaw[:, 3] = torch.cos(half)   # w
+            self.base_quat[envs_idx] = quat_yaw
         self.robot.set_pos(self.base_pos[envs_idx],  zero_velocity=False, envs_idx=envs_idx)
         self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx)
         self.base_lin_vel[envs_idx] = 0
@@ -660,6 +692,23 @@ class Go2LidarNavEnv:
             self.episode_sums[key][envs_idx] = 0.0
 
         self._resample_commands(envs_idx)
+
+    def _sample_spawn_positions(self, n: int) -> torch.Tensor:
+        """
+        Sample n spawn positions by randomly picking from the
+        fixed SAFE_SPAWN_POSITIONS table.
+        Returns tensor of shape [n, 3].
+        """
+        if not self.use_house or not SAFE_SPAWN_POSITIONS:
+            return self.base_init_pos.unsqueeze(0).expand(n, -1).clone()
+
+        # Random indices into the safe position table
+        idx = torch.randint(len(SAFE_SPAWN_POSITIONS), (n,))
+        positions = torch.tensor(
+            [(x, y, SPAWN_Z) for x, y in SAFE_SPAWN_POSITIONS],
+            device=self.device, dtype=gs.tc_float,
+        )
+        return positions[idx]   # [n, 3]
 
     def _resample_commands(self, envs_idx):
         if len(envs_idx) == 0:
@@ -1285,7 +1334,7 @@ def get_config(args):
         pretrained         = args.pretrained,
         scene_json         = args.scene,
         asset_root         = args.asset_root,
-        use_heightfield    = not args.no_heightfield,
+        use_heightfield    = not args.no_heightfield,   # default False
     )
 
 
@@ -1306,8 +1355,8 @@ def main():
                         help="Path to ReplicaCAD scene JSON (e.g. data/replica_cad/configs/scenes/apt_0.scene_instance.json)")
     parser.add_argument("--asset-root",    type=str,  default="data/replica_cad/",
                         help="Root directory of ReplicaCAD dataset")
-    parser.add_argument("--no-heightfield", action="store_true", default=False,
-                        help="Disable heightfield conversion, use raw mesh (slower)")
+    parser.add_argument("--no-heightfield", action="store_true", default=True,
+                        help="Disable heightfield (default — walls absent without stage collision)")
     args = parser.parse_args()
 
     if args.eval:

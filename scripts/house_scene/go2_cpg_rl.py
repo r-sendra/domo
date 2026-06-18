@@ -122,10 +122,10 @@ class Go2CPGEnv:
             },
             # Sim-to-Real Observation Noise scales
             "noise_scales": {
-                "ang_vel": 0.05,
-                "gravity": 0.02,
-                "dof_pos": 0.01,
-                "dof_vel": 1.5
+                "ang_vel": 0.00,  # Was 0.05
+                "gravity": 0.00,  # Was 0.02
+                "dof_pos": 0.00,  # Was 0.01
+                "dof_vel": 0.00   # Was 1.5
             }
         }
         
@@ -138,7 +138,7 @@ class Go2CPGEnv:
                 "tracking_ang_vel_z": 0.5,
                 "lin_vel_z_penalty": -2.0,
                 "ang_vel_xy_penalty": -0.05,
-                "work_penalty": -0.001,
+                "work_penalty": -0.0001,
             },
         }
         
@@ -691,7 +691,7 @@ def get_config(args):
     return dict(
         n_envs=args.n_envs, dt=0.01, max_episode_steps=2000, headless=args.headless,
         total_steps=args.total_steps, rollout_steps=args.rollout_steps,
-        minibatch_size=max(total_buffer // 4, 256), n_epochs=5, gamma=0.99, lam=0.95,
+        minibatch_size=max(total_buffer // 4, 256), n_epochs=8, gamma=0.99, lam=0.95,
         clip_eps=0.2, lr=3e-4, vf_coef=1.0, ent_coef=0.01, max_grad_norm=1.0,
         device=args.device, run_dir=args.run_dir, log_interval=10, save_interval=100,
     )

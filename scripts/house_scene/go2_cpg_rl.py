@@ -133,12 +133,10 @@ class Go2CPGEnv:
         self.reward_cfg = {
             "tracking_sigma": 0.25,
             "reward_scales": {
-                "tracking_lin_vel_x": 1,
-                "tracking_lin_vel_y": 0.75,
-                "tracking_ang_vel_z": 0.5,
+                "tracking_joint": 2.0,       # Replaces the separate X, Y, Z scales
                 "lin_vel_z_penalty": -2.0,
                 "ang_vel_xy_penalty": -0.05,
-                "work_penalty": -0.00005,
+                "work_penalty": -0.0001,     # Keep relaxed during early training
             },
         }
         
@@ -274,7 +272,7 @@ class Go2CPGEnv:
         mu = 1.5 + 0.5 * exec_actions[:, 0::3]                 # Amplitude target: [1, 2]
         omega_hz = 2.25 * (exec_actions[:, 1::3] + 1.0)        # Freq target: [0, 4.5 Hz]
         omega = 2 * math.pi * omega_hz                         # Rad/s
-        psi = 1.5 * exec_actions[:, 2::3]                      # Phase bias: [-1.5, 1.5]
+        psi = 0. * exec_actions[:, 2::3]                      # Phase bias: [-1.5, 1.5]
 
         # 2. Integrate CPG Euler Sub-steps
         for _ in range(self.n_cpg_substeps):
@@ -410,17 +408,29 @@ class Go2CPGEnv:
         self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (n,), self.device)
 
     # ── Paper 1:1 Rewards ──────────────────────────────────────────────
-    def _reward_tracking_lin_vel_x(self):
-        error = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
-        return torch.exp(-error / self.reward_cfg["tracking_sigma"])
-
-    def _reward_tracking_lin_vel_y(self):
-        error = torch.square(self.commands[:, 1] - self.base_lin_vel[:, 1])
-        return torch.exp(-error / self.reward_cfg["tracking_sigma"])
-
-    def _reward_tracking_ang_vel_z(self):
-        error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
-        return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+    # def _reward_tracking_lin_vel_x(self):
+    #     error = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
+    #     return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+    #
+    # def _reward_tracking_lin_vel_y(self):
+    #     error = torch.square(self.commands[:, 1] - self.base_lin_vel[:, 1])
+    #     return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+    #
+    # def _reward_tracking_ang_vel_z(self):
+    #     error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+    #     return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+    #
+    
+    # ── Unified Multiplicative Tracking ──────────────────────────────
+    def _reward_tracking_joint(self):
+        # Calculate squared errors for all 3 axes
+        lin_err = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        ang_err = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        
+        # Combine them inside a SINGLE exponential curve
+        # If it disobeys the X command, the whole reward collapses to near zero.
+        # But if commanded to STOP [0,0,0], standing still yields exp(0) = 1.0!
+        return torch.exp(-(lin_err + ang_err) / self.reward_cfg["tracking_sigma"])
 
     def _reward_lin_vel_z_penalty(self):
         return torch.square(self.base_lin_vel[:, 2])

@@ -131,13 +131,13 @@ class Go2CPGEnv:
         }
         self.reward_cfg = {
             "tracking_sigma": 0.25,
-            "base_height_target": 0.32,
             "reward_scales": {
-                "tracking_lin_vel": 1.0,
-                "tracking_ang_vel": 0.2,
-                "lin_vel_z": -1.0,
-                "base_height": -30.0,
-                "action_rate": -0.001,  # Relaxed for CPG
+                "tracking_lin_vel_x": 0.75,
+                "tracking_lin_vel_y": 0.75,
+                "tracking_ang_vel_z": 0.5,
+                "lin_vel_z_penalty": -2.0,
+                "ang_vel_xy_penalty": -0.05,
+                "work_penalty": -0.001,
             },
         }
         self.command_cfg = {
@@ -398,23 +398,34 @@ class Go2CPGEnv:
         self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (n,), self.device)
         self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (n,), self.device)
 
-    # ── Rewards ────────────────────────────────────────────────────────
-    def _reward_tracking_lin_vel(self):
-        error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+    # ── Paper 1:1 Rewards ──────────────────────────────────────────────
+    def _reward_tracking_lin_vel_x(self):
+        error = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
         return torch.exp(-error / self.reward_cfg["tracking_sigma"])
 
-    def _reward_tracking_ang_vel(self):
+    def _reward_tracking_lin_vel_y(self):
+        error = torch.square(self.commands[:, 1] - self.base_lin_vel[:, 1])
+        return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+
+    def _reward_tracking_ang_vel_z(self):
         error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-error / self.reward_cfg["tracking_sigma"])
 
-    def _reward_lin_vel_z(self):
+    def _reward_lin_vel_z_penalty(self):
+        # Penalizes bouncing up and down (replaces static height target)
         return torch.square(self.base_lin_vel[:, 2])
 
-    def _reward_base_height(self):
-        return torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
+    def _reward_ang_vel_xy_penalty(self):
+        # Penalizes body roll and pitch rates to keep the chassis flat
+        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
 
-    def _reward_action_rate(self):
-        return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+    def _reward_work_penalty(self):
+        # Work ζ : -|tau * (q_dot_t - q_dot_t-1)|
+        # Extract torques calculated by the physics engine in the previous step
+        torques = self.robot.get_dofs_force(self.motor_dofs)
+        dof_vel_delta = self.dof_vel - self.last_dof_vel
+        work = torch.sum(torch.abs(torques * dof_vel_delta), dim=1)
+        return work
 
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower

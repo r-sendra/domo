@@ -174,7 +174,7 @@ class Go2CPGEnv:
         }
         self.obs_scales = {"lin_vel": 2.0, "ang_vel": 0.25, "dof_pos": 1.0, "dof_vel": 0.05}
         self.reward_cfg = {
-            "tracking_sigma": 0.5,
+            "tracking_sigma": 0.25,
             "reward_scales": {                            # paper weights, signed
                 "tracking_lin_vel_x":  0.75,
                 "tracking_lin_vel_y":  0.75,
@@ -187,7 +187,7 @@ class Go2CPGEnv:
         # DEFAULT = forward only (clean gait first). For omnidirectional
         # (paper Table III) widen to x:[-1,1] y:[-1,1] yaw:[-1,1].
         self.command_cfg = {
-            "lin_vel_x_range": [0.0, 2.6],
+            "lin_vel_x_range": [0.0, 1.0],
             "lin_vel_y_range": [0.0, 0.0],
             "ang_vel_range":   [0.0, 0.0],
         }
@@ -794,62 +794,332 @@ class PPOTrainer:
         return trainer
 
 
+"""
+voice_commander.py
+------------------
+Voice command interface for Go2 locomotion evaluation.
+
+Pipeline:
+    Microphone → sounddevice (3s chunk)
+    → Whisper tiny (local, ~0.5s latency)
+    → Gemini 2.5 Flash free tier (parse NL → vx, vy, vyaw)
+    → CommandState (thread-safe)
+    → eval loop reads CommandState each step
+
+Dependencies:
+    pip install openai-whisper sounddevice numpy google-genai
+
+Setup:
+    1. Get a free API key at aistudio.google.com/app/apikey
+    2. export GEMINI_API_KEY=your_key_here
+
+Usage:
+    from voice_commander import VoiceCommander, CommandState
+    state = CommandState(vx=0.5)
+    vc    = VoiceCommander(state)
+    vc.start()
+    # in eval loop:
+    vx, vy, vyaw = state.get()
+    vc.stop()
+
+Standalone test:
+    python voice_commander.py
+"""
+
+import os
+import threading
+import time
+import json
+import numpy as np
+
+
 # ==========================================================================
-#  Evaluation  (single env, viewer, fixed forward command for a clean demo)
+#  Command state — thread-safe shared state between voice thread and sim loop
 # ==========================================================================
 
-def evaluate(checkpoint_path, n_episodes=3, command=(0.5, 0.0, 0.0), headless=False):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt = torch.load(checkpoint_path, weights_only=False, map_location=device)
-    cfg = ckpt["config"]
-    sd = clean_state_dict(ckpt["model_state"])           # tolerate _orig_mod./module. prefixes
+class CommandState:
+    VX_MIN,  VX_MAX  = -1.0,  1.0
+    VY_MIN,  VY_MAX  = -0.5,  0.5
+    VYW_MIN, VYW_MAX = -1.0,  1.0
 
-    # Architecture-agnostic dim inference: log_std is always [act_dim],
-    # trunk.0.weight is always [hidden, obs_dim].
-    obs_dim = sd["trunk.0.weight"].shape[1]
-    act_dim = sd["log_std"].shape[0]
-    print(f"  Checkpoint: obs_dim={obs_dim} act_dim={act_dim}")
-    if obs_dim != OBS_DIM:
-        print(f"  [warn] checkpoint obs_dim={obs_dim} != this script's OBS_DIM={OBS_DIM}.\n"
-              f"        It was trained on a different observation layout and will not run here.\n"
-              f"        Retrain with this script (CPG-RL converges in tens of millions of steps).")
-        return
+    def __init__(self, vx: float = 0.5, vy: float = 0.0, vyaw: float = 0.0):
+        self._lock    = threading.Lock()
+        self._vx      = float(vx)
+        self._vy      = float(vy)
+        self._vyaw    = float(vyaw)
+        self._changed = False
 
-    env = Go2CPGEnv(n_envs=1, headless=headless, max_episode_steps=cfg["max_episode_steps"],
-                    dt=cfg["dt"], device=device)
+    def set(self, vx: float, vy: float, vyaw: float):
+        vx   = float(np.clip(vx,   self.VX_MIN,  self.VX_MAX))
+        vy   = float(np.clip(vy,   self.VY_MIN,  self.VY_MAX))
+        vyaw = float(np.clip(vyaw, self.VYW_MIN, self.VYW_MAX))
+        with self._lock:
+            self._vx      = vx
+            self._vy      = vy
+            self._vyaw    = vyaw
+            self._changed = True
+
+    def get(self) -> tuple:
+        with self._lock:
+            return (self._vx, self._vy, self._vyaw)
+
+    def pop_changed(self) -> bool:
+        """Returns True once if state changed since last call."""
+        with self._lock:
+            c = self._changed
+            self._changed = False
+            return c
+
+
+# ==========================================================================
+#  Gemini command parser (free tier)
+# ==========================================================================
+
+SYSTEM_PROMPT = """You are a locomotion command interpreter for a quadruped robot (Go2).
+Convert natural language instructions into robot velocity commands.
+
+Output ONLY a valid JSON object with these exact fields — no markdown, no explanation:
+{
+  "vx":          float,   // forward velocity m/s, range [-1.0, 1.0]
+  "vy":          float,   // lateral velocity m/s, range [-0.5, 0.5], positive=left
+  "vyaw":        float,   // yaw rate rad/s, range [-1.0, 1.0], positive=turn left
+  "description": string   // one short phrase
+}
+
+Speed mappings:
+  "stop" / "halt"          → vx=0 vy=0 vyaw=0
+  "slow" / "slowly"        → multiply speed by 0.3
+  "medium" / default       → multiply speed by 0.6
+  "fast" / "quickly"       → multiply speed by 1.0
+  "faster"                 → add 0.2 to current vx
+  "slower"                 → subtract 0.2 from current vx
+
+Direction:
+  "forward" / "straight"   → vx>0, vy=0, vyaw=0
+  "backward" / "reverse"   → vx<0, vy=0, vyaw=0
+  "left" (lateral)         → vy>0
+  "right" (lateral)        → vy<0
+  "turn left"              → vyaw>0
+  "turn right"             → vyaw<0
+  "spin left"              → vx=0, vyaw=0.8
+  "spin right"             → vx=0, vyaw=-0.8
+
+If a specific speed in m/s is mentioned, use it directly (clamped to range).
+If the command is unclear or unrelated to locomotion, keep current values and
+set description to "no change"."""
+
+
+def parse_with_gemini(
+    text:    str,
+    current: tuple,
+    api_key: str = None,
+) -> tuple:
+    """
+    Parse natural language command using Gemini 2.5 Flash (free tier).
+    Returns (vx, vy, vyaw, description).
+    """
     try:
-        net = ActorCritic(obs_dim, act_dim, cfg.get("hidden_size", 512))
-    except TypeError:
-        net = ActorCritic(obs_dim, act_dim)
-    net.load_state_dict(sd)
-    net.eval().to(device)
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise ImportError(
+            "google-genai not installed — pip install google-genai"
+        )
 
-    cmd = torch.tensor([command], device=device, dtype=gs.tc_float)
-    for ep in range(n_episodes):
-        obs, _ = env.reset()
-        env.commands[:] = cmd
-        done = torch.zeros(1, dtype=torch.bool)
-        ep_ret, ep_len, vx_err, theta_hist = 0.0, 0, [], []
-        while not done[0]:
-            env.commands[:] = cmd
-            with torch.no_grad():
-                act, _, _ = net.get_action(obs, deterministic=True)
-            obs, _, reward, reset_buf, _ = env.step(act)
-            ep_ret += reward[0].item(); ep_len += 1
-            done = reset_buf.bool()
-            vx_err.append(abs(command[0] - env.base_lin_vel[0, 0].item()))
-            theta_hist.append(env.cpg_theta[0].cpu().numpy().copy())
-            if ep_len % 50 == 0:
-                r = env.cpg_r[0].cpu().numpy()
-                print(f"    step {ep_len:4d}  vx={env.base_lin_vel[0,0].item():+.2f}/{command[0]:.2f}  "
-                      f"vy={env.base_lin_vel[0,1].item():+.2f}  wz={env.base_ang_vel[0,2].item():+.2f}  "
-                      f"h={env.base_pos[0,2].item():.2f}  r=[{r[0]:.2f} {r[1]:.2f} {r[2]:.2f} {r[3]:.2f}]")
-        th = np.array(theta_hist)[:, 0]
-        wraps = int(np.sum(np.diff(th) < -math.pi))
-        period = (ep_len * env.dt / wraps) if wraps > 0 else float('nan')
-        print(f"  Episode {ep+1} | return={ep_ret:7.2f} | length={ep_len:4d} | "
-              f"mean |vx err|={np.mean(vx_err):.3f} m/s | gait period~{period:.2f}s\n")
+    key = api_key or os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise ValueError(
+            "No Gemini API key. Set GEMINI_API_KEY env var or pass api_key=."
+        )
 
+    client = genai.Client(api_key=key)
+
+    user_msg = (
+        f"Current command: vx={current[0]:.2f}, "
+        f"vy={current[1]:.2f}, vyaw={current[2]:.2f}\n"
+        f"User said: \"{text}\""
+    )
+
+    response = client.models.generate_content(
+        model    = "gemini-2.5-flash",
+        contents = [
+            types.Content(
+                role  = "user",
+                parts = [types.Part(text=SYSTEM_PROMPT + "\n\n" + user_msg)],
+            )
+        ],
+        config = types.GenerateContentConfig(
+            temperature      = 0.1,   # low temp for consistent JSON
+            max_output_tokens = 200,
+        ),
+    )
+
+    raw  = response.text.strip()
+    # Strip markdown fences if Gemini adds them
+    raw  = raw.replace("```json", "").replace("```", "").strip()
+    data = json.loads(raw)
+
+    vx   = float(data.get("vx",   current[0]))
+    vy   = float(data.get("vy",   current[1]))
+    vyaw = float(data.get("vyaw", current[2]))
+    desc = str(data.get("description", ""))
+
+    return (vx, vy, vyaw, desc)
+
+
+# ==========================================================================
+#  Audio recording + Whisper transcription
+# ==========================================================================
+
+def record_audio(duration: float = 3.0, sample_rate: int = 16000) -> np.ndarray:
+    """Record `duration` seconds from the default microphone."""
+    try:
+        import sounddevice as sd
+    except ImportError:
+        raise ImportError("sounddevice not installed — pip install sounddevice")
+
+    audio = sd.rec(
+        int(duration * sample_rate),
+        samplerate = sample_rate,
+        channels   = 1,
+        dtype      = "float32",
+    )
+    sd.wait()
+    return audio.flatten()
+
+
+def transcribe(audio: np.ndarray, model) -> str:
+    """Transcribe float32 numpy audio array using a loaded Whisper model."""
+    result = model.transcribe(audio, fp16=False)
+    return result["text"].strip()
+
+
+# ==========================================================================
+#  Voice Commander — background thread
+# ==========================================================================
+
+class VoiceCommander:
+    """
+    Records audio in 3-second chunks, transcribes with Whisper,
+    parses with Gemini, and updates CommandState.
+    Runs as a daemon thread — stops automatically when the main program exits.
+    """
+
+    def __init__(
+        self,
+        state:              CommandState,
+        whisper_model:      str   = "tiny",   # tiny/base/small
+        chunk_duration:     float = 3.0,
+        silence_threshold:  float = 0.01,
+        api_key:            str   = None,
+        verbose:            bool  = True,
+    ):
+        self.state             = state
+        self.whisper_model_name = whisper_model
+        self.chunk_duration    = chunk_duration
+        self.silence_threshold = silence_threshold
+        self.api_key           = api_key
+        self.verbose           = verbose
+        self._stop             = threading.Event()
+        self._thread           = None
+        self._whisper          = None
+
+    def _load_whisper(self):
+        try:
+            import whisper
+            if self.verbose:
+                print(f"  [voice] Loading Whisper '{self.whisper_model_name}'...")
+            self._whisper = whisper.load_model(self.whisper_model_name)
+            if self.verbose:
+                print(f"  [voice] Whisper ready.")
+        except ImportError:
+            raise ImportError(
+                "openai-whisper not installed — pip install openai-whisper"
+            )
+
+    def _loop(self):
+        self._load_whisper()
+
+        if self.verbose:
+            print(f"\n  [voice] Listening  (chunk={self.chunk_duration}s, "
+                  f"model={self.whisper_model_name})")
+            print(f"  [voice] Examples:")
+            print(f"            'go forward at 0.5 metres per second'")
+            print(f"            'turn left slowly'")
+            print(f"            'stop'\n")
+
+        while not self._stop.is_set():
+            try:
+                audio = record_audio(self.chunk_duration)
+
+                # Skip silence
+                rms = float(np.sqrt(np.mean(audio ** 2)))
+                if rms < self.silence_threshold:
+                    continue
+
+                text = transcribe(audio, self._whisper)
+                if not text or len(text.strip()) < 3:
+                    continue
+
+                if self.verbose:
+                    print(f"  [voice] Heard: \"{text}\"")
+
+                current = self.state.get()
+                vx, vy, vyaw, desc = parse_with_gemini(
+                    text, current, self.api_key
+                )
+
+                if desc == "no change":
+                    if self.verbose:
+                        print(f"  [voice] No change.")
+                    continue
+
+                self.state.set(vx, vy, vyaw)
+                if self.verbose:
+                    print(f"  [voice] → {desc}")
+                    print(f"          vx={vx:.2f}  vy={vy:.2f}  vyaw={vyaw:.2f}")
+
+            except KeyboardInterrupt:
+                break
+            except json.JSONDecodeError as e:
+                if self.verbose:
+                    print(f"  [voice] JSON parse error: {e}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"  [voice] Error: {e}")
+                time.sleep(0.5)
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+
+# ==========================================================================
+#  Standalone test
+# ==========================================================================
+
+if __name__ == "__main__":
+    print("Voice Commander — standalone test")
+    print("Requires: GEMINI_API_KEY environment variable")
+    print("Say locomotion commands. Ctrl+C to exit.\n")
+
+    state = CommandState(vx=0.5)
+    vc    = VoiceCommander(state, verbose=True)
+    vc.start()
+
+    try:
+        while True:
+            time.sleep(2.0)
+            vx, vy, vyaw = state.get()
+            print(f"  State: vx={vx:.2f}  vy={vy:.2f}  vyaw={vyaw:.2f}")
+    except KeyboardInterrupt:
+        print("\nStopping.")
+        vc.stop()
 
 # ==========================================================================
 #  Entry point
@@ -868,31 +1138,163 @@ def get_config(args):
         target_kl=0.02, vloss_skip=1e3, lr_floor_frac=0.05,
     )
 
+def evaluate(
+    checkpoint_path,
+    n_episodes = 3,
+    command    = (0.5, 0.0, 0.0),
+    headless   = False,
+    voice      = False,           # NEW: enable voice control
+    whisper_model = "tiny",       # NEW: whisper model size
+):
+    import sys, os
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt   = torch.load(checkpoint_path, weights_only=False, map_location=device)
+    cfg    = ckpt["config"]
+    sd     = clean_state_dict(ckpt["model_state"])
+
+    obs_dim = sd["trunk.0.weight"].shape[1]
+    act_dim = sd["log_std"].shape[0]
+    print(f"  Checkpoint: obs_dim={obs_dim} act_dim={act_dim}")
+    if obs_dim != OBS_DIM:
+        print(f"  [warn] checkpoint obs_dim={obs_dim} != this script's OBS_DIM={OBS_DIM}.\n"
+              f"        Retrain with this script.")
+        return
+
+    env = Go2CPGEnv(n_envs=1, headless=headless,
+                    max_episode_steps=cfg["max_episode_steps"],
+                    dt=cfg["dt"], device=device)
+    try:
+        net = ActorCritic(obs_dim, act_dim, cfg.get("hidden_size", 512))
+    except TypeError:
+        net = ActorCritic(obs_dim, act_dim)
+    net.load_state_dict(sd)
+    net.eval().to(device)
+
+    # ── Voice commander setup ─────────────────────────────────────────────
+    cmd_state = None
+    vc        = None
+    if voice:
+        try:
+            from voice_commander import VoiceCommander, CommandState
+            cmd_state = CommandState(
+                vx=command[0], vy=command[1], vyaw=command[2]
+            )
+            vc = VoiceCommander(
+                state         = cmd_state,
+                whisper_model = whisper_model,
+                verbose       = True,
+            )
+            vc.start()
+            print(f"\n  Voice control ENABLED")
+            print(f"  Initial command: vx={command[0]} vy={command[1]} vyaw={command[2]}")
+            print(f"  Speak to change commands during evaluation.\n")
+        except ImportError as e:
+            print(f"  [warn] Voice dependencies missing: {e}")
+            print(f"  Install: pip install openai-whisper sounddevice google-genai")
+            print(f"  Falling back to fixed command.\n")
+            voice = False
+
+    cmd = torch.tensor([command], device=device, dtype=gs.tc_float)
+
+    try:
+        for ep in range(n_episodes):
+            obs, _ = env.reset()
+            env.commands[:] = cmd
+            done = torch.zeros(1, dtype=torch.bool)
+            ep_ret, ep_len, vx_err, theta_hist = 0.0, 0, [], []
+
+            while not done[0]:
+                # Update command from voice if changed
+                if voice and cmd_state is not None:
+                    if cmd_state.pop_changed():
+                        vx, vy, vyaw = cmd_state.get()
+                        cmd = torch.tensor(
+                            [[vx, vy, vyaw]], device=device, dtype=gs.tc_float
+                        )
+                        print(f"    → New command: vx={vx:.2f} vy={vy:.2f} vyaw={vyaw:.2f}")
+
+                env.commands[:] = cmd
+                with torch.no_grad():
+                    act, _, _ = net.get_action(obs, deterministic=True)
+                obs, _, reward, reset_buf, _ = env.step(act)
+                ep_ret += reward[0].item(); ep_len += 1
+                done = reset_buf.bool()
+                vx_err.append(abs(cmd[0, 0].item() - env.base_lin_vel[0, 0].item()))
+                theta_hist.append(env.cpg_theta[0].cpu().numpy().copy())
+
+                if ep_len % 50 == 0:
+                    r = env.cpg_r[0].cpu().numpy()
+                    vx_cmd = cmd[0, 0].item()
+                    print(f"    step {ep_len:4d}  "
+                          f"vx={env.base_lin_vel[0,0].item():+.2f}/{vx_cmd:.2f}  "
+                          f"vy={env.base_lin_vel[0,1].item():+.2f}  "
+                          f"wz={env.base_ang_vel[0,2].item():+.2f}  "
+                          f"h={env.base_pos[0,2].item():.2f}  "
+                          f"r=[{r[0]:.2f} {r[1]:.2f} {r[2]:.2f} {r[3]:.2f}]")
+
+            import math as _math
+            th     = np.array(theta_hist)[:, 0]
+            wraps  = int(np.sum(np.diff(th) < -_math.pi))
+            period = (ep_len * env.dt / wraps) if wraps > 0 else float('nan')
+            print(f"  Episode {ep+1} | return={ep_ret:7.2f} | length={ep_len:4d} | "
+                  f"mean |vx err|={np.mean(vx_err):.3f} m/s | "
+                  f"gait period~{period:.2f}s\n")
+
+    finally:
+        if vc is not None:
+            vc.stop()
+
+
+# ==========================================================================
+#  REPLACE the existing main() function with this one
+# ==========================================================================
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--n-envs",        type=int, default=4096)
-    p.add_argument("--total-steps",   type=int, default=80_000_000)
-    p.add_argument("--rollout-steps", type=int, default=24)
-    p.add_argument("--device",        type=str, default="cuda", choices=["cpu", "cuda", "mps"])
-    p.add_argument("--run-dir",       type=str, default="../../runs/go2_cpg")
+    p.add_argument("--n-envs",        type=int,   default=4096)
+    p.add_argument("--total-steps",   type=int,   default=80_000_000)
+    p.add_argument("--rollout-steps", type=int,   default=24)
+    p.add_argument("--device",        type=str,   default="cuda",
+                   choices=["cpu", "cuda", "mps"])
+    p.add_argument("--run-dir",       type=str,   default="../../runs/go2_cpg")
     p.add_argument("--headless",      action="store_true", default=True)
-    p.add_argument("--resume",        type=str, default=None)
-    p.add_argument("--eval",          type=str, default=None)
+    p.add_argument("--resume",        type=str,   default=None)
+    p.add_argument("--eval",          type=str,   default=None)
+
+    # Velocity command args (used when --voiceless or voice unavailable)
     p.add_argument("--vx",   type=float, default=0.5,
-               help="Forward velocity command for eval (m/s)")
+                   help="Forward velocity command for eval (m/s)")
     p.add_argument("--vy",   type=float, default=0.0,
-                help="Lateral velocity command for eval (m/s)")
+                   help="Lateral velocity command for eval (m/s)")
     p.add_argument("--vyaw", type=float, default=0.0,
-                help="Yaw rate command for eval (rad/s)")
+                   help="Yaw rate command for eval (rad/s)")
+
+    # Voice control
+    p.add_argument("--voice",       action="store_true", default=False,
+                   help="Enable voice control via Whisper + Claude")
+    p.add_argument("--voiceless",   action="store_true", default=False,
+                   help="Disable voice control (use --vx/--vy/--vyaw)")
+    p.add_argument("--whisper-model", type=str, default="tiny",
+                   choices=["tiny", "base", "small", "medium"],
+                   help="Whisper model size (default: tiny)")
+
     args = p.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
         args.device = "cpu"
+
     if args.eval:
-        evaluate(args.eval, command=(args.vx, args.vy, args.vyaw))
+        use_voice = args.voice and not args.voiceless
+        evaluate(
+            args.eval,
+            command       = (args.vx, args.vy, args.vyaw),
+            voice         = use_voice,
+            whisper_model = args.whisper_model,
+        )
         return
-    trainer = PPOTrainer.load_checkpoint(args.resume) if args.resume else PPOTrainer(get_config(args))
+
+    trainer = (PPOTrainer.load_checkpoint(args.resume)
+               if args.resume else PPOTrainer(get_config(args)))
     trainer.train()
 
 

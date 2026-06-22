@@ -80,9 +80,9 @@ LEG_SIDE_SIGN = [-1.0, +1.0, -1.0, +1.0]   # [FR, FL, RR, RL]: right -y, left +y
 
 # --- CPG / foot-trajectory parameters --------------------------------------
 A_CONV  = 150.0   # oscillator convergence factor a (paper). Critically damped.
-D_STEP  = 0.15    # max step length scale [m]
+D_STEP  = 0.2    # max step length scale [m]
 H_NOM   = 0.30    # nominal foot depth below the hip [m] -> base stands ~0.30 m
-G_CLEAR = 0.06    # max swing ground clearance g_c [m]
+G_CLEAR = 0.08    # max swing ground clearance g_c [m]
 G_PEN   = 0.02    # max stance ground penetration g_p [m]
 CPG_DT  = 0.001   # CPG integration step [s] -> 1 kHz, matches the paper
 
@@ -96,7 +96,7 @@ TROT_PHASE = [0.0, math.pi, math.pi, 0.0]
 # caps gait freq at ~0.7 Hz (too slow for the ~0.5 s trot they report), so omega
 # is treated as Hz with theta_dot = 2*pi*omega. psi is taken as rad/s.
 MU_MIN,  MU_MAX  = 1.0, 2.0
-OMG_MIN, OMG_MAX = 0.0, 4.5
+OMG_MIN, OMG_MAX = 1.5, 3.5
 PSI_MAX          = 1.5
 MU_MID,  MU_HALF  = 0.5 * (MU_MAX + MU_MIN),  0.5 * (MU_MAX - MU_MIN)
 OMG_MID, OMG_HALF = 0.5 * (OMG_MAX + OMG_MIN), 0.5 * (OMG_MAX - OMG_MIN)
@@ -455,7 +455,7 @@ class Go2CPGEnv:
         self.cpg_r[envs_idx]     = 1.0
         self.cpg_rdot[envs_idx]  = 0.0
         self.cpg_theta[envs_idx] = self.trot_phase
-        self.cpg_phi[envs_idx]   = 0.0
+        self.cpg_phi[envs_idx]   = self.trot_phase * 0.1
 
         self.last_actions[envs_idx]       = 0.0
         self.last_dof_vel[envs_idx]       = 0.0

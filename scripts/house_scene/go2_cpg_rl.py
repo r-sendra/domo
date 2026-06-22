@@ -187,7 +187,7 @@ class Go2CPGEnv:
         # DEFAULT = forward only (clean gait first). For omnidirectional
         # (paper Table III) widen to x:[-1,1] y:[-1,1] yaw:[-1,1].
         self.command_cfg = {
-            "lin_vel_x_range": [0.0, 2.6],
+            "lin_vel_x_range": [0.4, 2.6],
             "lin_vel_y_range": [0.0, 0.0],
             "ang_vel_range":   [0.0, 0.0],
         }
@@ -533,7 +533,6 @@ class Go2CPGEnv:
 # ==========================================================================
 #  ActorCritic
 # ==========================================================================
-
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim, act_dim, hidden=512):
         super().__init__()

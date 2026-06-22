@@ -317,15 +317,47 @@ class Go2CPGEnv:
         psi      = PSI_MAX * t[:, 8:12]
         return mu, omega_hz, psi
 
+    # def _integrate_cpg(self, mu, omega_hz, psi):
+    #     omega = 2.0 * math.pi * omega_hz
+    #     a, dt_c = A_CONV, self.cpg_dt
+    #     for _ in range(self.n_cpg_substeps):
+    #         r_ddot = a * (0.25 * a * (mu - self.cpg_r) - self.cpg_rdot)
+    #         self.cpg_rdot = self.cpg_rdot + r_ddot * dt_c
+    #         self.cpg_r    = self.cpg_r + self.cpg_rdot * dt_c
+    #         self.cpg_theta = self.cpg_theta + omega * dt_c
+    #         self.cpg_phi   = self.cpg_phi + psi * dt_c
+    #     self.cpg_theta = torch.remainder(self.cpg_theta, 2 * math.pi)
+    #     self.cpg_phi   = torch.remainder(self.cpg_phi,   2 * math.pi)
     def _integrate_cpg(self, mu, omega_hz, psi):
         omega = 2.0 * math.pi * omega_hz
         a, dt_c = A_CONV, self.cpg_dt
+
+        # Desired phase offsets for trot [FR, FL, RR, RL]
+        # FR-RL in phase, FL-RR in phase, diagonal pairs π apart
+        phi_star = torch.tensor([
+            [0.0,   math.pi, math.pi, 0.0],   # FR target offsets
+            [math.pi, 0.0,   0.0,   math.pi], # FL
+            [math.pi, 0.0,   0.0,   math.pi], # RR
+            [0.0,   math.pi, math.pi, 0.0],   # RL
+        ], device=self.device)
+
+        # Coupling weight
+        w = 2.0   # paper uses w=1, higher = stronger coupling
+
         for _ in range(self.n_cpg_substeps):
+            # Kuramoto coupling: pull each leg toward desired phase offset
+            theta_i = self.cpg_theta.unsqueeze(2)   # [N, 4, 1]
+            theta_j = self.cpg_theta.unsqueeze(1)   # [N, 1, 4]
+            coupling = w * torch.sum(
+                torch.sin(theta_j - theta_i - phi_star), dim=2
+            )   # [N, 4]
+
             r_ddot = a * (0.25 * a * (mu - self.cpg_r) - self.cpg_rdot)
-            self.cpg_rdot = self.cpg_rdot + r_ddot * dt_c
-            self.cpg_r    = self.cpg_r + self.cpg_rdot * dt_c
-            self.cpg_theta = self.cpg_theta + omega * dt_c
+            self.cpg_rdot  = self.cpg_rdot + r_ddot * dt_c
+            self.cpg_r     = self.cpg_r + self.cpg_rdot * dt_c
+            self.cpg_theta = self.cpg_theta + (omega + coupling) * dt_c
             self.cpg_phi   = self.cpg_phi + psi * dt_c
+
         self.cpg_theta = torch.remainder(self.cpg_theta, 2 * math.pi)
         self.cpg_phi   = torch.remainder(self.cpg_phi,   2 * math.pi)
 

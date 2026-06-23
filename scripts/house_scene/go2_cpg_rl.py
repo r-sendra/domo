@@ -188,8 +188,8 @@ class Go2CPGEnv:
         # (paper Table III) widen to x:[-1,1] y:[-1,1] yaw:[-1,1].
         self.command_cfg = {
             "lin_vel_x_range": [0.6, 2],
-            "lin_vel_y_range": [0.0, 0.0],
-            "ang_vel_range":   [0.0, 0.0],
+            "lin_vel_y_range": [-0.5, 0.5],
+            "ang_vel_range":   [-1.0, 1.0],
         }
 
         self.reward_scales = {k: v * dt for k, v in self.reward_cfg["reward_scales"].items()}

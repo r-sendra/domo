@@ -174,7 +174,7 @@ class Go2CPGEnv:
         }
         self.obs_scales = {"lin_vel": 2.0, "ang_vel": 0.25, "dof_pos": 1.0, "dof_vel": 0.05}
         self.reward_cfg = {
-            "tracking_sigma": 0.5,
+            "tracking_sigma": 0.15,
             "reward_scales": {                            # paper weights, signed
                 "tracking_lin_vel_x":  0.75,
                 "tracking_lin_vel_y":  0.75,

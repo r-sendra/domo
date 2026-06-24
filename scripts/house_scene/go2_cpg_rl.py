@@ -174,7 +174,7 @@ class Go2CPGEnv:
         }
         self.obs_scales = {"lin_vel": 2.0, "ang_vel": 0.25, "dof_pos": 1.0, "dof_vel": 0.05}
         self.reward_cfg = {
-            "tracking_sigma": 0.15,
+            "tracking_sigma": 0.5,
             "reward_scales": {                            # paper weights, signed
                 "tracking_lin_vel_x":  0.75,
                 "tracking_lin_vel_y":  0.75,
@@ -859,7 +859,8 @@ def get_config(args):
     return dict(
         n_envs=args.n_envs, dt=0.02, max_episode_steps=1000, headless=args.headless,
         hidden_size=512, total_steps=args.total_steps, rollout_steps=args.rollout_steps,
-        minibatch_size=max(total_buffer // 4, 256), n_epochs=5,
+        minibatch_size=16384, #max(total_buffer // 4, 256), 
+        n_epochs=5,
         gamma=0.99, lam=0.95, clip_eps=0.2, lr=3e-4, vf_coef=1.0, ent_coef=0.01,
         max_grad_norm=1.0, device=args.device, run_dir=args.run_dir,
         log_interval=10, save_interval=100,

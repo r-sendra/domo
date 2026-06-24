@@ -178,7 +178,7 @@ class Go2CPGEnv:
             "reward_scales": {                            # paper weights, signed
                 "tracking_lin_vel_x":  0.75,
                 "tracking_lin_vel_y":  0.75,
-                "tracking_ang_vel":    0.50,
+                "tracking_ang_vel":    0.75,
                 "lin_vel_z":          -2.00,
                 "ang_vel_xy":         -0.05,
                 "work":               -0.001,
@@ -187,7 +187,7 @@ class Go2CPGEnv:
         # DEFAULT = forward only (clean gait first). For omnidirectional
         # (paper Table III) widen to x:[-1,1] y:[-1,1] yaw:[-1,1].
         self.command_cfg = {
-            "lin_vel_x_range": [-2, 4],
+            "lin_vel_x_range": [0.3, 3],
             "lin_vel_y_range": [-0.5, 0.5],
             "ang_vel_range":   [-1.0, 1.0],
         }
@@ -309,6 +309,13 @@ class Go2CPGEnv:
         self.episode_length_buf = torch.zeros((N,),         device=self.device, dtype=gs.tc_int)
         self.extras = {}
 
+        self.phi_star = torch.tensor([
+            [0.0,     math.pi, math.pi, 0.0    ],
+            [math.pi, 0.0,     0.0,     math.pi],
+            [math.pi, 0.0,     0.0,     math.pi],
+            [0.0,     math.pi, math.pi, 0.0    ],
+        ], device=self.device, dtype=gs.tc_float)
+
     # ------------------------------------------------------------------
     def _map_action(self, raw):
         t = torch.tanh(raw)                              # bounded; squash lives in env
@@ -334,13 +341,13 @@ class Go2CPGEnv:
 
         # Desired phase offsets for trot gait [FR, FL, RR, RL]
         # Diagonal pairs (FR+RL, FL+RR) are in phase, opposite pairs are π apart
-        phi_star = torch.tensor([
-            [0.0,       math.pi, math.pi, 0.0    ],   # FR offsets
-            [math.pi,   0.0,     0.0,     math.pi],   # FL offsets
-            [math.pi,   0.0,     0.0,     math.pi],   # RR offsets
-            [0.0,       math.pi, math.pi, 0.0    ],   # RL offsets
-        ], device=self.device, dtype=gs.tc_float)
-
+        # phi_star = torch.tensor([
+        #     [0.0,       math.pi, math.pi, 0.0    ],   # FR offsets
+        #     [math.pi,   0.0,     0.0,     math.pi],   # FL offsets
+        #     [math.pi,   0.0,     0.0,     math.pi],   # RR offsets
+        #     [0.0,       math.pi, math.pi, 0.0    ],   # RL offsets
+        # ], device=self.device, dtype=gs.tc_float)
+        #
         COUPLING_W = 2.0   # coupling strength — higher = tighter phase lock
 
         for _ in range(self.n_cpg_substeps):
@@ -349,7 +356,7 @@ class Go2CPGEnv:
             theta_i  = self.cpg_theta.unsqueeze(2)
             theta_j  = self.cpg_theta.unsqueeze(1)
             coupling = COUPLING_W * torch.sum(
-                torch.sin(theta_j - theta_i - phi_star), dim=2
+                torch.sin(theta_j - theta_i - self.phi_star), dim=2
             )   # [N, 4]
 
             r_ddot = a * (0.25 * a * (mu - self.cpg_r) - self.cpg_rdot)
@@ -859,7 +866,7 @@ def get_config(args):
     return dict(
         n_envs=args.n_envs, dt=0.02, max_episode_steps=1000, headless=args.headless,
         hidden_size=512, total_steps=args.total_steps, rollout_steps=args.rollout_steps,
-        minibatch_size=16384, #max(total_buffer // 4, 256), 
+        minibatch_size=max(total_buffer // 4, 256), 
         n_epochs=5,
         gamma=0.99, lam=0.95, clip_eps=0.2, lr=3e-4, vf_coef=1.0, ent_coef=0.01,
         max_grad_norm=1.0, device=args.device, run_dir=args.run_dir,

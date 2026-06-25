@@ -92,9 +92,12 @@ CONTACT_FORCE_THRESH = 1.0
 #  Constants — LiDAR
 # ==========================================================================
 
-N_LIDAR_SECTORS  = 36         # horizontal sectors
-N_LIDAR_HEIGHTS = 3
-LIDAR_MAX_RANGE  = 5.0        # metres
+N_LIDAR_SECTORS  = 36         # horizontal sectors (obs size stays 36)
+N_LIDAR_ELEV     = 4          # elevation layers: -20°, -10°, 0°, +10°
+# Total rays = N_LIDAR_SECTORS × N_LIDAR_ELEV = 144
+# Aggregation: min across elevations per sector → 36 obs values
+# Detects short ground objects (small spheres, low boxes) missed by flat ring
+LIDAR_MAX_RANGE  = 4.0        # metres
 LIDAR_INTERVAL   = 5          # update every N steps (10 Hz at 50 Hz control)
 LIDAR_POS_OFFSET = (0.0, 0.0, 0.35)   # above chassis — avoids self-hit
 
@@ -129,7 +132,7 @@ SPHERE_RAD_RANGE  = (0.06, 0.14)   # ball/vase scale
 # ==========================================================================
 
 PROP_DIM  = 76                        # proprioception (matches go2_cpg_rl.py)
-OBS_DIM   = PROP_DIM + N_LIDAR_SECTORS*N_LIDAR_HEIGHTS  # 76 + 36 = 112
+OBS_DIM   = PROP_DIM + N_LIDAR_SECTORS  # 76 + 36 = 112 (sectors, not raw rays)
 ACT_DIM   = 12
 
 
@@ -333,8 +336,8 @@ class Go2CPGNavEnv:
         self.lidar = self.scene.add_sensor(
             gs.sensors.Lidar(
                 pattern = gs.sensors.SphericalPattern(
-                    fov      = (360.0, 0.0),   # flat horizontal
-                    n_points = (N_LIDAR_SECTORS, N_LIDAR_HEIGHTS),
+                    fov      = (360.0, 30.0),           # 360° horiz, ±15° vert
+                    n_points = (N_LIDAR_SECTORS, N_LIDAR_ELEV),  # 36×4 = 144 rays
                 ),
                 entity_idx         = self.robot.idx,
                 pos_offset         = LIDAR_POS_OFFSET,
@@ -396,7 +399,8 @@ class Go2CPGNavEnv:
         print(f"  Control dt    : {dt}s ({1/dt:.0f} Hz) | CPG {self.n_cpg_substeps}x ({1/self.cpg_dt:.0f} Hz)")
         print(f"  Obs / Act     : {OBS_DIM} / {ACT_DIM}  "
               f"({PROP_DIM} prop + {N_LIDAR_SECTORS} LiDAR)")
-        print(f"  LiDAR         : {N_LIDAR_SECTORS} rays, max {LIDAR_MAX_RANGE}m, "
+        print(f"  LiDAR         : {N_LIDAR_SECTORS} sectors × {N_LIDAR_ELEV} elevations "
+              f"= {N_LIDAR_SECTORS*N_LIDAR_ELEV} rays, max {LIDAR_MAX_RANGE}m, "
               f"update every {LIDAR_INTERVAL} steps")
         print(f"  Obstacles     : {N_OBSTACLES} total, "
               f"ring {OBSTACLE_RING_MIN}-{OBSTACLE_RING_MAX}m")
@@ -519,22 +523,44 @@ class Go2CPGNavEnv:
     def _update_lidar(self):
         """
         Read LiDAR and aggregate into sector minimums.
-        Called every LIDAR_INTERVAL steps — not every step.
-        """
-        raw_ = self.lidar.read().distances         # [N, channels, h] or [N, rays]
-        raw  = raw_.reshape(self.n_envs, -1)       # [N, total_rays]
-        n_raw = raw.shape[1]
+        Multi-elevation: takes min across all elevations per sector so
+        low objects (small spheres, short boxes) are detected.
 
-        if n_raw >= N_LIDAR_SECTORS:
-            rps   = n_raw // N_LIDAR_SECTORS
-            n_trim = rps * N_LIDAR_SECTORS
-            self.lidar_sectors[:] = raw[
-                :, :n_trim
-            ].view(self.n_envs, N_LIDAR_SECTORS, rps).min(dim=2).values
+        Raw tensor shape from Genesis: [N, n_elev, n_horiz] or [N, total_rays]
+        Output: [N, N_LIDAR_SECTORS] — one min distance per horizontal sector
+        """
+        raw_ = self.lidar.read().distances   # [N, ...] various shapes
+
+        if raw_.dim() == 3:
+            # [N, n_elev, n_horiz] — take min across elevations first
+            # then aggregate horizontal sectors
+            # raw_.shape = [N, N_LIDAR_ELEV, N_LIDAR_SECTORS] ideally
+            n_env, n_elev, n_horiz = raw_.shape
+            if n_horiz == N_LIDAR_SECTORS:
+                # Perfect shape — min across elevation dim
+                self.lidar_sectors[:] = raw_.min(dim=1).values   # [N, 36]
+            else:
+                # Reshape needed — flatten then reaggregate
+                raw = raw_.reshape(n_env, -1)
+                n_raw = raw.shape[1]
+                rps   = n_raw // N_LIDAR_SECTORS
+                n_trim = rps * N_LIDAR_SECTORS
+                self.lidar_sectors[:] = raw[
+                    :, :n_trim
+                ].view(n_env, N_LIDAR_SECTORS, rps).min(dim=2).values
         else:
-            # Fewer rays than sectors — pad
-            pad = raw.repeat(1, math.ceil(N_LIDAR_SECTORS/n_raw))
-            self.lidar_sectors[:] = pad[:, :N_LIDAR_SECTORS]
+            # 2D fallback [N, total_rays]
+            raw   = raw_.reshape(self.n_envs, -1)
+            n_raw = raw.shape[1]
+            if n_raw >= N_LIDAR_SECTORS:
+                rps    = n_raw // N_LIDAR_SECTORS
+                n_trim = rps * N_LIDAR_SECTORS
+                self.lidar_sectors[:] = raw[
+                    :, :n_trim
+                ].view(self.n_envs, N_LIDAR_SECTORS, rps).min(dim=2).values
+            else:
+                pad = raw.repeat(1, math.ceil(N_LIDAR_SECTORS / n_raw))
+                self.lidar_sectors[:] = pad[:, :N_LIDAR_SECTORS]
 
     # ------------------------------------------------------------------
     # Observation

@@ -1189,7 +1189,7 @@ def main():
     p.add_argument("--rollout-steps", type=int,  default=24)
     p.add_argument("--device",        type=str,  default="cuda",
                    choices=["cpu","cuda","mps"])
-    p.add_argument("--run-dir",       type=str,  default="../../runs/go2_cpg_nav")
+    p.add_argument("--run-dir",       type=str,  default="../../runs/go2_cpg_lidar")
     p.add_argument("--headless",      action="store_true", default=True)
     p.add_argument("--resume",        type=str,  default=None)
     p.add_argument("--eval",          type=str,  default=None)

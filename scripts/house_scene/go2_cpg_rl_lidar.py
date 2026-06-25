@@ -93,6 +93,7 @@ CONTACT_FORCE_THRESH = 1.0
 # ==========================================================================
 
 N_LIDAR_SECTORS  = 36         # horizontal sectors
+N_LIDAR_HEIGHTS = 3
 LIDAR_MAX_RANGE  = 5.0        # metres
 LIDAR_INTERVAL   = 5          # update every N steps (10 Hz at 50 Hz control)
 LIDAR_POS_OFFSET = (0.0, 0.0, 0.35)   # above chassis — avoids self-hit
@@ -128,7 +129,7 @@ SPHERE_RAD_RANGE  = (0.06, 0.14)   # ball/vase scale
 # ==========================================================================
 
 PROP_DIM  = 76                        # proprioception (matches go2_cpg_rl.py)
-OBS_DIM   = PROP_DIM + N_LIDAR_SECTORS  # 76 + 36 = 112
+OBS_DIM   = PROP_DIM + N_LIDAR_SECTORS*N_LIDAR_HEIGHTS  # 76 + 36 = 112
 ACT_DIM   = 12
 
 
@@ -333,7 +334,7 @@ class Go2CPGNavEnv:
             gs.sensors.Lidar(
                 pattern = gs.sensors.SphericalPattern(
                     fov      = (360.0, 0.0),   # flat horizontal
-                    n_points = (N_LIDAR_SECTORS, 1),
+                    n_points = (N_LIDAR_SECTORS, N_LIDAR_HEIGHTS),
                 ),
                 entity_idx         = self.robot.idx,
                 pos_offset         = LIDAR_POS_OFFSET,

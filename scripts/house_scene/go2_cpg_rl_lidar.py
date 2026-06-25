@@ -105,19 +105,23 @@ LIDAR_CAUTION = 1.2           # metres — light penalty
 #  Constants — obstacles
 # ==========================================================================
 
-N_OBSTACLES       = 12        # total obstacles per env
-OBSTACLE_RING_MIN = 1.5       # inner exclusion radius (metres)
-OBSTACLE_RING_MAX = 5.0       # outer boundary
+N_OBSTACLES       = 20
+# Arena — square 8×8m (half-side = 4m)
+ARENA_HALF        = 4.0    # metres
+ARENA_WALL_HEIGHT = 0.6    # metres — low walls, just enough to block robot
+ARENA_WALL_THICK  = 0.15   # metres
+OBSTACLE_RING_MIN = 1.2    # inner exclusion radius (metres)
+OBSTACLE_RING_MAX = 3.5    # outer boundary — inside arena
 # Fraction of each shape type (must sum to 1.0)
 FRAC_CYLINDER = 0.4
 FRAC_BOX      = 0.4
 FRAC_SPHERE   = 0.2
 
-# Size ranges
-CYL_RADIUS_RANGE  = (0.15, 0.50)   # metres
-CYL_HEIGHT_RANGE  = (0.30, 2.00)
-BOX_SIZE_RANGE    = (0.20, 0.80)   # per side
-SPHERE_RAD_RANGE  = (0.10, 0.40)
+# Size ranges — house-object scale
+CYL_RADIUS_RANGE  = (0.05, 0.15)   # chair/table leg: 5-15cm radius
+CYL_HEIGHT_RANGE  = (0.30, 0.80)   # knee to hip height
+BOX_SIZE_RANGE    = (0.15, 0.35)   # small furniture footprint
+SPHERE_RAD_RANGE  = (0.06, 0.14)   # ball/vase scale
 
 # ==========================================================================
 #  Observation dims
@@ -246,6 +250,28 @@ class Go2CPGNavEnv:
         # ── Ground ────────────────────────────────────────────────────────
         self.scene.add_entity(gs.morphs.Plane())
 
+        # ── Arena walls — simple square 6×6m ─────────────────────────────
+        s = ARENA_HALF
+        t = ARENA_WALL_THICK
+        h = ARENA_WALL_HEIGHT
+        # Four walls: (pos_x, pos_y, size_x, size_y)
+        wall_defs = [
+            ( 0.0,   s,   2*s + 2*t, t),   # north
+            ( 0.0,  -s,   2*s + 2*t, t),   # south
+            ( s,     0.0, t,          2*s), # east
+            (-s,     0.0, t,          2*s), # west
+        ]
+        for wx, wy, sx, sy in wall_defs:
+            self.scene.add_entity(
+                gs.morphs.Box(
+                    size  = (sx, sy, h),
+                    pos   = (wx, wy, h / 2),
+                    fixed = True,
+                )
+            )
+        self.arena_term_dist = s + 0.5   # termination threshold
+        print(f"  Arena: {2*s:.0f}×{2*s:.0f}m square, walls h={h}m")
+
         # ── Obstacles ─────────────────────────────────────────────────────
         # Pre-allocate all obstacle entities at build time.
         # Positions are randomised at each reset via set_pos().
@@ -268,8 +294,7 @@ class Go2CPGNavEnv:
 
         for i in range(n_box):
             s = BOX_SIZE_RANGE[0] + (BOX_SIZE_RANGE[1]-BOX_SIZE_RANGE[0]) * i/max(n_box-1,1)
-            h = s  # height = side length for cubes; rectangular boxes use s*2
-            h = s * (1.0 + i/max(n_box-1,1))   # vary height independently
+            h = 0.4 + 0.8 * i/max(n_box-1,1)   # height 0.4 → 1.2m
             e = self.scene.add_entity(
                 gs.morphs.Box(size=(s, s, h),
                               pos=(99.0, 99.0, h/2), fixed=True)
@@ -582,6 +607,9 @@ class Go2CPGNavEnv:
         self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
         self.reset_buf |= self.base_pos[:, 2] < self.env_cfg["termination_if_height_less_than"]
+        # Arena boundary — terminate if robot escapes the square
+        self.reset_buf |= self.base_pos[:, 0].abs() > self.arena_term_dist
+        self.reset_buf |= self.base_pos[:, 1].abs() > self.arena_term_dist
 
         time_out_idx = (
             self.episode_length_buf > self.max_episode_length
@@ -641,15 +669,12 @@ class Go2CPGNavEnv:
             envs_idx       = envs_idx,
         )
 
-        # Base pose — random yaw at spawn
+        # Base pose — fixed identity quat at spawn
+        # Random yaw causes CPG instability when training from scratch.
+        # Re-enable after policy is stable (>50M steps).
         n = len(envs_idx)
         self.base_pos[envs_idx]  = self.base_init_pos
-        yaws      = gs_rand_float(-math.pi, math.pi, (n,), self.device)
-        half      = yaws * 0.5
-        quat_yaw  = torch.zeros((n, 4), device=self.device, dtype=gs.tc_float)
-        quat_yaw[:, 2] = torch.sin(half)
-        quat_yaw[:, 3] = torch.cos(half)
-        self.base_quat[envs_idx] = quat_yaw
+        self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
 
         self.robot.set_pos( self.base_pos[envs_idx],  zero_velocity=False, envs_idx=envs_idx)
         self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx)
@@ -887,6 +912,13 @@ class PPOTrainer:
         # Optional: warm-start from pretrained CPG locomotion checkpoint
         if cfg.get("pretrained"):
             self._load_pretrained(cfg["pretrained"])
+            # Freeze trunk for first N steps so LiDAR weights can warm up
+            # without corrupting the pretrained walking behaviour
+            freeze_steps = cfg.get("freeze_trunk_steps", 5_000_000)
+            if freeze_steps > 0:
+                for param in self.net.trunk.parameters():
+                    param.requires_grad = False
+                print(f"  Trunk frozen for first {freeze_steps:,} steps\n")
 
         self.opt = torch.optim.Adam(
             self.net.parameters(), lr=cfg["lr"], eps=1e-5)
@@ -940,6 +972,14 @@ class PPOTrainer:
         n_updates         = cfg["total_steps"] // steps_per_rollout
 
         for update in range(1, n_updates+1):
+            # Unfreeze trunk once enough steps have passed
+            freeze_steps = cfg.get("freeze_trunk_steps", 0)
+            if (freeze_steps > 0
+                    and self.global_step >= freeze_steps
+                    and not self.net.trunk[0].weight.requires_grad):
+                for param in self.net.trunk.parameters():
+                    param.requires_grad = True
+                print(f"\n  Trunk unfrozen at step {self.global_step:,}\n")
             frac = max(1.0 - self.global_step / max(cfg["total_steps"],1),
                        cfg["lr_floor_frac"])
             lr = cfg["lr"] * frac
@@ -1179,6 +1219,7 @@ def get_config(args):
         vloss_skip         = 1e3,
         lr_floor_frac      = 0.05,
         pretrained         = args.pretrained,
+        freeze_trunk_steps = 5_000_000 if args.pretrained else 0,
     )
 
 
@@ -1189,7 +1230,7 @@ def main():
     p.add_argument("--rollout-steps", type=int,  default=24)
     p.add_argument("--device",        type=str,  default="cuda",
                    choices=["cpu","cuda","mps"])
-    p.add_argument("--run-dir",       type=str,  default="../../runs/go2_cpg_lidar")
+    p.add_argument("--run-dir",       type=str,  default="../../runs/go2_cpg_nav")
     p.add_argument("--headless",      action="store_true", default=True)
     p.add_argument("--resume",        type=str,  default=None)
     p.add_argument("--eval",          type=str,  default=None)

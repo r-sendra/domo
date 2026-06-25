@@ -27,7 +27,6 @@ Obstacle configuration:
 Usage:
     # Train on H200
     python go2_cpg_nav.py --n-envs 4096 --device cuda --headless
-
     # Evaluate on Mac
     python go2_cpg_nav.py --eval ../../runs/go2_cpg_nav/checkpoint_final.pt
 
@@ -99,11 +98,14 @@ N_LIDAR_ELEV     = 4          # elevation layers: -20°, -10°, 0°, +10°
 # Detects short ground objects (small spheres, low boxes) missed by flat ring
 LIDAR_MAX_RANGE  = 4.0        # metres
 LIDAR_INTERVAL   = 5          # update every N steps (10 Hz at 50 Hz control)
-LIDAR_POS_OFFSET = (0.0, 0.0, 0.35)   # above chassis — avoids self-hit
+LIDAR_POS_OFFSET = (0.0, 0.0, 0.2)   # above chassis — avoids self-hit
 
 # Collision thresholds for reward
-LIDAR_DANGER  = 0.5           # metres — strong penalty
-LIDAR_CAUTION = 1.2           # metres — light penalty
+LIDAR_COLLISION  = 0.25       # metres — episode termination (actual contact)
+LIDAR_DANGER     = 0.60       # metres — strong quadratic penalty
+LIDAR_CAUTION    = 1.50       # metres — linear penalty
+LIDAR_ANTICIPATE = 2.50       # metres — very light penalty, early steering
+ 
 
 # ==========================================================================
 #  Constants — obstacles
@@ -248,6 +250,7 @@ class Go2CPGNavEnv:
                 enable_collision=True, enable_joint_limit=True,
                 iterations=100,
             ),
+            renderer    = gs.renderers.Rasterizer(),   # needed for camera.render()
             show_viewer = not headless,
         )
 
@@ -345,6 +348,28 @@ class Go2CPGNavEnv:
                 draw_debug         = (not headless),
             )
         )
+
+        # ── Front camera (BEFORE build — Genesis requires this) ───────────
+        # Visualization only — not used in RL at all.
+        self.front_cam    = None
+        self.cam_interval = 10
+        self._cam_step    = 0
+
+        if not headless:
+            try:
+                self.front_cam = self.scene.add_camera(
+                    res    = (640, 360),
+                    pos    = (0.3, 0.0, 0.1),
+                    lookat = (1.0, 0.0, 0.1),
+                    fov    = 60,
+                    GUI    = False,
+                )
+                self._cam_frame   = None
+                self._pip_ready   = False
+                print(f"  ✅  Front camera created (640×360, FOV=60°)")
+            except Exception as e:
+                print(f"  ⚠️  Front camera failed: {e}")
+                self.front_cam = None
 
         # ── Build ─────────────────────────────────────────────────────────
         self.scene.build(n_envs=n_envs)
@@ -453,6 +478,7 @@ class Go2CPGNavEnv:
             (N, N_LIDAR_SECTORS), fill_value=LIDAR_MAX_RANGE,
             device=self.device, dtype=f)
         self._lidar_step = 0
+        self._cam_step   = 0
 
         self.obs_buf            = torch.zeros((N, OBS_DIM),  device=self.device, dtype=f)
         self.rew_buf            = torch.zeros((N,),           device=self.device, dtype=f)
@@ -599,6 +625,63 @@ class Go2CPGNavEnv:
 
         self.episode_length_buf += 1
         self._lidar_step         += 1
+        self._cam_step           += 1
+
+        # Front camera render — head-mounted PiP via OpenCV
+        if (self.front_cam is not None
+                and self._cam_step % self.cam_interval == 0):
+            try:
+                import math as _math, cv2
+                pos  = self.robot.get_pos()[0].cpu().numpy()
+                quat = self.robot.get_quat()[0].cpu().numpy()
+                yaw  = float(quat_to_xyz(
+                    torch.tensor(quat).unsqueeze(0)
+                )[0, 2].item())
+
+                cam_x  = pos[0] + 0.25 * _math.cos(yaw)
+                cam_y  = pos[1] + 0.25 * _math.sin(yaw)
+                cam_z  = pos[2] + 0.15
+                look_x = pos[0] + 2.0 * _math.cos(yaw)
+                look_y = pos[1] + 2.0 * _math.sin(yaw)
+                look_z = pos[2] + 0.05
+
+                self.front_cam.set_pose(
+                    pos=(cam_x, cam_y, cam_z),
+                    lookat=(look_x, look_y, look_z),
+                )
+                rgb, _, _, _ = self.front_cam.render(rgb=True)
+                frame = np.array(rgb, dtype=np.uint8)
+                bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+                # Resize + label
+                pip = cv2.resize(bgr, (320, 180))
+                pip = cv2.copyMakeBorder(
+                    pip, 2, 2, 2, 2,
+                    cv2.BORDER_CONSTANT, value=(0, 220, 0)
+                )
+                cv2.putText(pip, "Front Cam", (6, 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (0, 255, 0), 1, cv2.LINE_AA)
+
+                if not self._pip_ready:
+                    cv2.namedWindow("pip", cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow("pip", 324, 184)
+                    cv2.moveWindow("pip", 950, 10)
+                    self._pip_ready = True
+
+                cv2.imshow("pip", pip)
+                # pollKey() is truly non-blocking — does NOT consume
+                # mouse events, safe for macOS main thread use
+                cv2.pollKey()
+
+                if not hasattr(self, '_cam_ok'):
+                    print("  [cam] PiP active")
+                    self._cam_ok = True
+
+            except Exception as e:
+                if not hasattr(self, '_cam_warn'):
+                    print(f"  ⚠️  Camera: {e}")
+                    self._cam_warn = True
 
         # State update
         self.base_pos[:]  = self.robot.get_pos()
@@ -1258,7 +1341,7 @@ def main():
     p.add_argument("--device",        type=str,  default="cuda",
                    choices=["cpu","cuda","mps"])
     p.add_argument("--run-dir",       type=str,  default="../../runs/go2_cpg_nav")
-    p.add_argument("--headless",      action="store_true", default=True)
+    p.add_argument("--headless",      action="store_true", default=False)
     p.add_argument("--resume",        type=str,  default=None)
     p.add_argument("--eval",          type=str,  default=None)
     p.add_argument("--pretrained",    type=str,  default=None,

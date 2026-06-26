@@ -98,36 +98,51 @@ N_LIDAR_ELEV     = 4          # elevation layers: -20°, -10°, 0°, +10°
 # Detects short ground objects (small spheres, low boxes) missed by flat ring
 LIDAR_MAX_RANGE  = 4.0        # metres
 LIDAR_INTERVAL   = 5          # update every N steps (10 Hz at 50 Hz control)
-LIDAR_POS_OFFSET = (0.0, 0.0, 0.2)   # above chassis — avoids self-hit
+LIDAR_POS_OFFSET = (0.0, 0.0, 0.35)   # above chassis — avoids self-hit
 
 # Collision thresholds for reward
 LIDAR_COLLISION  = 0.25       # metres — episode termination (actual contact)
 LIDAR_DANGER     = 0.60       # metres — strong quadratic penalty
 LIDAR_CAUTION    = 1.50       # metres — linear penalty
 LIDAR_ANTICIPATE = 2.50       # metres — very light penalty, early steering
- 
 
 # ==========================================================================
 #  Constants — obstacles
 # ==========================================================================
 
-N_OBSTACLES       = 20
+N_OBS_CHAIRS   = 3    # chair = 4 thin cylinders in a square
+N_OBS_SOFAS    = 2    # sofa/cabinet = wide flat box
+N_OBS_PILLARS  = 3    # lamp/column = tall thin cylinder
+N_OBS_STEPS    = 2    # book/step = low flat box
+N_OBS_BALLS    = 2    # ball/vase = sphere
+N_OBSTACLES    = N_OBS_CHAIRS*4 + N_OBS_SOFAS + N_OBS_PILLARS + N_OBS_STEPS + N_OBS_BALLS
 # Arena — square 8×8m (half-side = 4m)
-ARENA_HALF        = 4.0    # metres
-ARENA_WALL_HEIGHT = 0.6    # metres — low walls, just enough to block robot
-ARENA_WALL_THICK  = 0.15   # metres
-OBSTACLE_RING_MIN = 1.2    # inner exclusion radius (metres)
-OBSTACLE_RING_MAX = 3.5    # outer boundary — inside arena
-# Fraction of each shape type (must sum to 1.0)
-FRAC_CYLINDER = 0.4
-FRAC_BOX      = 0.4
-FRAC_SPHERE   = 0.2
+ARENA_HALF        = 4.0
+ARENA_WALL_HEIGHT = 0.6
+ARENA_WALL_THICK  = 0.15
+OBSTACLE_RING_MIN = 1.2
+OBSTACLE_RING_MAX = 3.5
 
-# Size ranges — house-object scale
-CYL_RADIUS_RANGE  = (0.05, 0.15)   # chair/table leg: 5-15cm radius
-CYL_HEIGHT_RANGE  = (0.30, 0.80)   # knee to hip height
-BOX_SIZE_RANGE    = (0.15, 0.35)   # small furniture footprint
-SPHERE_RAD_RANGE  = (0.06, 0.14)   # ball/vase scale
+# Chair: 4 thin legs in a square
+CHAIR_LEG_RADIUS = 0.03
+CHAIR_LEG_HEIGHT = 0.45
+CHAIR_LEG_SPREAD = 0.25    # half-spacing between legs
+
+# Sofa/cabinet: wide flat box
+SOFA_WIDTH_RANGE  = (0.8,  1.6)
+SOFA_DEPTH_RANGE  = (0.3,  0.5)
+SOFA_HEIGHT_RANGE = (0.35, 0.50)
+
+# Pillar/lamp: tall thin cylinder
+PILLAR_RADIUS_RANGE = (0.04, 0.10)
+PILLAR_HEIGHT_RANGE = (0.60, 1.20)
+
+# Step/book: very low flat box
+STEP_SIZE_RANGE   = (0.20, 0.50)
+STEP_HEIGHT_RANGE = (0.04, 0.15)
+
+# Ball/vase
+SPHERE_RAD_RANGE  = (0.06, 0.16)
 
 # ==========================================================================
 #  Observation dims
@@ -212,11 +227,12 @@ class Go2CPGNavEnv:
             "reward_scales": {
                 "tracking_lin_vel_x":  0.75,
                 "tracking_lin_vel_y":  0.75,
-                "tracking_ang_vel":    0.75,   # equal weight to linear
+                "tracking_ang_vel":    0.75,
                 "lin_vel_z":          -2.00,
                 "ang_vel_xy":         -0.05,
                 "work":               -0.001,
-                "obstacle_avoidance": -2.00,   # NEW
+                "obstacle_avoidance": -5.00,   # stronger — overcomes tracking drive
+                "survival":           +0.20,   # bonus per step alive — incentivises avoidance
             },
         }
         self.command_cfg = {
@@ -279,44 +295,80 @@ class Go2CPGNavEnv:
         self.arena_term_dist = s + 0.5   # termination threshold
         print(f"  Arena: {2*s:.0f}×{2*s:.0f}m square, walls h={h}m")
 
-        # ── Obstacles ─────────────────────────────────────────────────────
-        # Pre-allocate all obstacle entities at build time.
-        # Positions are randomised at each reset via set_pos().
-        # Sizes are fixed per-entity but varied across entities.
-        print(f"\n  Building {N_OBSTACLES} obstacles "
-              f"(cylinders/boxes/spheres)...")
-        self.obstacles = []
-        n_cyl = int(N_OBSTACLES * FRAC_CYLINDER)
-        n_box = int(N_OBSTACLES * FRAC_BOX)
-        n_sph = N_OBSTACLES - n_cyl - n_box
+        # ── Obstacles — realistic indoor objects ──────────────────────────
+        # Pre-allocated at build time; positions randomised each episode.
+        # Types: chairs (4-leg clusters), sofas, pillars, steps, balls.
+        print(f"\n  Building obstacles: "
+              f"{N_OBS_CHAIRS} chairs, {N_OBS_SOFAS} sofas, "
+              f"{N_OBS_PILLARS} pillars, {N_OBS_STEPS} steps, "
+              f"{N_OBS_BALLS} balls → {N_OBSTACLES} total entities")
 
-        for i in range(n_cyl):
-            r = CYL_RADIUS_RANGE[0] + (CYL_RADIUS_RANGE[1]-CYL_RADIUS_RANGE[0]) * i/max(n_cyl-1,1)
-            h = CYL_HEIGHT_RANGE[0] + (CYL_HEIGHT_RANGE[1]-CYL_HEIGHT_RANGE[0]) * i/max(n_cyl-1,1)
+        self.obstacles = []   # list of (type, entity, height, metadata)
+
+        # ── Chairs: 4 thin cylinder legs per chair ────────────────────────
+        # Each chair = 4 entities. Positions set together in _randomise_obstacles.
+        # leg_offsets: corners of a square with side CHAIR_LEG_SPREAD*2
+        leg_offsets = [
+            ( CHAIR_LEG_SPREAD,  CHAIR_LEG_SPREAD),
+            ( CHAIR_LEG_SPREAD, -CHAIR_LEG_SPREAD),
+            (-CHAIR_LEG_SPREAD,  CHAIR_LEG_SPREAD),
+            (-CHAIR_LEG_SPREAD, -CHAIR_LEG_SPREAD),
+        ]
+        for c in range(N_OBS_CHAIRS):
+            legs = []
+            for dx, dy in leg_offsets:
+                e = self.scene.add_entity(
+                    gs.morphs.Cylinder(
+                        radius = CHAIR_LEG_RADIUS,
+                        height = CHAIR_LEG_HEIGHT,
+                        pos    = (99.0 + dx, 99.0 + dy, CHAIR_LEG_HEIGHT/2),
+                        fixed  = True,
+                    )
+                )
+                legs.append(e)
+            # Store as one logical chair: all 4 legs together
+            self.obstacles.append(("chair", legs, CHAIR_LEG_HEIGHT, leg_offsets))
+
+        # ── Sofas/cabinets: wide flat box ─────────────────────────────────
+        for i in range(N_OBS_SOFAS):
+            t = i / max(N_OBS_SOFAS-1, 1)
+            w = SOFA_WIDTH_RANGE[0]  + (SOFA_WIDTH_RANGE[1]  - SOFA_WIDTH_RANGE[0])  * t
+            d = SOFA_DEPTH_RANGE[0]  + (SOFA_DEPTH_RANGE[1]  - SOFA_DEPTH_RANGE[0])  * t
+            h = SOFA_HEIGHT_RANGE[0] + (SOFA_HEIGHT_RANGE[1] - SOFA_HEIGHT_RANGE[0]) * t
+            e = self.scene.add_entity(
+                gs.morphs.Box(size=(w, d, h), pos=(99.0, 99.0, h/2), fixed=True)
+            )
+            self.obstacles.append(("sofa", e, h, None))
+
+        # ── Pillars/lamps: tall thin cylinder ─────────────────────────────
+        for i in range(N_OBS_PILLARS):
+            t = i / max(N_OBS_PILLARS-1, 1)
+            r = PILLAR_RADIUS_RANGE[0] + (PILLAR_RADIUS_RANGE[1] - PILLAR_RADIUS_RANGE[0]) * t
+            h = PILLAR_HEIGHT_RANGE[0] + (PILLAR_HEIGHT_RANGE[1] - PILLAR_HEIGHT_RANGE[0]) * t
             e = self.scene.add_entity(
                 gs.morphs.Cylinder(radius=r, height=h,
                                    pos=(99.0, 99.0, h/2), fixed=True)
             )
-            self.obstacles.append(("cylinder", e, h))
+            self.obstacles.append(("pillar", e, h, None))
 
-        for i in range(n_box):
-            s = BOX_SIZE_RANGE[0] + (BOX_SIZE_RANGE[1]-BOX_SIZE_RANGE[0]) * i/max(n_box-1,1)
-            h = 0.4 + 0.8 * i/max(n_box-1,1)   # height 0.4 → 1.2m
+        # ── Steps/books: very low flat box ────────────────────────────────
+        for i in range(N_OBS_STEPS):
+            t = i / max(N_OBS_STEPS-1, 1)
+            s = STEP_SIZE_RANGE[0]   + (STEP_SIZE_RANGE[1]   - STEP_SIZE_RANGE[0])   * t
+            h = STEP_HEIGHT_RANGE[0] + (STEP_HEIGHT_RANGE[1] - STEP_HEIGHT_RANGE[0]) * t
             e = self.scene.add_entity(
-                gs.morphs.Box(size=(s, s, h),
-                              pos=(99.0, 99.0, h/2), fixed=True)
+                gs.morphs.Box(size=(s, s, h), pos=(99.0, 99.0, h/2), fixed=True)
             )
-            self.obstacles.append(("box", e, h))
+            self.obstacles.append(("step", e, h, None))
 
-        for i in range(n_sph):
-            r = SPHERE_RAD_RANGE[0] + (SPHERE_RAD_RANGE[1]-SPHERE_RAD_RANGE[0]) * i/max(n_sph-1,1)
+        # ── Balls/vases: sphere ───────────────────────────────────────────
+        for i in range(N_OBS_BALLS):
+            t = i / max(N_OBS_BALLS-1, 1)
+            r = SPHERE_RAD_RANGE[0] + (SPHERE_RAD_RANGE[1] - SPHERE_RAD_RANGE[0]) * t
             e = self.scene.add_entity(
-                gs.morphs.Sphere(radius=r,
-                                 pos=(99.0, 99.0, r), fixed=True)
+                gs.morphs.Sphere(radius=r, pos=(99.0, 99.0, r), fixed=True)
             )
-            self.obstacles.append(("sphere", e, r*2))
-
-        print(f"    cylinders={n_cyl}  boxes={n_box}  spheres={n_sph}")
+            self.obstacles.append(("ball", e, r*2, None))
 
         # ── Robot ─────────────────────────────────────────────────────────
         self.base_init_pos  = torch.tensor(
@@ -717,7 +769,9 @@ class Go2CPGNavEnv:
         self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
         self.reset_buf |= self.base_pos[:, 2] < self.env_cfg["termination_if_height_less_than"]
-        # Arena boundary — terminate if robot escapes the square
+        # Collision termination — too close to any obstacle
+        self.reset_buf |= self.lidar_sectors.min(dim=1).values < LIDAR_COLLISION
+        # Arena boundary
         self.reset_buf |= self.base_pos[:, 0].abs() > self.arena_term_dist
         self.reset_buf |= self.base_pos[:, 1].abs() > self.arena_term_dist
 
@@ -829,22 +883,39 @@ class Go2CPGNavEnv:
     def _randomise_obstacles(self, envs_idx):
         """
         Place obstacles at random positions in the ring around spawn.
-        Each obstacle type gets independent random placement.
+        Chairs: all 4 legs placed together around one random centre.
+        Other types: single entity per random position.
         """
         if len(envs_idx) == 0:
             return
         n = len(envs_idx)
-        spawn = self.base_init_pos   # [3]
+        spawn = self.base_init_pos
 
-        for _, entity, height in self.obstacles:
+        for obs_type, entity, height, meta in self.obstacles:
             angles = gs_rand_float(0.0, 2*math.pi, (n,), self.device)
             radii  = gs_rand_float(
                 OBSTACLE_RING_MIN, OBSTACLE_RING_MAX, (n,), self.device)
-            x = spawn[0] + radii * torch.cos(angles)
-            y = spawn[1] + radii * torch.sin(angles)
-            z = torch.full((n,), height/2, device=self.device)
-            pos = torch.stack([x, y, z], dim=-1)   # [n, 3]
-            entity.set_pos(pos, envs_idx=envs_idx)
+            cx = spawn[0] + radii * torch.cos(angles)
+            cy = spawn[1] + radii * torch.sin(angles)
+
+            if obs_type == "chair":
+                # entity is a list of 4 leg entities
+                # meta is list of (dx, dy) offsets
+                # Add random yaw rotation to the chair
+                chair_yaw = gs_rand_float(0.0, 2*math.pi, (n,), self.device)
+                for leg_e, (dx, dy) in zip(entity, meta):
+                    # Rotate leg offset by chair yaw
+                    lx = cx + dx * torch.cos(chair_yaw) - dy * torch.sin(chair_yaw)
+                    ly = cy + dx * torch.sin(chair_yaw) + dy * torch.cos(chair_yaw)
+                    lz = torch.full((n,), height/2, device=self.device)
+                    leg_e.set_pos(
+                        torch.stack([lx, ly, lz], dim=-1),
+                        envs_idx=envs_idx
+                    )
+            else:
+                z   = torch.full((n,), height/2, device=self.device)
+                pos = torch.stack([cx, cy, z], dim=-1)
+                entity.set_pos(pos, envs_idx=envs_idx)
 
     # ------------------------------------------------------------------
     # Reward functions
@@ -877,24 +948,48 @@ class Go2CPGNavEnv:
 
     def _reward_obstacle_avoidance(self):
         """
-        Penalty based on minimum LiDAR distance across all sectors.
-        Danger zone (< LIDAR_DANGER): quadratic penalty.
-        Caution zone (< LIDAR_CAUTION): linear penalty.
+        4-zone penalty based on minimum LiDAR distance.
+
+        ANTICIPATE (< 2.5m): very light penalty — encourages early steering
+        CAUTION    (< 1.5m): linear penalty — start turning now
+        DANGER     (< 0.6m): strong quadratic — urgent avoidance
+        COLLISION  (< 0.25m): maximum penalty — robot is touching obstacle
+
+        The wide anticipation zone is the key improvement: the policy gets
+        a gradient signal far enough ahead to actually change direction.
         """
         min_d = self.lidar_sectors.min(dim=1).values
         min_d = torch.clamp(min_d, 0.0, LIDAR_MAX_RANGE)
 
-        danger_pen = torch.where(
-            min_d < LIDAR_DANGER,
-            torch.square(min_d - LIDAR_DANGER),
+        # Zone 1: anticipate
+        anticipate_pen = torch.where(
+            (min_d >= LIDAR_CAUTION) & (min_d < LIDAR_ANTICIPATE),
+            (LIDAR_ANTICIPATE - min_d) * 0.05,
             torch.zeros_like(min_d),
         )
+        # Zone 2: caution
         caution_pen = torch.where(
             (min_d >= LIDAR_DANGER) & (min_d < LIDAR_CAUTION),
-            (LIDAR_CAUTION - min_d) * 0.3,
+            (LIDAR_CAUTION - min_d) * 0.5,
             torch.zeros_like(min_d),
         )
-        return danger_pen + caution_pen
+        # Zone 3: danger
+        danger_pen = torch.where(
+            (min_d >= LIDAR_COLLISION) & (min_d < LIDAR_DANGER),
+            torch.square(LIDAR_DANGER - min_d) * 2.0,
+            torch.zeros_like(min_d),
+        )
+        # Zone 4: collision — maximum flat penalty
+        collision_pen = torch.where(
+            min_d < LIDAR_COLLISION,
+            torch.full_like(min_d, 1.0),
+            torch.zeros_like(min_d),
+        )
+        return anticipate_pen + caution_pen + danger_pen + collision_pen
+
+    def _reward_survival(self):
+        """+1 every step the robot is alive — incentivises avoiding resets."""
+        return torch.ones(self.n_envs, device=self.device, dtype=gs.tc_float)
 
 
 # ==========================================================================

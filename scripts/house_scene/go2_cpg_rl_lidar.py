@@ -92,18 +92,18 @@ CONTACT_FORCE_THRESH = 1.0
 # ==========================================================================
 
 N_LIDAR_SECTORS  = 36         # horizontal sectors (obs size stays 36)
-N_LIDAR_ELEV     = 6          # elevation layers covering -40° to +15°
-# Heavy downward bias to catch low objects (steps, balls, chair legs)
-# Total rays = 36 × 6 = 216
+N_LIDAR_ELEV     = 5          # elevation layers: -30°, -15°, 0°, +10°, +20°
+# Downward bias catches low objects; z=0.35 keeps sensor above chassis
+# Total rays = 36 × 5 = 180
 LIDAR_MAX_RANGE  = 4.0        # metres
 LIDAR_INTERVAL   = 5          # update every N steps (10 Hz at 50 Hz control)
-LIDAR_POS_OFFSET = (0.0, 0.0, 0.25)   # lower — closer to chassis centre
+LIDAR_POS_OFFSET = (0.0, 0.0, 0.35)   # above chassis — safe from self-hits
 
 # Collision thresholds for reward
-LIDAR_COLLISION  = 0.25       # metres — episode termination (actual contact)
+LIDAR_COLLISION  = 0.20       # metres — episode termination
 LIDAR_DANGER     = 0.60       # metres — strong quadratic penalty
 LIDAR_CAUTION    = 1.50       # metres — linear penalty
-LIDAR_ANTICIPATE = 2.50       # metres — very light penalty, early steering
+LIDAR_ANTICIPATE = 3.00       # metres — early steering signal (widened)
 
 # ==========================================================================
 #  Constants — obstacles
@@ -230,12 +230,13 @@ class Go2CPGNavEnv:
                 "lin_vel_z":          -2.00,
                 "ang_vel_xy":         -0.05,
                 "work":               -0.001,
-                "obstacle_avoidance": -5.00,   # stronger — overcomes tracking drive
-                "survival":           +0.20,   # bonus per step alive — incentivises avoidance
+                "obstacle_avoidance": -6.00,   # stronger
+                "speed_near_obstacle": -3.00,  # penalise fast approach
+                "survival":           +0.30,   # higher survival bonus
             },
         }
         self.command_cfg = {
-            "lin_vel_x_range": [0.3, 1.5],
+            "lin_vel_x_range": [0.3, 1.0],   # cap at 1.0 — slower = more time to react
             "lin_vel_y_range": [-0.3, 0.3],
             "ang_vel_range":   [-1.0, 1.0],
         }
@@ -390,13 +391,12 @@ class Go2CPGNavEnv:
         self.lidar = self.scene.add_sensor(
             gs.sensors.Lidar(
                 pattern = gs.sensors.SphericalPattern(
-                    fov      = (360.0, 55.0),   # 360° horiz, 55° vert range
-                    n_points = (N_LIDAR_SECTORS, N_LIDAR_ELEV),  # 36×6=216
+                    fov      = (360.0, 50.0),   # 360° horiz, 50° vert
+                    n_points = (N_LIDAR_SECTORS, N_LIDAR_ELEV),  # 36×5=180
                 ),
                 entity_idx         = self.robot.idx,
                 pos_offset         = LIDAR_POS_OFFSET,
-                return_world_frame = True,   # world frame → gait oscillation
-                                             # doesn't rotate rays up/down
+                return_world_frame = True,
                 draw_debug         = (not headless),
             )
         )
@@ -986,6 +986,23 @@ class Go2CPGNavEnv:
     def _reward_survival(self):
         """+1 every step the robot is alive — incentivises avoiding resets."""
         return torch.ones(self.n_envs, device=self.device, dtype=gs.tc_float)
+
+    def _reward_speed_near_obstacle(self):
+        """
+        Penalise high forward speed when obstacles are close.
+        Teaches the robot to slow down near walls rather than hit them fast.
+        Penalty = forward_speed × proximity_weight
+        where proximity_weight → 1.0 as distance → LIDAR_DANGER
+        """
+        min_d      = self.lidar_sectors.min(dim=1).values
+        min_d      = torch.clamp(min_d, 0.0, LIDAR_CAUTION)
+        # proximity: 0 when far, 1 when at LIDAR_DANGER distance
+        proximity  = torch.clamp(
+            (LIDAR_CAUTION - min_d) / (LIDAR_CAUTION - LIDAR_DANGER + 1e-6),
+            0.0, 1.0
+        )
+        fwd_speed  = torch.clamp(self.base_lin_vel[:, 0], 0.0, None)
+        return proximity * fwd_speed
 
 
 # ==========================================================================

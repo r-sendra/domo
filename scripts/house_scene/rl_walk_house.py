@@ -1,40 +1,40 @@
 """
-go2_lidar_nav.py
-================
-Self-contained RL experiment: Go2 locomotion with LiDAR-based
-obstacle avoidance on flat terrain with random obstacles.
+go2_cpg_nav.py
+==============
+Visual CPG-RL: Go2 locomotion + obstacle avoidance with randomised obstacles.
 
-Curriculum learning (2 phases):
-  Phase 1 — Walk (0 → 10M steps):
-    No avoidance reward. Robot reinforces walking with pretrained weights.
+Extends go2_cpg_rl.py (Bellegarda & Ijspeert RA-L 2022) with:
+  1. LiDAR sensor    — 36 horizontal rays, fast, above chassis
+  2. Obstacle env    — random mix of cylinders, boxes, spheres each episode
+  3. Expanded obs    — 76 proprioception + 36 LiDAR sectors = 112 dims
+  4. Avoidance reward — penalty for approaching obstacles
 
-  Phase 2 — Avoidance (10M → end):
-    Full avoidance penalty enabled. LiDAR rays are horizontal-only,
-    positioned above the chassis so they detect room walls and furniture
-    rather than the robot's own body.
+Following: Visual CPG-RL (Bellegarda, Shafiee, Ijspeert — ICRA 2024)
+  "the agent learns to coordinate rhythmic oscillator behaviour to
+   track velocity commands while overriding them to avoid collisions"
 
-LiDAR setup:
-  - 128 horizontal rays at 0° elevation (flat ring)
-  - pos_offset z=0.35m (above chassis, clears legs)
-  - return_world_frame=True (stable sector ordering as robot rotates)
-  - 128 rays → 36 sector minimums → 81-dim obs (45 prop + 36 LiDAR)
+LiDAR optimisations:
+  - 36 rays only (vs 8192 default) — 227x fewer rays
+  - Updated every LIDAR_INTERVAL steps (10 Hz vs 50 Hz control)
+  - draw_debug=False during training
+
+Obstacle configuration:
+  - N_OBSTACLES total per env, mix of cylinders / boxes / spheres
+  - Randomised size, position, orientation each episode
+  - Placed in ring OBSTACLE_RING_MIN → OBSTACLE_RING_MAX from spawn
+  - Inner exclusion zone keeps robot spawn clear
 
 Usage:
-    # Train in house (recommended)
-    python go2_lidar_nav.py --n-envs 512 --device cuda --headless \\
-        --scene data/replica_cad/configs/scenes/apt_0.scene_instance.json \\
-        --asset-root data/replica_cad/ \\
-        --pretrained ../../runs/go2_walk/checkpoint_final.pt
-
+    # Train on H200
+    python go2_cpg_nav.py --n-envs 4096 --device cuda --headless
     # Evaluate on Mac
-    python go2_lidar_nav.py --eval ../../runs/go2_lidar/checkpoint_final.pt
+    python go2_cpg_nav.py --eval ../../runs/go2_cpg_nav/checkpoint_final.pt
 
     # Resume
-    python go2_lidar_nav.py --resume ../../runs/go2_lidar/checkpoint_step_010000000.pt
+    python go2_cpg_nav.py --resume ../../runs/go2_cpg_nav/checkpoint_step_XXXXXXXXX.pt
 """
 
 import os
-import json
 import time
 import math
 import argparse
@@ -49,7 +49,7 @@ from genesis.utils.geom import (
 
 
 # ==========================================================================
-#  Constants
+#  Constants — locomotion (identical to go2_cpg_rl.py)
 # ==========================================================================
 
 MOTOR_JOINT_NAMES = [
@@ -58,6 +58,7 @@ MOTOR_JOINT_NAMES = [
     "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
     "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
 ]
+FOOT_LINK_NAMES = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
 
 DEFAULT_JOINT_ANGLES = {
     "FR_hip_joint":   0.0, "FR_thigh_joint":  0.8, "FR_calf_joint": -1.5,
@@ -66,338 +67,320 @@ DEFAULT_JOINT_ANGLES = {
     "RL_hip_joint":   0.0, "RL_thigh_joint":  1.0, "RL_calf_joint": -1.5,
 }
 
-BASE_INIT_POS  = [3.0, -2.0, 0.42]
-BASE_INIT_QUAT = [0.0, 0.0, 0.0, 1.0]   # [x,y,z,w] identity
+L_HIP, L_THIGH, L_CALF = 0.0955, 0.213, 0.213
+LEG_SIDE_SIGN = [-1.0, +1.0, -1.0, +1.0]
 
-# LiDAR — default SphericalPattern (n_points=(64,128) = 8192 rays on GPU)
-# On CPU (Mac) this is slow; training on H200 GPU is fast
-LIDAR_MAX_RANGE    = 5.0    # metres
-LIDAR_DANGER_ZONE  = 0.8    # metres — penalise if closer than this
-LIDAR_CAUTION_ZONE = 1.5    # metres — smaller penalty
+A_CONV  = 150.0
+D_STEP  = 0.20
+H_NOM   = 0.30
+G_CLEAR = 0.08
+G_PEN   = 0.02
+CPG_DT  = 0.001
 
-# Sector aggregation: 8192 rays → 36 sector minimums
-# Each sector covers 360°/36 = 10° horizontal slice
-# Min distance per sector is the relevant signal for avoidance
-N_SECTORS = 36
-PROP_DIM  = 45               # proprioception dims (unchanged from walking env)
-OBS_DIM   = PROP_DIM + N_SECTORS   # 45 + 36 = 81
+TROT_PHASE = [0.0, math.pi, math.pi, 0.0]
 
-# Obstacle configuration
-# Fixed safe spawn positions inside apt_0.
-# These are known-clear floor positions verified visually in the viewer.
-# Add or remove positions to match your specific scene layout.
-# Format: (x, y) — z is always SPAWN_Z
-SPAWN_Z = 0.45
-SAFE_SPAWN_POSITIONS = [
-    (3.0, -2.0),   # verified working — open living area
-    (2.0, -2.0),   # living area left
-    (.0, -1),   # living area back
-    # (2.0, -3.0),   # near rug corner
-    # (4.0, -3.0),   # open area right-back
-    # (2.5, -1.5),   # centre-left
-    # (3.5, -1.5),   # centre-right
-    # (3.5, -2.5),   # centre-back-right
-]
-OBSTACLE_RING_MAX  = 4.0    # metres from spawn — outer boundary
-OBSTACLE_HEIGHT    = 1.2    # metres
-OBSTACLE_RADIUS    = 0.25   # metres
+MU_MIN,  MU_MAX  = 1.0, 2.0
+OMG_MIN, OMG_MAX = 1.5, 3.5
+PSI_MAX          = 1.5
+MU_MID,  MU_HALF  = 0.5*(MU_MAX+MU_MIN),  0.5*(MU_MAX-MU_MIN)
+OMG_MID, OMG_HALF = 0.5*(OMG_MAX+OMG_MIN), 0.5*(OMG_MAX-OMG_MIN)
 
-# Curriculum phases (in environment steps)
-# Phase 1: walk only — no avoidance reward (robot reinforces walking)
-# Phase 2: full avoidance reward enabled
-CURRICULUM_PHASE1_STEPS = 1_000_000    # 0 → 1M: walk only (minimal warm-up)
-# Phase 2: 10M → end: full avoidance reward
+CONTACT_FORCE_THRESH = 1.0
+
+# ==========================================================================
+#  Constants — LiDAR
+# ==========================================================================
+
+N_LIDAR_SECTORS  = 36         # horizontal sectors (obs size stays 36)
+N_LIDAR_ELEV     = 5          # elevation layers: -30°, -15°, 0°, +10°, +20°
+# Downward bias catches low objects; z=0.35 keeps sensor above chassis
+# Total rays = 36 × 5 = 180
+LIDAR_MAX_RANGE  = 4.0        # metres
+LIDAR_INTERVAL   = 5          # update every N steps (10 Hz at 50 Hz control)
+LIDAR_POS_OFFSET = (0.0, 0.0, 0.35)   # above chassis — safe from self-hits
+
+# Collision thresholds for reward
+LIDAR_COLLISION  = 0.20       # metres — episode termination
+LIDAR_DANGER     = 0.50       # metres — strong quadratic penalty
+LIDAR_CAUTION    = 1.20       # metres — linear penalty
+LIDAR_ANTICIPATE = 2.50       # metres — early steering signal
+
+# ==========================================================================
+#  Constants — obstacles
+# ==========================================================================
+
+N_OBS_CHAIRS   = 3    # chair = 4 thin cylinders in a square
+N_OBS_SOFAS    = 2    # sofa/cabinet = wide flat box
+N_OBS_PILLARS  = 3    # lamp/column = tall thin cylinder
+N_OBS_STEPS    = 2    # book/step = low flat box
+N_OBS_BALLS    = 2    # ball/vase = sphere
+N_OBSTACLES    = N_OBS_CHAIRS*4 + N_OBS_SOFAS + N_OBS_PILLARS + N_OBS_STEPS + N_OBS_BALLS
+# Arena — square 8×8m (half-side = 4m)
+ARENA_HALF        = 4.0
+ARENA_WALL_HEIGHT = 0.6
+ARENA_WALL_THICK  = 0.15
+OBSTACLE_RING_MIN = 2.0    # safe spawn clearance — chair legs won't be at collision dist
+OBSTACLE_RING_MAX = 3.5
+
+# Chair: 4 thin legs in a square
+CHAIR_LEG_RADIUS = 0.03
+CHAIR_LEG_HEIGHT = 0.45
+CHAIR_LEG_SPREAD = 0.25    # half-spacing between legs
+
+# Sofa/cabinet: wide flat box
+SOFA_WIDTH_RANGE  = (0.8,  1.6)
+SOFA_DEPTH_RANGE  = (0.3,  0.5)
+SOFA_HEIGHT_RANGE = (0.35, 0.50)
+
+# Pillar/lamp: tall thin cylinder
+PILLAR_RADIUS_RANGE = (0.04, 0.10)
+PILLAR_HEIGHT_RANGE = (0.60, 1.20)
+
+# Step/book: very low flat box
+STEP_SIZE_RANGE   = (0.20, 0.50)
+STEP_HEIGHT_RANGE = (0.04, 0.15)
+
+# Ball/vase
+SPHERE_RAD_RANGE  = (0.06, 0.16)
+
+# ==========================================================================
+#  Observation dims
+# ==========================================================================
+
+PROP_DIM  = 76                        # proprioception (matches go2_cpg_rl.py)
+OBS_DIM   = PROP_DIM + N_LIDAR_SECTORS  # 76 + 36 = 112 (sectors, not raw rays)
+ACT_DIM   = 12
 
 
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
 
 
+def clean_state_dict(sd):
+    return {k.replace("_orig_mod.", "").replace("module.", ""): v
+            for k, v in sd.items()}
+
+
 # ==========================================================================
-#  ReplicaCAD scene loader (same as replica_rl_locomotion.py)
+#  Kinematics (identical to go2_cpg_rl.py)
 # ==========================================================================
 
-def _convert_habitat_to_genesis(pos, quat_wxyz):
-    x, y, z = pos
-    qw, qx, qy, qz = quat_wxyz
-    return [x, -z, y], [qw, qx, -qz, qy]
+def leg_fk(qh, qt, qc, side_sign, l1, l2, l3):
+    s   = side_sign
+    z_s = -l2*torch.cos(qt) - l3*torch.cos(qt+qc)
+    px  = -l2*torch.sin(qt) - l3*torch.sin(qt+qc)
+    py  =  s*l1*torch.cos(qh) - z_s*torch.sin(qh)
+    pz  =  s*l1*torch.sin(qh) + z_s*torch.cos(qh)
+    return px, py, pz
 
 
-def _resolve_asset_path(template_path, root_dir):
-    base_name  = os.path.basename(template_path)
-    search_dir = os.path.join(root_dir, "configs")
-    if not os.path.exists(search_dir):
-        search_dir = root_dir
-    for subdir, _, files in os.walk(search_dir):
-        for f in files:
-            if f.startswith(base_name) and f.endswith(".json"):
-                path = os.path.join(subdir, f)
-                try:
-                    with open(path) as fp:
-                        cfg = json.load(fp)
-                    asset = cfg.get("urdf_filepath") or cfg.get("render_asset")
-                    if asset:
-                        abs_p = os.path.abspath(
-                            os.path.join(os.path.dirname(path), asset)
-                        )
-                        if os.path.exists(abs_p):
-                            return abs_p
-                except Exception:
-                    pass
-    return None
-
-
-def _spawn_entity(scene, template_name, asset_path, pos, quat, is_fixed, scale=1.0):
-    try:
-        if asset_path.endswith(".urdf"):
-            scene.add_entity(gs.morphs.URDF(
-                file=asset_path, pos=pos, quat=quat, fixed=is_fixed
-            ))
-        elif asset_path.endswith((".glb", ".obj")):
-            scene.add_entity(gs.morphs.Mesh(
-                file=asset_path, pos=pos, quat=quat, fixed=is_fixed,
-                scale=(scale, scale, scale)
-            ))
-        print(f"  ✅  {os.path.basename(template_name)}")
-    except Exception as e:
-        print(f"  ❌  {os.path.basename(template_name)}: {e}")
-
-
-def _load_stage_as_heightfield(scene, asset_path, pos):
-    """
-    Fast floor: add a Genesis infinite plane at Z=0 for collision,
-    and load the stage mesh as visual-only (no collision geometry).
-    This avoids the expensive mesh collision while keeping visuals.
-    """
-    try:
-        # Infinite plane — zero collision cost, guaranteed floor at Z=0
-        scene.add_entity(gs.morphs.Plane())
-        print(f"  ✅  Floor: infinite plane at Z=0 (fast collision)")
-
-        # Stage mesh visual only — no collision, just for rendering
-        scene.add_entity(gs.morphs.Mesh(
-            file          = asset_path,
-            pos           = pos,
-            fixed         = True,
-            collision     = False,   # visual only
-        ))
-        print(f"  ✅  Stage mesh: visual only (no collision)")
-        return True
-
-    except Exception as e:
-        print(f"  ⚠️  Fast floor failed: {e} — falling back to full mesh")
-        return False
-
-
-def _load_replica_scene(scene, scene_json, asset_root, use_heightfield=True):
-    """Load a ReplicaCAD scene into a Genesis scene object.
-
-    use_heightfield: if True, converts the stage mesh to a heightfield
-                     for faster collision. Falls back to mesh on failure.
-    """
-    import json as _json
-    with open(scene_json) as f:
-        config = _json.load(f)
-
-    print("\n── Stage ──")
-    stage = config.get("stage_instance", {})
-    tmpl  = stage.get("template_name")
-    if tmpl:
-        asset = _resolve_asset_path(tmpl, asset_root)
-        if asset:
-            p, q = _convert_habitat_to_genesis(
-                stage.get("translation", [0, 0, 0]),
-                stage.get("rotation",    [1, 0, 0, 0]),
-            )
-            p[2] -= 0.05   # nudge to prevent z-fighting
-
-            if use_heightfield:
-                loaded = _load_stage_as_heightfield(scene, asset, p)
-                if not loaded:
-                    # Fallback to full mesh
-                    _spawn_entity(scene, tmpl, asset, p, q, True)
-            else:
-                _spawn_entity(scene, tmpl, asset, p, q, True)
-        else:
-            print(f"  ⚠️  Could not resolve stage: {tmpl}")
-
-    print("\n── Rigid objects ──")
-    for obj in config.get("object_instances", []):
-        tmpl  = obj["template_name"]
-        asset = _resolve_asset_path(tmpl, asset_root)
-        if asset:
-            p, q = _convert_habitat_to_genesis(obj["translation"], obj["rotation"])
-            _spawn_entity(scene, tmpl, asset, p, q,
-                          obj.get("motion_type") == "STATIC",
-                          obj.get("uniform_scale", 1.0))
-
-    print("\n── Articulated objects ──")
-    for obj in config.get("articulated_object_instances", []):
-        tmpl  = obj["template_name"]
-        asset = _resolve_asset_path(tmpl, asset_root)
-        if asset:
-            p, q = _convert_habitat_to_genesis(obj["translation"], obj["rotation"])
-            _spawn_entity(scene, tmpl, asset, p, q,
-                          obj.get("fixed_base", True),
-                          obj.get("uniform_scale", 1.0))
+def leg_ik(px, py, pz, side_sign, l1, l2, l3):
+    l1_s = side_sign * l1
+    L    = torch.sqrt(torch.clamp(py*py + pz*pz - l1*l1, min=1e-8))
+    z_s  = -L
+    qh   = torch.atan2(L*py + l1_s*pz, l1_s*py - L*pz)
+    D2   = px*px + L*L
+    ck   = torch.clamp((D2-l2*l2-l3*l3)/(2.0*l2*l3), -1.0, 1.0)
+    qc   = -torch.acos(ck)
+    A    = l2 + l3*ck
+    B    = l3*torch.sin(qc)
+    qt   = torch.atan2(B*z_s - A*px, -B*px - A*z_s)
+    return qh, qt, qc
 
 
 # ==========================================================================
 #  Environment
 # ==========================================================================
 
-class Go2LidarNavEnv:
+class Go2CPGNavEnv:
     """
-    Go2 locomotion + LiDAR obstacle avoidance environment.
-
-    Observation: [proprioception (45)] + [LiDAR distances (N_lidar)]
-    Action:      joint position offsets (12)
-    Reward:      velocity tracking + collision avoidance penalty
+    CPG-RL locomotion environment with randomised obstacles and LiDAR.
+    Observation: proprioception (76) + LiDAR sector mins (36) = 112 dims.
     """
 
-    ACT_DIM = 12
+    ACT_DIM = ACT_DIM
 
-    def __init__(
-        self,
-        n_envs:            int   = 4096,
-        dt:                float = 0.02,
-        max_episode_steps: int   = 1000,
-        headless:          bool  = True,
-        device:            str   = "cuda",
-        scene_json:        str   = None,
-        asset_root:        str   = None,
-        use_heightfield:   bool  = False,  # disabled — walls not present without stage collision
-    ):
-        self.n_envs            = n_envs
-        self.num_envs          = n_envs
-        self.dt                = dt
-        self.max_episode_steps = max_episode_steps
-        self.device            = torch.device(device)
-        self.scene_json        = scene_json
-        self.asset_root        = os.path.abspath(asset_root) if asset_root else None
-        self.use_house         = scene_json is not None
+    def __init__(self, n_envs=4096, dt=0.02, max_episode_steps=1000,
+                 headless=True, device="cuda"):
+        self.n_envs   = n_envs
+        self.num_envs = n_envs
+        self.dt       = dt
+        self.device   = torch.device(device)
 
-        self.simulate_action_latency = True
-
-        # ── Config ────────────────────────────────────────────────────────
         self.env_cfg = {
-            "num_actions":   12,
-            "base_init_pos":  BASE_INIT_POS,
-            "base_init_quat": BASE_INIT_QUAT,
-            "episode_length_s": max_episode_steps * dt,
+            "base_init_pos":  [0.0, 0.0, 0.42],
+            "base_init_quat": [0.0, 0.0, 0.0, 1.0],
+            "episode_length_s":  max_episode_steps * dt,
             "resampling_time_s": 4.0,
-            "action_scale":  0.25,
-            "clip_actions":  100.0,
-            "kp": 20.0,
-            "kd":  0.5,
-            "dof_names": MOTOR_JOINT_NAMES,
-            "default_joint_angles": DEFAULT_JOINT_ANGLES,
+            "kp": 100.0, "kd": 2.0,
             "termination_if_pitch_greater_than": 1.0,
             "termination_if_roll_greater_than":  1.0,
+            "termination_if_height_less_than":   0.18,
         }
-        self.obs_cfg = {
-            "obs_scales": {
-                "lin_vel": 2.0, "ang_vel": 0.25,
-                "dof_pos": 1.0, "dof_vel": 0.05,
-            },
+        self.obs_scales = {
+            "lin_vel": 2.0, "ang_vel": 0.25,
+            "dof_pos": 1.0, "dof_vel": 0.05,
         }
         self.reward_cfg = {
-            "tracking_sigma":     0.25,
-            "base_height_target": 0.34,
+            "tracking_sigma": 0.5,
             "reward_scales": {
-                "tracking_lin_vel":   1.0,
-                "tracking_ang_vel":   0.2,
-                "lin_vel_z":         -1.0,
-                "base_height":       -50.0,
-                "action_rate":       -0.005,
-                "similar_to_default":-0.1,
-                "obstacle_avoidance":-2.0,   # NEW: collision avoidance
+                "tracking_lin_vel_x":  0.75,
+                "tracking_lin_vel_y":  0.75,
+                "tracking_ang_vel":    0.75,
+                "lin_vel_z":          -2.00,
+                "ang_vel_xy":         -0.05,
+                "work":               -0.001,
+                "obstacle_avoidance": -4.00,
+                "survival":           +0.10,
+                "forward_progress":   +0.50,   # reward actual movement — breaks standing still
+                "stall_penalty":      -0.30,   # penalise near-zero velocity near obstacles
             },
         }
+
+        # Avoidance curriculum — disabled during eval (n_envs=1)
+        self.curriculum_steps    = 20_000_000
+        self.curriculum_step_ctr = 0
+        self._use_curriculum     = (n_envs > 1)   # off during eval
         self.command_cfg = {
-            "num_commands": 3,
-            "lin_vel_x_range": [0.5, 0.5],
-            "lin_vel_y_range": [0.0, 0.0],
-            "ang_vel_range":   [0.0, 0.0],
+            "lin_vel_x_range": [0.5, 1.5],   # min 0.5 — always commanded to move
+            "lin_vel_y_range": [-0.3, 0.3],
+            "ang_vel_range":   [-1.0, 1.0],
         }
 
-        self.obs_scales     = self.obs_cfg["obs_scales"]
-        self.reward_scales  = {
-            k: v * dt
-            for k, v in self.reward_cfg["reward_scales"].items()
-        }
-        self.max_episode_length = math.ceil(
-            self.env_cfg["episode_length_s"] / self.dt
-        )
-        self.num_commands = self.command_cfg["num_commands"]
+        self.reward_scales      = {k: v*dt for k, v in self.reward_cfg["reward_scales"].items()}
+        self.max_episode_length = math.ceil(self.env_cfg["episode_length_s"] / dt)
+        self.num_commands       = 3
+        self.n_cpg_substeps     = max(1, round(dt / CPG_DT))
+        self.cpg_dt             = dt / self.n_cpg_substeps
 
-        # Curriculum state — controlled by PPOTrainer
-        self.curriculum_phase    = 1   # 1=walk only, 2=obstacles, 3=full avoidance
-        self.obstacles_active    = False
-        self.avoidance_active    = False
-
-        # ── Genesis init ──────────────────────────────────────────────────
+        # ── Genesis ───────────────────────────────────────────────────────
         backend = gs.cuda if torch.cuda.is_available() else gs.cpu
-        gs.init(
-            backend      = backend,
-            precision    = "32",
-            logging_level= "warning",
-            performance_mode = True,
-        )
+        gs.init(backend=backend, precision="32",
+                logging_level="warning", performance_mode=True)
 
         self.scene = gs.Scene(
-            sim_options    = gs.options.SimOptions(dt=self.dt, substeps=2),
+            sim_options    = gs.options.SimOptions(dt=dt, substeps=2),
             viewer_options = gs.options.ViewerOptions(
-                max_FPS      = int(0.5 / self.dt),
-                camera_pos   = (BASE_INIT_POS[0] + 2.0,
-                                BASE_INIT_POS[1] - 2.0, 1.5),
-                camera_lookat= (BASE_INIT_POS[0],
-                                BASE_INIT_POS[1], 0.4),
+                max_FPS      = int(0.5/dt),
+                camera_pos   = (3.0, -3.0, 2.5),
+                camera_lookat= (0.0,  0.0, 0.3),
                 camera_fov   = 50,
             ),
-            vis_options    = gs.options.VisOptions(n_rendered_envs=1),
-            rigid_options  = gs.options.RigidOptions(
-                dt                               = self.dt,
-                constraint_solver                = gs.constraint_solver.Newton,
-                enable_collision                 = True,
-                enable_joint_limit               = True,
-                multiplier_collision_broad_phase = 10,   # reduced from 50
-                max_collision_pairs              = 1000, # reduced from 10000
-                iterations                       = 100,  # restored — needed for stability
+            vis_options  = gs.options.VisOptions(n_rendered_envs=1),
+            rigid_options= gs.options.RigidOptions(
+                dt=dt, constraint_solver=gs.constraint_solver.Newton,
+                enable_collision=True, enable_joint_limit=True,
+                iterations=100,
             ),
+            renderer    = gs.renderers.Rasterizer(),   # needed for camera.render()
             show_viewer = not headless,
         )
 
-        # ── Scene: house or flat terrain + cylinders ─────────────────────
-        if self.use_house:
-            print(f"\nLoading house scene: {self.scene_json}")
-            _load_replica_scene(
-                self.scene, self.scene_json, self.asset_root,
-                use_heightfield = use_heightfield,
-            )
-            self.obstacles = []
-            print()
-        else:
-            # Flat terrain
+        # ── Ground ────────────────────────────────────────────────────────
+        self.scene.add_entity(gs.morphs.Plane())
+
+        # ── Arena walls — simple square 6×6m ─────────────────────────────
+        s = ARENA_HALF
+        t = ARENA_WALL_THICK
+        h = ARENA_WALL_HEIGHT
+        # Four walls: (pos_x, pos_y, size_x, size_y)
+        wall_defs = [
+            ( 0.0,   s,   2*s + 2*t, t),   # north
+            ( 0.0,  -s,   2*s + 2*t, t),   # south
+            ( s,     0.0, t,          2*s), # east
+            (-s,     0.0, t,          2*s), # west
+        ]
+        for wx, wy, sx, sy in wall_defs:
             self.scene.add_entity(
-                gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True)
+                gs.morphs.Box(
+                    size  = (sx, sy, h),
+                    pos   = (wx, wy, h / 2),
+                    fixed = True,
+                )
             )
-            # Random cylinders — parked off-scene until Phase 2
-            self.obstacles = []
-            for _ in range(N_OBSTACLES):
-                obs_entity = self.scene.add_entity(
+        self.arena_term_dist = s + 0.5   # termination threshold
+        print(f"  Arena: {2*s:.0f}×{2*s:.0f}m square, walls h={h}m")
+
+        # ── Obstacles — realistic indoor objects ──────────────────────────
+        # Pre-allocated at build time; positions randomised each episode.
+        # Types: chairs (4-leg clusters), sofas, pillars, steps, balls.
+        print(f"\n  Building obstacles: "
+              f"{N_OBS_CHAIRS} chairs, {N_OBS_SOFAS} sofas, "
+              f"{N_OBS_PILLARS} pillars, {N_OBS_STEPS} steps, "
+              f"{N_OBS_BALLS} balls → {N_OBSTACLES} total entities")
+
+        self.obstacles = []   # list of (type, entity, height, metadata)
+
+        # ── Chairs: 4 thin cylinder legs per chair ────────────────────────
+        # Each chair = 4 entities. Positions set together in _randomise_obstacles.
+        # leg_offsets: corners of a square with side CHAIR_LEG_SPREAD*2
+        leg_offsets = [
+            ( CHAIR_LEG_SPREAD,  CHAIR_LEG_SPREAD),
+            ( CHAIR_LEG_SPREAD, -CHAIR_LEG_SPREAD),
+            (-CHAIR_LEG_SPREAD,  CHAIR_LEG_SPREAD),
+            (-CHAIR_LEG_SPREAD, -CHAIR_LEG_SPREAD),
+        ]
+        for c in range(N_OBS_CHAIRS):
+            legs = []
+            for dx, dy in leg_offsets:
+                e = self.scene.add_entity(
                     gs.morphs.Cylinder(
-                        height = OBSTACLE_HEIGHT,
-                        radius = OBSTACLE_RADIUS,
-                        pos    = (999.0, 999.0, OBSTACLE_HEIGHT / 2),
+                        radius = CHAIR_LEG_RADIUS,
+                        height = CHAIR_LEG_HEIGHT,
+                        pos    = (99.0 + dx, 99.0 + dy, CHAIR_LEG_HEIGHT/2),
                         fixed  = True,
                     )
                 )
-                self.obstacles.append(obs_entity)
+                legs.append(e)
+            # Store as one logical chair: all 4 legs together
+            self.obstacles.append(("chair", legs, CHAIR_LEG_HEIGHT, leg_offsets))
+
+        # ── Sofas/cabinets: wide flat box ─────────────────────────────────
+        for i in range(N_OBS_SOFAS):
+            t = i / max(N_OBS_SOFAS-1, 1)
+            w = SOFA_WIDTH_RANGE[0]  + (SOFA_WIDTH_RANGE[1]  - SOFA_WIDTH_RANGE[0])  * t
+            d = SOFA_DEPTH_RANGE[0]  + (SOFA_DEPTH_RANGE[1]  - SOFA_DEPTH_RANGE[0])  * t
+            h = SOFA_HEIGHT_RANGE[0] + (SOFA_HEIGHT_RANGE[1] - SOFA_HEIGHT_RANGE[0]) * t
+            e = self.scene.add_entity(
+                gs.morphs.Box(size=(w, d, h), pos=(99.0, 99.0, h/2), fixed=True)
+            )
+            self.obstacles.append(("sofa", e, h, None))
+
+        # ── Pillars/lamps: tall thin cylinder ─────────────────────────────
+        for i in range(N_OBS_PILLARS):
+            t = i / max(N_OBS_PILLARS-1, 1)
+            r = PILLAR_RADIUS_RANGE[0] + (PILLAR_RADIUS_RANGE[1] - PILLAR_RADIUS_RANGE[0]) * t
+            h = PILLAR_HEIGHT_RANGE[0] + (PILLAR_HEIGHT_RANGE[1] - PILLAR_HEIGHT_RANGE[0]) * t
+            e = self.scene.add_entity(
+                gs.morphs.Cylinder(radius=r, height=h,
+                                   pos=(99.0, 99.0, h/2), fixed=True)
+            )
+            self.obstacles.append(("pillar", e, h, None))
+
+        # ── Steps/books: very low flat box ────────────────────────────────
+        for i in range(N_OBS_STEPS):
+            t = i / max(N_OBS_STEPS-1, 1)
+            s = STEP_SIZE_RANGE[0]   + (STEP_SIZE_RANGE[1]   - STEP_SIZE_RANGE[0])   * t
+            h = STEP_HEIGHT_RANGE[0] + (STEP_HEIGHT_RANGE[1] - STEP_HEIGHT_RANGE[0]) * t
+            e = self.scene.add_entity(
+                gs.morphs.Box(size=(s, s, h), pos=(99.0, 99.0, h/2), fixed=True)
+            )
+            self.obstacles.append(("step", e, h, None))
+
+        # ── Balls/vases: sphere ───────────────────────────────────────────
+        for i in range(N_OBS_BALLS):
+            t = i / max(N_OBS_BALLS-1, 1)
+            r = SPHERE_RAD_RANGE[0] + (SPHERE_RAD_RANGE[1] - SPHERE_RAD_RANGE[0]) * t
+            e = self.scene.add_entity(
+                gs.morphs.Sphere(radius=r, pos=(99.0, 99.0, r), fixed=True)
+            )
+            self.obstacles.append(("ball", e, r*2, None))
 
         # ── Robot ─────────────────────────────────────────────────────────
-        self.base_init_pos  = torch.tensor(BASE_INIT_POS,  device=self.device)
-        self.base_init_quat = torch.tensor(BASE_INIT_QUAT, device=self.device)
+        self.base_init_pos  = torch.tensor(
+            self.env_cfg["base_init_pos"],  device=self.device)
+        self.base_init_quat = torch.tensor(
+            self.env_cfg["base_init_quat"], device=self.device)
         self.inv_base_init_quat = inv_quat(self.base_init_quat)
 
         self.robot = self.scene.add_entity(
@@ -408,65 +391,112 @@ class Go2LidarNavEnv:
             )
         )
 
-        # ── LiDAR sensor ──────────────────────────────────────────────────
-        # Horizontal-only rays at robot body height to avoid hitting own legs.
-        # pos_offset z=0.35 clears the robot chassis.
-        # return_world_frame=True so sector ordering is stable as robot rotates.
+        # ── LiDAR ─────────────────────────────────────────────────────────
+        # 36 horizontal rays — minimal ray count for maximum speed.
+        # Updated every LIDAR_INTERVAL steps (10 Hz).
         self.lidar = self.scene.add_sensor(
             gs.sensors.Lidar(
                 pattern = gs.sensors.SphericalPattern(
-                    fov      = (360.0, 0.0),   # flat horizontal — avoids hitting legs
-                    n_points = (128, 1),        # 128 rays × 1 elevation = 128 rays
+                    fov      = (360.0, 50.0),   # 360° horiz, 50° vert
+                    n_points = (N_LIDAR_SECTORS, N_LIDAR_ELEV),  # 36×5=180
                 ),
                 entity_idx         = self.robot.idx,
-                pos_offset         = (0.0, 0.0, 0.35),   # above chassis
-                return_world_frame = True,                # stable sector ordering
+                pos_offset         = LIDAR_POS_OFFSET,
+                return_world_frame = True,
                 draw_debug         = (not headless),
             )
         )
 
+        # ── Front camera (BEFORE build — Genesis requires this) ───────────
+        # Visualization only — not used in RL at all.
+        self.front_cam    = None
+        self.cam_interval = 10
+        self._cam_step    = 0
+
+        if not headless:
+            try:
+                self.front_cam = self.scene.add_camera(
+                    res    = (640, 360),
+                    pos    = (0.3, 0.0, 0.1),
+                    lookat = (1.0, 0.0, 0.1),
+                    fov    = 60,
+                    GUI    = False,
+                )
+                self._cam_frame   = None
+                self._pip_ready   = False
+                print(f"  ✅  Front camera created (640×360, FOV=60°)")
+            except Exception as e:
+                print(f"  ⚠️  Front camera failed: {e}")
+                self.front_cam = None
+
         # ── Build ─────────────────────────────────────────────────────────
         self.scene.build(n_envs=n_envs)
 
-        # Determine LiDAR output dimension from a dummy read after build
-        # SphericalPattern default: 64 horizontal × 128 vertical = 8192
-        _dummy           = self.lidar.read()
-        _dummy_flat      = _dummy.distances.reshape(_dummy.distances.shape[0], -1)
-        self.n_lidar_raw     = _dummy_flat.shape[-1]
-        self.rays_per_sector = self.n_lidar_raw // N_SECTORS
-        self.n_trim          = self.rays_per_sector * N_SECTORS
-        self.OBS_DIM         = OBS_DIM   # 45 + 36 = 81
-        print(f"  LiDAR raw rays : {self.n_lidar_raw}")
-        print(f"  Rays/sector    : {self.rays_per_sector}  (trimmed to {self.n_trim})")
-        print(f"  LiDAR sectors  : {N_SECTORS}  (min per sector)")
-        print(f"  Total obs dim  : {self.OBS_DIM}")
-
-        # ── Motor DOFs ────────────────────────────────────────────────────
+        # ── Motors ────────────────────────────────────────────────────────
         self.motor_dofs = [
-            self.robot.get_joint(name).dof_idx_local
-            for name in self.env_cfg["dof_names"]
+            self.robot.get_joint(n).dof_idx_local for n in MOTOR_JOINT_NAMES
         ]
-        self.robot.set_dofs_kp(
-            [self.env_cfg["kp"]] * self.ACT_DIM, self.motor_dofs
-        )
-        self.robot.set_dofs_kv(
-            [self.env_cfg["kd"]] * self.ACT_DIM, self.motor_dofs
-        )
-
+        self.robot.set_dofs_kp([self.env_cfg["kp"]]*ACT_DIM, self.motor_dofs)
+        self.robot.set_dofs_kv([self.env_cfg["kd"]]*ACT_DIM, self.motor_dofs)
         self.default_dof_pos = torch.tensor(
-            [self.env_cfg["default_joint_angles"][n]
-             for n in self.env_cfg["dof_names"]],
-            device=self.device, dtype=gs.tc_float,
-        )
+            [DEFAULT_JOINT_ANGLES[n] for n in MOTOR_JOINT_NAMES],
+            device=self.device, dtype=gs.tc_float)
+
+        self.side_sign  = torch.tensor(LEG_SIDE_SIGN,  device=self.device, dtype=gs.tc_float)
+        self.trot_phase = torch.tensor(TROT_PHASE,     device=self.device, dtype=gs.tc_float)
+
+        # ── Contacts ──────────────────────────────────────────────────────
+        self.contact_mode = "phase"
+        try:
+            self.foot_link_idx = [
+                self.robot.get_link(n).idx_local for n in FOOT_LINK_NAMES
+            ]
+            _ = self.robot.get_links_net_contact_force()
+            self.contact_mode = "force"
+        except Exception as e:
+            print(f"  [contacts] using phase proxy ({e})")
+
+        # ── Kuramoto phi_star (precomputed, not recreated each step) ──────
+        self.phi_star = torch.tensor([
+            [0.0,       math.pi, math.pi, 0.0    ],
+            [math.pi,   0.0,     0.0,     math.pi],
+            [math.pi,   0.0,     0.0,     math.pi],
+            [0.0,       math.pi, math.pi, 0.0    ],
+        ], device=self.device, dtype=gs.tc_float)
+
+        # ── IK self-test ──────────────────────────────────────────────────
+        with torch.no_grad():
+            qh0 = self.default_dof_pos[0::3].view(1, 4)
+            qt0 = self.default_dof_pos[1::3].view(1, 4)
+            qc0 = self.default_dof_pos[2::3].view(1, 4)
+            fx, fy, fz = leg_fk(qh0, qt0, qc0, self.side_sign,
+                                 L_HIP, L_THIGH, L_CALF)
+            rh, rt, rc = leg_ik(fx, fy, fz, self.side_sign,
+                                 L_HIP, L_THIGH, L_CALF)
+            err = (torch.abs(rh-qh0)+torch.abs(rt-qt0)+torch.abs(rc-qc0)).max().item()
+
+        print(f"\n{'='*60}")
+        print(f"  Go2 Visual CPG-RL Navigation")
+        print(f"{'='*60}")
+        print(f"  Envs          : {n_envs}")
+        print(f"  Control dt    : {dt}s ({1/dt:.0f} Hz) | CPG {self.n_cpg_substeps}x ({1/self.cpg_dt:.0f} Hz)")
+        print(f"  Obs / Act     : {OBS_DIM} / {ACT_DIM}  "
+              f"({PROP_DIM} prop + {N_LIDAR_SECTORS} LiDAR)")
+        print(f"  LiDAR         : {N_LIDAR_SECTORS} sectors × {N_LIDAR_ELEV} elevations "
+              f"= {N_LIDAR_SECTORS*N_LIDAR_ELEV} rays, FOV 55° downward-biased, "
+              f"max {LIDAR_MAX_RANGE}m, update every {LIDAR_INTERVAL} steps")
+        print(f"  Obstacles     : {N_OBSTACLES} total, "
+              f"ring {OBSTACLE_RING_MIN}-{OBSTACLE_RING_MAX}m")
+        print(f"  IK self-test  : max error {err:.2e} rad "
+              f"[{'OK' if err < 1e-4 else 'WARN'}]")
+        print(f"{'='*60}\n")
 
         # ── Reward registry ───────────────────────────────────────────────
-        self.reward_functions = {}
-        self.episode_sums     = {}
+        self.reward_functions, self.episode_sums = {}, {}
         for name in self.reward_scales:
             self.reward_functions[name] = getattr(self, f"_reward_{name}")
-            self.episode_sums[name]     = torch.zeros(
-                (n_envs,), device=self.device, dtype=gs.tc_float
-            )
+            self.episode_sums[name] = torch.zeros(
+                (n_envs,), device=self.device, dtype=gs.tc_float)
 
         # ── State buffers ─────────────────────────────────────────────────
         N, f = n_envs, gs.tc_float
@@ -474,158 +504,329 @@ class Go2LidarNavEnv:
         self.base_ang_vel      = torch.zeros((N, 3), device=self.device, dtype=f)
         self.projected_gravity = torch.zeros((N, 3), device=self.device, dtype=f)
         self.global_gravity    = torch.tensor(
-            [0.0, 0.0, -1.0], device=self.device, dtype=f
-        ).repeat(N, 1)
+            [0., 0., -1.], device=self.device, dtype=f).repeat(N, 1)
+        self.base_pos          = torch.zeros((N, 3), device=self.device, dtype=f)
+        self.base_quat         = torch.zeros((N, 4), device=self.device, dtype=f)
+        self.base_euler        = torch.zeros((N, 3), device=self.device, dtype=f)
 
-        self.obs_buf            = torch.zeros((N, self.OBS_DIM), device=self.device, dtype=f)
-        self.rew_buf            = torch.zeros((N,),              device=self.device, dtype=f)
-        self.reset_buf          = torch.ones( (N,),              device=self.device, dtype=gs.tc_int)
-        self.episode_length_buf = torch.zeros((N,),              device=self.device, dtype=gs.tc_int)
+        self.dof_pos        = torch.zeros((N, ACT_DIM), device=self.device, dtype=f)
+        self.dof_vel        = torch.zeros((N, ACT_DIM), device=self.device, dtype=f)
+        self.last_dof_vel   = torch.zeros((N, ACT_DIM), device=self.device, dtype=f)
+        self.target_dof_pos = self.default_dof_pos.unsqueeze(0).repeat(N, 1).clone()
+        self.applied_torque = torch.zeros((N, ACT_DIM), device=self.device, dtype=f)
+
+        self.actions      = torch.zeros((N, ACT_DIM), device=self.device, dtype=f)
+        self.last_actions = torch.zeros((N, ACT_DIM), device=self.device, dtype=f)
+
+        self.cpg_r     = torch.ones( (N, 4), device=self.device, dtype=f)
+        self.cpg_rdot  = torch.zeros((N, 4), device=self.device, dtype=f)
+        self.cpg_theta = torch.zeros((N, 4), device=self.device, dtype=f)
+        self.cpg_phi   = torch.zeros((N, 4), device=self.device, dtype=f)
+        self.foot_contacts = torch.zeros((N, 4), device=self.device, dtype=f)
 
         self.commands       = torch.zeros((N, self.num_commands), device=self.device, dtype=f)
         self.commands_scale = torch.tensor(
             [self.obs_scales["lin_vel"],
              self.obs_scales["lin_vel"],
              self.obs_scales["ang_vel"]],
-            device=self.device, dtype=f,
-        )
+            device=self.device, dtype=f)
 
-        self.actions      = torch.zeros((N, self.ACT_DIM), device=self.device, dtype=f)
-        self.last_actions = torch.zeros_like(self.actions)
-        self.dof_pos      = torch.zeros_like(self.actions)
-        self.dof_vel      = torch.zeros_like(self.actions)
-        self.last_dof_vel = torch.zeros_like(self.actions)
-        self.base_pos     = torch.zeros((N, 3), device=self.device, dtype=f)
-        self.base_quat    = torch.zeros((N, 4), device=self.device, dtype=f)
+        # LiDAR sector buffer — updated every LIDAR_INTERVAL steps
+        self.lidar_sectors = torch.full(
+            (N, N_LIDAR_SECTORS), fill_value=LIDAR_MAX_RANGE,
+            device=self.device, dtype=f)
+        self._lidar_step = 0
+        self._cam_step   = 0
 
-        # LiDAR sector buffer — shape [N, N_SECTORS]
-        # Aggregated from raw rays: min distance per 36 horizontal sectors
-        self.lidar_sectors = torch.zeros(
-            (N, N_SECTORS), device=self.device, dtype=f
-        )
-
+        self.obs_buf            = torch.zeros((N, OBS_DIM),  device=self.device, dtype=f)
+        self.rew_buf            = torch.zeros((N,),           device=self.device, dtype=f)
+        self.reset_buf          = torch.ones( (N,),           device=self.device, dtype=gs.tc_int)
+        self.episode_length_buf = torch.zeros((N,),           device=self.device, dtype=gs.tc_int)
         self.extras = {}
 
     # ------------------------------------------------------------------
-    # Public interface
+    # CPG
+    # ------------------------------------------------------------------
+
+    def _map_action(self, raw):
+        t        = torch.tanh(raw)
+        mu       = MU_MID  + MU_HALF  * t[:, 0:4]
+        omega_hz = OMG_MID + OMG_HALF * t[:, 4:8]
+        psi      = PSI_MAX * t[:, 8:12]
+        return mu, omega_hz, psi
+
+    def _integrate_cpg(self, mu, omega_hz, psi):
+        """CPG integration with Kuramoto inter-leg coupling (trot pattern)."""
+        omega = 2.0 * math.pi * omega_hz
+        a, dt_c = A_CONV, self.cpg_dt
+        COUPLING_W = 2.0
+
+        for _ in range(self.n_cpg_substeps):
+            theta_i  = self.cpg_theta.unsqueeze(2)   # [N,4,1]
+            theta_j  = self.cpg_theta.unsqueeze(1)   # [N,1,4]
+            coupling = COUPLING_W * torch.sum(
+                torch.sin(theta_j - theta_i - self.phi_star), dim=2
+            )
+            r_ddot         = a * (0.25*a*(mu - self.cpg_r) - self.cpg_rdot)
+            self.cpg_rdot  = self.cpg_rdot  + r_ddot          * dt_c
+            self.cpg_r     = self.cpg_r     + self.cpg_rdot   * dt_c
+            self.cpg_theta = self.cpg_theta + (omega+coupling) * dt_c
+            self.cpg_phi   = self.cpg_phi   + psi              * dt_c
+
+        self.cpg_theta = torch.remainder(self.cpg_theta, 2*math.pi)
+        self.cpg_phi   = torch.remainder(self.cpg_phi,   2*math.pi)
+
+    def _cpg_to_joint_targets(self):
+        amp  = D_STEP * (self.cpg_r - 1.0)
+        ct, st = torch.cos(self.cpg_theta), torch.sin(self.cpg_theta)
+        cp, sp = torch.cos(self.cpg_phi),   torch.sin(self.cpg_phi)
+        px = -amp * ct * cp
+        py = self.side_sign * L_HIP - amp * ct * sp
+        z_clear = torch.where(st > 0, G_CLEAR*st, G_PEN*st)
+        pz = -H_NOM + z_clear
+        qh, qt, qc = leg_ik(px, py, pz, self.side_sign, L_HIP, L_THIGH, L_CALF)
+        self.target_dof_pos[:, 0::3] = qh
+        self.target_dof_pos[:, 1::3] = qt
+        self.target_dof_pos[:, 2::3] = qc
+
+    def _update_foot_contacts(self):
+        if self.contact_mode == "force":
+            try:
+                ff = self.robot.get_links_net_contact_force()
+                ff = ff[:, self.foot_link_idx, :]
+                self.foot_contacts = (torch.norm(ff, dim=-1) > CONTACT_FORCE_THRESH).float()
+                return
+            except Exception:
+                self.contact_mode = "phase"
+        self.foot_contacts = (torch.sin(self.cpg_theta) < 0).float()
+
+    # ------------------------------------------------------------------
+    # LiDAR update
+    # ------------------------------------------------------------------
+
+    def _update_lidar(self):
+        """
+        Read LiDAR and aggregate into sector minimums.
+        Multi-elevation: min across elevation layers per sector catches
+        low objects (chair legs, balls, steps) missed by flat ring.
+        Raw oscillation is intentionally preserved — the policy learns
+        to handle it, matching real robot sensor behaviour.
+        """
+        raw_ = self.lidar.read().distances
+
+        if raw_.dim() == 3:
+            n_env, n_elev, n_horiz = raw_.shape
+            if n_horiz == N_LIDAR_SECTORS:
+                self.lidar_sectors[:] = raw_.min(dim=1).values
+            else:
+                raw = raw_.reshape(n_env, -1)
+                n_raw = raw.shape[1]
+                rps   = n_raw // N_LIDAR_SECTORS
+                n_trim = rps * N_LIDAR_SECTORS
+                self.lidar_sectors[:] = raw[:, :n_trim].view(
+                    n_env, N_LIDAR_SECTORS, rps
+                ).min(dim=2).values
+        else:
+            raw   = raw_.reshape(self.n_envs, -1)
+            n_raw = raw.shape[1]
+            if n_raw >= N_LIDAR_SECTORS:
+                rps    = n_raw // N_LIDAR_SECTORS
+                n_trim = rps * N_LIDAR_SECTORS
+                self.lidar_sectors[:] = raw[:, :n_trim].view(
+                    self.n_envs, N_LIDAR_SECTORS, rps
+                ).min(dim=2).values
+            else:
+                pad = raw.repeat(1, math.ceil(N_LIDAR_SECTORS / n_raw))
+                self.lidar_sectors[:] = pad[:, :N_LIDAR_SECTORS]
+
+    # ------------------------------------------------------------------
+    # Observation
+    # ------------------------------------------------------------------
+
+    def _compute_observation(self):
+        lidar_norm = torch.clamp(
+            self.lidar_sectors / LIDAR_MAX_RANGE, 0.0, 1.0
+        )
+        self.obs_buf = torch.cat([
+            self.base_lin_vel * self.obs_scales["lin_vel"],                      # 3
+            self.base_ang_vel * self.obs_scales["ang_vel"],                      # 3
+            self.projected_gravity,                                              # 3
+            self.commands * self.commands_scale,                                 # 3
+            (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"], # 12
+            self.dof_vel * self.obs_scales["dof_vel"],                           # 12
+            self.last_actions,                                                   # 12
+            self.foot_contacts,                                                  # 4
+            self.cpg_r, self.cpg_rdot,                                           # 8
+            torch.cos(self.cpg_theta), torch.sin(self.cpg_theta),               # 8
+            torch.cos(self.cpg_phi),   torch.sin(self.cpg_phi),                 # 8
+            lidar_norm,                                                          # 36
+        ], dim=-1)
+
+    # ------------------------------------------------------------------
+    # Step
     # ------------------------------------------------------------------
 
     def step(self, actions):
-        self.actions = torch.clip(
-            actions,
-            -self.env_cfg["clip_actions"],
-             self.env_cfg["clip_actions"],
-        )
-
-        exec_actions   = self.last_actions if self.simulate_action_latency else self.actions
-        target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
-        self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
+        self.actions = actions
+        mu, omega_hz, psi = self._map_action(self.actions)
+        self._integrate_cpg(mu, omega_hz, psi)
+        self._cpg_to_joint_targets()
+        self.robot.control_dofs_position(self.target_dof_pos, self.motor_dofs)
         self.scene.step()
 
-        # ── Update state ──────────────────────────────────────────────────
         self.episode_length_buf += 1
+        self._lidar_step         += 1
+        self._cam_step           += 1
+
+        # Front camera render — head-mounted PiP via OpenCV
+        if (self.front_cam is not None
+                and self._cam_step % self.cam_interval == 0):
+            try:
+                import math as _math, cv2
+                pos  = self.robot.get_pos()[0].cpu().numpy()
+                quat = self.robot.get_quat()[0].cpu().numpy()
+                yaw  = float(quat_to_xyz(
+                    torch.tensor(quat).unsqueeze(0)
+                )[0, 2].item())
+
+                cam_x  = pos[0] + 0.25 * _math.cos(yaw)
+                cam_y  = pos[1] + 0.25 * _math.sin(yaw)
+                cam_z  = pos[2] + 0.15
+                look_x = pos[0] + 2.0 * _math.cos(yaw)
+                look_y = pos[1] + 2.0 * _math.sin(yaw)
+                look_z = pos[2] + 0.05
+
+                self.front_cam.set_pose(
+                    pos=(cam_x, cam_y, cam_z),
+                    lookat=(look_x, look_y, look_z),
+                )
+                rgb, _, _, _ = self.front_cam.render(rgb=True)
+                frame = np.array(rgb, dtype=np.uint8)
+                bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+                # Resize + label
+                pip = cv2.resize(bgr, (320, 180))
+                pip = cv2.copyMakeBorder(
+                    pip, 2, 2, 2, 2,
+                    cv2.BORDER_CONSTANT, value=(0, 220, 0)
+                )
+                cv2.putText(pip, "Front Cam", (6, 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (0, 255, 0), 1, cv2.LINE_AA)
+
+                if not self._pip_ready:
+                    cv2.namedWindow("pip", cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow("pip", 324, 184)
+                    cv2.moveWindow("pip", 950, 10)
+                    self._pip_ready = True
+
+                cv2.imshow("pip", pip)
+                # pollKey() is truly non-blocking — does NOT consume
+                # mouse events, safe for macOS main thread use
+                cv2.pollKey()
+
+                if not hasattr(self, '_cam_ok'):
+                    print("  [cam] PiP active")
+                    self._cam_ok = True
+
+            except Exception as e:
+                if not hasattr(self, '_cam_warn'):
+                    print(f"  ⚠️  Camera: {e}")
+                    self._cam_warn = True
+
+        # State update
         self.base_pos[:]  = self.robot.get_pos()
         self.base_quat[:] = self.robot.get_quat()
-        self.base_euler   = quat_to_xyz(
-            transform_quat_by_quat(
-                torch.ones_like(self.base_quat) * self.inv_base_init_quat,
-                self.base_quat,
-            )
+        self.base_euler   = quat_to_xyz(transform_quat_by_quat(
+            torch.ones_like(self.base_quat) * self.inv_base_init_quat,
+            self.base_quat))
+        inv_q = inv_quat(self.base_quat)
+        self.base_lin_vel[:]      = transform_by_quat(self.robot.get_vel(), inv_q)
+        self.base_ang_vel[:]      = transform_by_quat(self.robot.get_ang(), inv_q)
+        self.projected_gravity[:] = transform_by_quat(self.global_gravity, inv_q)
+        self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
+        self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
+        self.applied_torque = (
+            self.env_cfg["kp"] * (self.target_dof_pos - self.dof_pos)
+            - self.env_cfg["kd"] * self.dof_vel
         )
-        inv_base_quat              = inv_quat(self.base_quat)
-        self.base_lin_vel[:]       = transform_by_quat(self.robot.get_vel(), inv_base_quat)
-        self.base_ang_vel[:]       = transform_by_quat(self.robot.get_ang(), inv_base_quat)
-        self.projected_gravity[:]  = transform_by_quat(self.global_gravity, inv_base_quat)
-        self.dof_pos[:]            = self.robot.get_dofs_position(self.motor_dofs)
-        self.dof_vel[:]            = self.robot.get_dofs_velocity(self.motor_dofs)
+        self._update_foot_contacts()
 
-        # ── LiDAR read + sector aggregation ──────────────────────────────
-        # scene.step() already computed all rays — this is just a memory read
-        lidar_data = self.lidar.read()
-        raw_       = lidar_data.distances   # [N, channels, horizontal] or [N, n_rays]
+        # LiDAR — update every LIDAR_INTERVAL steps only
+        if self._lidar_step % LIDAR_INTERVAL == 0:
+            self._update_lidar()
 
-        # One-time debug print to show actual runtime shape
-        if not hasattr(self, '_lidar_shape_printed'):
-            print(f"  [LiDAR runtime] distances.shape = {raw_.shape}")
-            self._lidar_shape_printed = True
-
-        # Flatten to [N, total_rays] regardless of whether Genesis returns
-        # a 2D [N, rays] or 3D [N, channels, horizontal] tensor
-        raw = raw_.reshape(raw_.shape[0], -1)   # [N, total_rays]
-
-        # Aggregate raw rays into N_SECTORS sector minimums.
-        # Handles any ray count gracefully — no assumption about divisibility.
-        batch, n_raw = raw.shape
-        if n_raw >= N_SECTORS:
-            # Enough rays — reshape into N_SECTORS groups and take min
-            rays_ps = n_raw // N_SECTORS
-            n_trim  = rays_ps * N_SECTORS
-            self.lidar_sectors[:] = raw[
-                :, :n_trim
-            ].view(batch, N_SECTORS, rays_ps).min(dim=2).values
-        else:
-            # Fewer rays than sectors — repeat-pad to fill sectors
-            # Each sector gets the same small set of rays
-            padded = raw.repeat(1, math.ceil(N_SECTORS / n_raw))[:, :N_SECTORS]
-            self.lidar_sectors[:] = padded
-
-        # ── Resample commands ─────────────────────────────────────────────
+        # Command resample
         resample_every = int(self.env_cfg["resampling_time_s"] / self.dt)
         envs_idx = (
-            (self.episode_length_buf % resample_every == 0)
-            .nonzero(as_tuple=False).flatten()
-        )
+            self.episode_length_buf % resample_every == 0
+        ).nonzero(as_tuple=False).flatten()
         self._resample_commands(envs_idx)
 
-        # ── Termination ───────────────────────────────────────────────────
+        # Termination
         self.reset_buf  = self.episode_length_buf > self.max_episode_length
         self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+        self.reset_buf |= self.base_pos[:, 2] < self.env_cfg["termination_if_height_less_than"]
+        # Collision termination — only after first LiDAR update (step >= LIDAR_INTERVAL)
+        # Avoids false termination from stale max-range initialisation at spawn
+        if self._lidar_step >= LIDAR_INTERVAL:
+            self.reset_buf |= self.lidar_sectors.min(dim=1).values < LIDAR_COLLISION
+        # Arena boundary
+        self.reset_buf |= self.base_pos[:, 0].abs() > self.arena_term_dist
+        self.reset_buf |= self.base_pos[:, 1].abs() > self.arena_term_dist
 
         time_out_idx = (
-            (self.episode_length_buf > self.max_episode_length)
-            .nonzero(as_tuple=False).flatten()
-        )
+            self.episode_length_buf > self.max_episode_length
+        ).nonzero(as_tuple=False).flatten()
         self.extras["time_outs"] = torch.zeros_like(
-            self.reset_buf, device=self.device, dtype=gs.tc_float
-        )
+            self.reset_buf, device=self.device, dtype=gs.tc_float)
         self.extras["time_outs"][time_out_idx] = 1.0
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
 
-        # ── Reward ────────────────────────────────────────────────────────
+        self.curriculum_step_ctr += self.n_envs
+
+        # Curriculum tracking scale — ramps 0→1 during training, fixed 1.0 at eval
+        if self._use_curriculum:
+            tracking_scale = min(
+                self.curriculum_step_ctr / max(self.curriculum_steps, 1), 1.0
+            )
+        else:
+            tracking_scale = 1.0
+
+        # Reward
         self.rew_buf[:] = 0.0
         for name, fn in self.reward_functions.items():
             rew = fn() * self.reward_scales[name]
+            # Scale tracking rewards during curriculum phase 1
+            if name.startswith("tracking_"):
+                rew = rew * tracking_scale
             self.rew_buf += rew
             self.episode_sums[name] += rew
+        self.rew_buf = torch.clamp(self.rew_buf, -10.0, 10.0)
 
-        # ── Observation ───────────────────────────────────────────────────
-        # Proprioception (45) + sector minimums normalised to [0,1] (36)
-        lidar_norm = torch.clamp(
-            self.lidar_sectors / LIDAR_MAX_RANGE, 0.0, 1.0
-        )
-        self.obs_buf = torch.cat(
-            [
-                self.base_ang_vel * self.obs_scales["ang_vel"],                  # 3
-                self.projected_gravity,                                            # 3
-                self.commands * self.commands_scale,                               # 3
-                (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
-                self.dof_vel * self.obs_scales["dof_vel"],                         # 12
-                self.actions,                                                      # 12
-                lidar_norm,                                                        # 36 sectors
-            ],
-            dim=-1,
-        )
-
+        self._compute_observation()
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]
-
         return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
 
     def reset(self):
         self.reset_buf[:] = True
         self.reset_idx(torch.arange(self.n_envs, device=self.device))
+        self.base_pos[:]  = self.robot.get_pos()
+        self.base_quat[:] = self.robot.get_quat()
+        inv_q = inv_quat(self.base_quat)
+        self.base_lin_vel[:]      = transform_by_quat(self.robot.get_vel(), inv_q)
+        self.base_ang_vel[:]      = transform_by_quat(self.robot.get_ang(), inv_q)
+        self.projected_gravity[:] = transform_by_quat(self.global_gravity, inv_q)
+        self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
+        self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
+        self._update_lidar()
+        self._update_foot_contacts()
+        self._compute_observation()
+        assert self.obs_buf.shape[-1] == OBS_DIM, \
+            f"obs dim {self.obs_buf.shape[-1]} != OBS_DIM {OBS_DIM}"
         return self.obs_buf, None
 
     # ------------------------------------------------------------------
@@ -636,48 +837,42 @@ class Go2LidarNavEnv:
         if len(envs_idx) == 0:
             return
 
-        # Reset joints
+        # Joints
         self.dof_pos[envs_idx] = self.default_dof_pos
         self.dof_vel[envs_idx] = 0.0
         self.robot.set_dofs_position(
-            position      = self.dof_pos[envs_idx],
-            dofs_idx_local= self.motor_dofs,
-            zero_velocity = True,
-            envs_idx      = envs_idx,
+            position       = self.dof_pos[envs_idx],
+            dofs_idx_local = self.motor_dofs,
+            zero_velocity  = True,
+            envs_idx       = envs_idx,
         )
 
-        # Sample spawn positions from safe position table
-        if self.use_house and len(envs_idx) > 0:
-            valid_pos = self._sample_spawn_positions(len(envs_idx))
-            self.base_pos[envs_idx] = valid_pos
-        else:
-            self.base_pos[envs_idx] = self.base_init_pos
-
+        # Base pose — fixed identity quat at spawn
+        # Random yaw causes CPG instability when training from scratch.
+        # Re-enable after policy is stable (>50M steps).
+        n = len(envs_idx)
+        self.base_pos[envs_idx]  = self.base_init_pos
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
 
-        # Randomise yaw so robot doesn't always face same direction
-        if self.use_house:
-            yaws = gs_rand_float(
-                -math.pi, math.pi, (len(envs_idx),), self.device
-            )
-            # Build quaternions [x, y, z, w] for each yaw
-            half = yaws * 0.5
-            quat_yaw = torch.zeros(
-                (len(envs_idx), 4), device=self.device, dtype=gs.tc_float
-            )
-            quat_yaw[:, 2] = torch.sin(half)   # z
-            quat_yaw[:, 3] = torch.cos(half)   # w
-            self.base_quat[envs_idx] = quat_yaw
-        self.robot.set_pos(self.base_pos[envs_idx],  zero_velocity=False, envs_idx=envs_idx)
+        self.robot.set_pos( self.base_pos[envs_idx],  zero_velocity=False, envs_idx=envs_idx)
         self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx)
         self.base_lin_vel[envs_idx] = 0
         self.base_ang_vel[envs_idx] = 0
         self.robot.zero_all_dofs_velocity(envs_idx)
 
+        # CPG reset
+        self.cpg_r[envs_idx]     = 1.0
+        self.cpg_rdot[envs_idx]  = 0.0
+        self.cpg_theta[envs_idx] = self.trot_phase
+        self.cpg_phi[envs_idx]   = self.trot_phase * 0.1
+
+        # Reset LiDAR sectors for reset envs
+        self.lidar_sectors[envs_idx] = LIDAR_MAX_RANGE
+
         # Randomise obstacle positions for reset envs
         self._randomise_obstacles(envs_idx)
 
-        # Reset buffers
+        # Buffers
         self.last_actions[envs_idx]       = 0.0
         self.last_dof_vel[envs_idx]       = 0.0
         self.episode_length_buf[envs_idx] = 0
@@ -685,179 +880,183 @@ class Go2LidarNavEnv:
 
         self.extras["episode"] = {}
         for key in self.episode_sums:
-            self.extras["episode"]["rew_" + key] = (
+            self.extras["episode"]["rew_"+key] = (
                 torch.mean(self.episode_sums[key][envs_idx]).item()
-                / self.env_cfg["episode_length_s"]
-            )
+                / self.env_cfg["episode_length_s"])
             self.episode_sums[key][envs_idx] = 0.0
-
         self._resample_commands(envs_idx)
-
-    def _sample_spawn_positions(self, n: int) -> torch.Tensor:
-        """
-        Sample n spawn positions by randomly picking from the
-        fixed SAFE_SPAWN_POSITIONS table.
-        Returns tensor of shape [n, 3].
-        """
-        if not self.use_house or not SAFE_SPAWN_POSITIONS:
-            return self.base_init_pos.unsqueeze(0).expand(n, -1).clone()
-
-        # Random indices into the safe position table
-        idx = torch.randint(len(SAFE_SPAWN_POSITIONS), (n,))
-        positions = torch.tensor(
-            [(x, y, SPAWN_Z) for x, y in SAFE_SPAWN_POSITIONS],
-            device=self.device, dtype=gs.tc_float,
-        )
-        return positions[idx]   # [n, 3]
 
     def _resample_commands(self, envs_idx):
         if len(envs_idx) == 0:
             return
         n = len(envs_idx)
+        # Curriculum: scale vx commands 0→max over curriculum_steps
+        # Phase 1: slow commands → survival is main objective
+        # Phase 2: full range → track velocity while avoiding
+        tracking_scale = min(
+            self.curriculum_step_ctr / max(self.curriculum_steps, 1), 1.0
+        )
+        vx_lo = self.command_cfg["lin_vel_x_range"][0]
+        vx_hi = self.command_cfg["lin_vel_x_range"][1]
+        vx_hi_curr = max(vx_lo, vx_hi * tracking_scale)
         self.commands[envs_idx, 0] = gs_rand_float(
-            *self.command_cfg["lin_vel_x_range"], (n,), self.device
-        )
+            vx_lo, vx_hi_curr, (n,), self.device)
         self.commands[envs_idx, 1] = gs_rand_float(
-            *self.command_cfg["lin_vel_y_range"], (n,), self.device
-        )
+            *self.command_cfg["lin_vel_y_range"], (n,), self.device)
         self.commands[envs_idx, 2] = gs_rand_float(
-            *self.command_cfg["ang_vel_range"],   (n,), self.device
-        )
-
-    def set_curriculum_phase(self, phase: int):
-        """
-        Set the curriculum phase from the trainer.
-
-        Two phases:
-          Phase 1: walk only — no avoidance reward (short warm-up)
-          Phase 2: full avoidance reward enabled
-
-        Flat mode: cylinders parked in Phase 1, randomised in Phase 2.
-        House mode: walls always present, only avoidance reward changes.
-        """
-        if phase == self.curriculum_phase:
-            return
-        self.curriculum_phase = phase
-        if self.use_house:
-            self.obstacles_active = False       # no movable cylinders in house
-            self.avoidance_active = phase >= 2
-        else:
-            self.obstacles_active = phase >= 2
-            self.avoidance_active = phase >= 2
-        print(f"\n  [Curriculum] → Phase {phase}  "
-              f"mode={'house' if self.use_house else 'flat'}  "
-              f"avoidance={'ON' if self.avoidance_active else 'OFF'}\n")
+            *self.command_cfg["ang_vel_range"],   (n,), self.device)
 
     def _randomise_obstacles(self, envs_idx):
         """
-        Place obstacles at random positions around each reset env's spawn.
-        In Phase 1: park all obstacles far off-scene (no obstacles).
-        In Phase 2+: randomise within the ring around spawn.
+        Place obstacles at random positions in the ring around spawn.
+        Chairs: all 4 legs placed together around one random centre.
+        Other types: single entity per random position.
         """
         if len(envs_idx) == 0:
             return
+        n = len(envs_idx)
+        spawn = self.base_init_pos
 
-        if not self.obstacles_active:
-            # Phase 1 — park obstacles far away, out of simulation range
-            for obs_entity in self.obstacles:
-                far = torch.full(
-                    (len(envs_idx), 3), 999.0, device=self.device
-                )
-                far[:, 2] = OBSTACLE_HEIGHT / 2
-                obs_entity.set_pos(far, envs_idx=envs_idx)
-            return
+        for obs_type, entity, height, meta in self.obstacles:
+            angles = gs_rand_float(0.0, 2*math.pi, (n,), self.device)
+            radii  = gs_rand_float(
+                OBSTACLE_RING_MIN, OBSTACLE_RING_MAX, (n,), self.device)
+            cx = spawn[0] + radii * torch.cos(angles)
+            cy = spawn[1] + radii * torch.sin(angles)
 
-        # Phase 2 and 3 — random ring placement
-        for obs_entity in self.obstacles:
-            angles = torch.rand(len(envs_idx), device=self.device) * 2 * math.pi
-            radii  = (
-                OBSTACLE_RING_MIN
-                + torch.rand(len(envs_idx), device=self.device)
-                * (OBSTACLE_RING_MAX - OBSTACLE_RING_MIN)
-            )
-            # Place relative to spawn position
-            spawn = self.base_init_pos
-            x = spawn[0] + radii * torch.cos(angles)
-            y = spawn[1] + radii * torch.sin(angles)
-            z = torch.full((len(envs_idx),), OBSTACLE_HEIGHT / 2, device=self.device)
-            pos = torch.stack([x, y, z], dim=-1)
-            obs_entity.set_pos(pos, envs_idx=envs_idx)
+            if obs_type == "chair":
+                # entity is a list of 4 leg entities
+                # meta is list of (dx, dy) offsets
+                # Add random yaw rotation to the chair
+                chair_yaw = gs_rand_float(0.0, 2*math.pi, (n,), self.device)
+                for leg_e, (dx, dy) in zip(entity, meta):
+                    # Rotate leg offset by chair yaw
+                    lx = cx + dx * torch.cos(chair_yaw) - dy * torch.sin(chair_yaw)
+                    ly = cy + dx * torch.sin(chair_yaw) + dy * torch.cos(chair_yaw)
+                    lz = torch.full((n,), height/2, device=self.device)
+                    leg_e.set_pos(
+                        torch.stack([lx, ly, lz], dim=-1),
+                        envs_idx=envs_idx
+                    )
+            else:
+                z   = torch.full((n,), height/2, device=self.device)
+                pos = torch.stack([cx, cy, z], dim=-1)
+                entity.set_pos(pos, envs_idx=envs_idx)
 
     # ------------------------------------------------------------------
     # Reward functions
     # ------------------------------------------------------------------
 
-    def _reward_tracking_lin_vel(self):
-        error = torch.sum(
-            torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1
-        )
-        return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+    def _reward_tracking_lin_vel_x(self):
+        return torch.exp(
+            -torch.square(self.commands[:,0] - self.base_lin_vel[:,0])
+            / self.reward_cfg["tracking_sigma"])
+
+    def _reward_tracking_lin_vel_y(self):
+        return torch.exp(
+            -torch.square(self.commands[:,1] - self.base_lin_vel[:,1])
+            / self.reward_cfg["tracking_sigma"])
 
     def _reward_tracking_ang_vel(self):
-        error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
-        return torch.exp(-error / self.reward_cfg["tracking_sigma"])
+        return torch.exp(
+            -torch.square(self.commands[:,2] - self.base_ang_vel[:,2])
+            / self.reward_cfg["tracking_sigma"])
 
     def _reward_lin_vel_z(self):
         return torch.square(self.base_lin_vel[:, 2])
 
-    def _reward_base_height(self):
-        return torch.square(
-            self.base_pos[:, 2] - self.reward_cfg["base_height_target"]
-        )
+    def _reward_ang_vel_xy(self):
+        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
 
-    def _reward_action_rate(self):
-        return torch.sum(
-            torch.square(self.last_actions - self.actions), dim=1
-        )
-
-    def _reward_similar_to_default(self):
-        return torch.sum(
-            torch.abs(self.dof_pos - self.default_dof_pos), dim=1
-        )
+    def _reward_work(self):
+        dqd = self.dof_vel - self.last_dof_vel
+        return torch.abs(torch.sum(self.applied_torque * dqd, dim=1))
 
     def _reward_obstacle_avoidance(self):
         """
-        Penalty based on minimum LiDAR distance.
-        Only active in Phase 2+. Returns zero in Phase 1.
+        4-zone penalty based on minimum LiDAR distance.
+
+        ANTICIPATE (< 2.5m): very light penalty — encourages early steering
+        CAUTION    (< 1.5m): linear penalty — start turning now
+        DANGER     (< 0.6m): strong quadratic — urgent avoidance
+        COLLISION  (< 0.25m): maximum penalty — robot is touching obstacle
+
+        The wide anticipation zone is the key improvement: the policy gets
+        a gradient signal far enough ahead to actually change direction.
         """
-        if not self.avoidance_active:
-            return torch.zeros(self.n_envs, device=self.device, dtype=gs.tc_float)
+        min_d = self.lidar_sectors.min(dim=1).values
+        min_d = torch.clamp(min_d, 0.0, LIDAR_MAX_RANGE)
 
-        min_dist = self.lidar_sectors.min(dim=1).values
-        min_dist = torch.clamp(min_dist, 0.0, LIDAR_MAX_RANGE)
-
-        danger_pen = torch.where(
-            min_dist < LIDAR_DANGER_ZONE,
-            torch.square(min_dist - LIDAR_DANGER_ZONE),
-            torch.zeros_like(min_dist),
+        # Zone 1: anticipate
+        anticipate_pen = torch.where(
+            (min_d >= LIDAR_CAUTION) & (min_d < LIDAR_ANTICIPATE),
+            (LIDAR_ANTICIPATE - min_d) * 0.05,
+            torch.zeros_like(min_d),
         )
+        # Zone 2: caution
         caution_pen = torch.where(
-            (min_dist >= LIDAR_DANGER_ZONE) & (min_dist < LIDAR_CAUTION_ZONE),
-            (LIDAR_CAUTION_ZONE - min_dist) * 0.2,
-            torch.zeros_like(min_dist),
+            (min_d >= LIDAR_DANGER) & (min_d < LIDAR_CAUTION),
+            (LIDAR_CAUTION - min_d) * 0.5,
+            torch.zeros_like(min_d),
         )
-        return danger_pen + caution_pen
+        # Zone 3: danger
+        danger_pen = torch.where(
+            (min_d >= LIDAR_COLLISION) & (min_d < LIDAR_DANGER),
+            torch.square(LIDAR_DANGER - min_d) * 2.0,
+            torch.zeros_like(min_d),
+        )
+        # Zone 4: collision — maximum flat penalty
+        collision_pen = torch.where(
+            min_d < LIDAR_COLLISION,
+            torch.full_like(min_d, 1.0),
+            torch.zeros_like(min_d),
+        )
+        return anticipate_pen + caution_pen + danger_pen + collision_pen
+
+    def _reward_survival(self):
+        """+1 every step the robot is alive — incentivises avoiding resets."""
+        return torch.ones(self.n_envs, device=self.device, dtype=gs.tc_float)
+
+    def _reward_forward_progress(self):
+        """
+        Reward actual forward velocity — directly breaks the standing still optimum.
+        Uses a sqrt to avoid overwhelming the tracking reward at high speeds.
+        Only rewards positive forward velocity (not backward drift).
+        """
+        vx = torch.clamp(self.base_lin_vel[:, 0], 0.0, None)
+        return torch.sqrt(vx + 1e-6) - math.sqrt(1e-6)   # 0 at vx=0, grows with speed
+
+    def _reward_stall_penalty(self):
+        """
+        Penalise near-zero velocity when an obstacle is close.
+        This specifically targets the standing-still-near-obstacle behaviour:
+        if min_lidar < LIDAR_CAUTION and speed < threshold → penalty.
+        Forces the policy to keep moving (turn away) rather than freeze.
+        """
+        min_d     = self.lidar_sectors.min(dim=1).values
+        near_obs  = (min_d < LIDAR_CAUTION).float()
+        speed     = torch.norm(self.base_lin_vel[:, :2], dim=1)
+        stalled   = (speed < 0.15).float()   # below 15cm/s = stalled
+        return near_obs * stalled
 
 
 # ==========================================================================
-#  ActorCritic (identical to main.py — cross-compatible checkpoints)
+#  ActorCritic
 # ==========================================================================
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 512):
+    def __init__(self, obs_dim, act_dim, hidden=512):
         super().__init__()
         self.trunk = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.ELU(),
             nn.Linear(hidden,  hidden), nn.ELU(),
         )
-        self.actor_head = nn.Sequential(
+        self.actor_head  = nn.Sequential(
             nn.Linear(hidden, hidden), nn.ELU(),
-            nn.Linear(hidden, act_dim),
-        )
+            nn.Linear(hidden, act_dim))
         self.critic_head = nn.Sequential(
             nn.Linear(hidden, hidden), nn.ELU(),
-            nn.Linear(hidden, 1),
-        )
+            nn.Linear(hidden, 1))
         self.log_std = nn.Parameter(torch.zeros(act_dim))
 
         for m in self.modules():
@@ -897,31 +1096,26 @@ class ActorCritic(nn.Module):
 
 
 # ==========================================================================
-#  RolloutBuffer (identical to main.py)
+#  RolloutBuffer
 # ==========================================================================
 
 class RolloutBuffer:
     def __init__(self, rollout_steps, n_envs, obs_dim, act_dim, device):
         self.T, self.N, self.device, self.ptr = rollout_steps, n_envs, device, 0
-
-        def buf(*shape):
-            return torch.zeros(*shape, device=device)
-
-        self.obs        = buf(rollout_steps, n_envs, obs_dim)
-        self.actions    = buf(rollout_steps, n_envs, act_dim)
-        self.log_probs  = buf(rollout_steps, n_envs)
-        self.values     = buf(rollout_steps, n_envs)
-        self.rewards    = buf(rollout_steps, n_envs)
-        self.dones      = buf(rollout_steps, n_envs)
-        self.advantages = buf(rollout_steps, n_envs)
-        self.returns    = buf(rollout_steps, n_envs)
+        b = lambda *s: torch.zeros(*s, device=device)
+        self.obs        = b(rollout_steps, n_envs, obs_dim)
+        self.actions    = b(rollout_steps, n_envs, act_dim)
+        self.log_probs  = b(rollout_steps, n_envs)
+        self.values     = b(rollout_steps, n_envs)
+        self.rewards    = b(rollout_steps, n_envs)
+        self.dones      = b(rollout_steps, n_envs)
+        self.advantages = b(rollout_steps, n_envs)
+        self.returns    = b(rollout_steps, n_envs)
 
     def store_step(self, obs, actions, log_probs, values):
         t = self.ptr
-        self.obs[t]       = obs.detach()
-        self.actions[t]   = actions.detach()
-        self.log_probs[t] = log_probs.detach()
-        self.values[t]    = values.detach()
+        self.obs[t], self.actions[t]   = obs.detach(), actions.detach()
+        self.log_probs[t], self.values[t] = log_probs.detach(), values.detach()
 
     def store_outcome(self, rewards, dones):
         t = self.ptr
@@ -932,24 +1126,19 @@ class RolloutBuffer:
     def compute_gae(self, last_value, gamma=0.99, lam=0.95):
         gae = torch.zeros(self.N, device=self.device)
         for t in reversed(range(self.T)):
-            next_val = last_value if t == self.T - 1 else self.values[t + 1]
-            mask     = 1.0 - self.dones[t]
-            delta    = self.rewards[t] + gamma * next_val * mask - self.values[t]
-            gae      = delta + gamma * lam * mask * gae
+            nv    = last_value if t == self.T-1 else self.values[t+1]
+            mask  = 1.0 - self.dones[t]
+            delta = self.rewards[t] + gamma*nv*mask - self.values[t]
+            gae   = delta + gamma*lam*mask*gae
             self.advantages[t] = gae
         self.returns = self.advantages + self.values
         self.ptr = 0
 
     def get_flat(self):
         T, N = self.T, self.N
-        return (
-            self.obs.view(T*N, -1),
-            self.actions.view(T*N, -1),
-            self.log_probs.view(T*N),
-            self.advantages.view(T*N),
-            self.returns.view(T*N),
-            self.values.view(T*N),
-        )
+        return (self.obs.view(T*N,-1), self.actions.view(T*N,-1),
+                self.log_probs.view(T*N), self.advantages.view(T*N),
+                self.returns.view(T*N),   self.values.view(T*N))
 
 
 # ==========================================================================
@@ -962,145 +1151,118 @@ class PPOTrainer:
         self.cfg    = cfg
         self.device = cfg["device"]
 
-        self.env = Go2LidarNavEnv(
+        self.env = Go2CPGNavEnv(
             n_envs            = cfg["n_envs"],
             dt                = cfg["dt"],
             max_episode_steps = cfg["max_episode_steps"],
             headless          = cfg["headless"],
             device            = cfg["device"],
-            scene_json        = cfg.get("scene_json"),
-            asset_root        = cfg.get("asset_root"),
-            use_heightfield   = cfg.get("use_heightfield", True),
         )
 
-        obs_dim = self.env.OBS_DIM
-        self.net = ActorCritic(
-            obs_dim = obs_dim,
-            act_dim = Go2LidarNavEnv.ACT_DIM,
-            hidden  = cfg["hidden_size"],
-        ).to(self.device)
-        print(f"  Network params : {self.net.num_parameters:,}")
-        print(f"  Obs dim        : {obs_dim}  (45 proprioception + {N_SECTORS} LiDAR sectors)")
+        self.net = ActorCritic(OBS_DIM, ACT_DIM, cfg["hidden_size"]).to(self.device)
+        print(f"  Network params: {self.net.num_parameters:,}\n")
 
-        # Load pretrained walking policy if provided
-        # The pretrained network has obs_dim=45, ours is 81.
-        # We load only the trunk and actor/critic heads — the extra 36 LiDAR
-        # input weights are initialised to near-zero so the policy ignores
-        # LiDAR initially and gradually learns to use it.
+        # Optional: warm-start from pretrained CPG locomotion checkpoint
         if cfg.get("pretrained"):
             self._load_pretrained(cfg["pretrained"])
+            # Freeze trunk for first N steps so LiDAR weights can warm up
+            # without corrupting the pretrained walking behaviour
+            freeze_steps = cfg.get("freeze_trunk_steps", 5_000_000)
+            if freeze_steps > 0:
+                for param in self.net.trunk.parameters():
+                    param.requires_grad = False
+                print(f"  Trunk frozen for first {freeze_steps:,} steps\n")
 
         self.opt = torch.optim.Adam(
-            self.net.parameters(), lr=cfg["lr"], eps=1e-5
-        )
+            self.net.parameters(), lr=cfg["lr"], eps=1e-5)
         self.buf = RolloutBuffer(
-            rollout_steps = cfg["rollout_steps"],
-            n_envs        = cfg["n_envs"],
-            obs_dim       = obs_dim,
-            act_dim       = Go2LidarNavEnv.ACT_DIM,
-            device        = self.device,
-        )
+            cfg["rollout_steps"], cfg["n_envs"],
+            OBS_DIM, ACT_DIM, self.device)
 
         os.makedirs(cfg["run_dir"], exist_ok=True)
         self.writer      = SummaryWriter(cfg["run_dir"])
         self.global_step = 0
         self.start_time  = time.time()
-        self.ep_returns  = []
-        self.ep_lengths  = []
-        self._env_ret    = torch.zeros(cfg["n_envs"], device=self.device)
-        self._env_len    = torch.zeros(cfg["n_envs"], device=self.device, dtype=torch.int32)
+        self.ep_returns, self.ep_lengths = [], []
+        self._env_ret = torch.zeros(cfg["n_envs"], device=self.device)
+        self._env_len = torch.zeros(cfg["n_envs"], device=self.device,
+                                    dtype=torch.int32)
 
     def _load_pretrained(self, path: str):
         """
-        Load trunk + heads from a pretrained flat-terrain walking checkpoint.
-        The pretrained network has obs_dim=45; ours is 81 (45+36 LiDAR).
-        Strategy: copy matching weights, leave the 36 LiDAR input weights
-        near zero so the policy initially ignores sensor data and relies
-        on the walking behaviour it already learned.
+        Warm-start from go2_cpg_rl.py checkpoint (OBS_DIM=76).
+        Copy matching weights; leave the 36 new LiDAR input weights near zero.
         """
-        print(f"\n  Loading pretrained weights: {path}")
-        ckpt        = torch.load(path, weights_only=False, map_location=self.device)
-        src_state   = ckpt["model_state"]
-        dst_state   = self.net.state_dict()
-
-        n_loaded = 0
-        for key, dst_param in dst_state.items():
-            if key not in src_state:
+        print(f"\n  Loading pretrained CPG weights: {path}")
+        ckpt      = torch.load(path, weights_only=False, map_location=self.device)
+        src       = clean_state_dict(ckpt["model_state"])
+        dst       = self.net.state_dict()
+        n_loaded  = 0
+        for key, dp in dst.items():
+            if key not in src:
                 continue
-            src_param = src_state[key]
-            if src_param.shape == dst_param.shape:
-                # Exact match — copy directly (trunk layers 1+, heads)
-                dst_state[key] = src_param.clone()
+            sp = src[key]
+            if sp.shape == dp.shape:
+                dst[key] = sp.clone()
                 n_loaded += 1
             elif key == "trunk.0.weight":
-                # First trunk layer: [hidden, obs_dim_new] vs [hidden, obs_dim_old]
-                # Copy the proprioception columns, leave LiDAR columns at ~0
-                dst_param[:, :src_param.shape[1]] = src_param.clone()
-                dst_state[key] = dst_param
+                # [hidden, 112] ← [hidden, 76]: copy prop cols, LiDAR cols stay ~0
+                dp[:, :sp.shape[1]] = sp.clone()
+                dst[key] = dp
                 n_loaded += 1
-
-        self.net.load_state_dict(dst_state)
-        print(f"  Loaded {n_loaded}/{len(dst_state)} parameter tensors from pretrained\n")
-
-    def _update_curriculum(self, global_step: int):
-        """Update curriculum phase based on global step count."""
-        if global_step < CURRICULUM_PHASE1_STEPS:
-            self.env.set_curriculum_phase(1)
-        else:
-            self.env.set_curriculum_phase(2)
+        self.net.load_state_dict(dst)
+        print(f"  Loaded {n_loaded}/{len(dst)} tensors from pretrained.\n")
 
     def train(self):
         cfg = self.cfg
         obs, _ = self.env.reset()
 
-        print(f"\n{'='*55}")
-        print(f"  Go2 LiDAR Navigation PPO Training")
-        print(f"{'='*55}")
-        print(f"  Envs          : {cfg['n_envs']}")
-        print(f"  Obstacles/env : {N_OBSTACLES}")
-        print(f"  Total steps   : {cfg['total_steps']:,}")
-        print(f"  Device        : {self.device}")
-        print(f"  Run dir       : {cfg['run_dir']}")
-        print(f"  Curriculum:")
-        print(f"    Phase 1 (walk only) :    0 → {CURRICULUM_PHASE1_STEPS:,}")
-        print(f"    Phase 2 (avoidance) : {CURRICULUM_PHASE1_STEPS:,} → end")
-        print(f"{'='*55}\n")
+        print(f"{'='*60}")
+        print(f"  Visual CPG-RL Nav | {cfg['total_steps']:,} steps | {self.device}")
+        print(f"{'='*60}\n")
 
         steps_per_rollout = cfg["rollout_steps"] * cfg["n_envs"]
         n_updates         = cfg["total_steps"] // steps_per_rollout
 
-        for update in range(1, n_updates + 1):
-            # Update curriculum phase before collecting rollout
-            self._update_curriculum(self.global_step)
+        for update in range(1, n_updates+1):
+            # Unfreeze trunk once enough steps have passed
+            freeze_steps = cfg.get("freeze_trunk_steps", 0)
+            if (freeze_steps > 0
+                    and self.global_step >= freeze_steps
+                    and not self.net.trunk[0].weight.requires_grad):
+                for param in self.net.trunk.parameters():
+                    param.requires_grad = True
+                print(f"\n  Trunk unfrozen at step {self.global_step:,}\n")
+            frac = max(1.0 - self.global_step / max(cfg["total_steps"],1),
+                       cfg["lr_floor_frac"])
+            lr = cfg["lr"] * frac
+            for g in self.opt.param_groups:
+                g["lr"] = lr
 
             obs     = self._collect_rollout(obs)
-            metrics = self._ppo_update()
+            m       = self._ppo_update()
             self.global_step += steps_per_rollout
 
             if update % cfg["log_interval"] == 0:
-                elapsed   = time.time() - self.start_time
-                sps       = self.global_step / elapsed
-                mean_ret  = float(np.mean(self.ep_returns[-20:])) if self.ep_returns else 0.0
-                mean_len  = float(np.mean(self.ep_lengths[-20:])) if self.ep_lengths else 0.0
-
-                print(
-                    f"  step {self.global_step:>10,} | "
-                    f"ph {self.env.curriculum_phase} | "
-                    f"ret {mean_ret:>7.3f} | "
-                    f"len {mean_len:>5.0f} | "
-                    f"ploss {metrics['policy_loss']:>7.4f} | "
-                    f"vloss {metrics['value_loss']:>7.4f} | "
-                    f"clip {metrics['clip_frac']:>4.2f} | "
-                    f"{sps:>7,.0f} sps"
-                )
-                self.writer.add_scalar("train/mean_return",   mean_ret,               self.global_step)
-                self.writer.add_scalar("train/mean_ep_len",   mean_len,               self.global_step)
-                self.writer.add_scalar("loss/policy",         metrics["policy_loss"], self.global_step)
-                self.writer.add_scalar("loss/value",          metrics["value_loss"],  self.global_step)
-                self.writer.add_scalar("loss/entropy",        metrics["entropy"],     self.global_step)
-                self.writer.add_scalar("train/clip_fraction", metrics["clip_frac"],   self.global_step)
-                self.writer.add_scalar("train/sps",           sps,                    self.global_step)
-                self.writer.add_scalar("curriculum/phase",    self.env.curriculum_phase, self.global_step)
+                sps  = self.global_step / (time.time() - self.start_time)
+                mret = float(np.mean(self.ep_returns[-50:])) if self.ep_returns else 0.0
+                mlen = float(np.mean(self.ep_lengths[-50:])) if self.ep_lengths else 0.0
+                print(f"  step {self.global_step:>11,} | "
+                      f"ret {mret:>7.3f} | len {mlen:>5.0f} | "
+                      f"ploss {m['policy_loss']:>7.4f} | "
+                      f"vloss {m['value_loss']:>8.3f} | "
+                      f"kl {m['approx_kl']:>6.4f} | "
+                      f"clip {m['clip_frac']:>4.2f} | "
+                      f"lr {lr:.1e} | {sps:>7,.0f} sps")
+                scalars = {
+                    "train/mean_return": mret, "train/mean_ep_len": mlen,
+                    "loss/policy": m["policy_loss"], "loss/value": m["value_loss"],
+                    "loss/entropy": m["entropy"], "train/approx_kl": m["approx_kl"],
+                    "train/clip_fraction": m["clip_frac"], "train/lr": lr,
+                    "train/sps": sps,
+                }
+                for k, v in scalars.items():
+                    self.writer.add_scalar(k, v, self.global_step)
 
             if update % cfg["save_interval"] == 0:
                 self._save_checkpoint()
@@ -1115,10 +1277,8 @@ class PPOTrainer:
             for _ in range(self.cfg["rollout_steps"]):
                 action, log_prob, value = self.net.get_action(obs)
                 self.buf.store_step(obs, action, log_prob, value)
-
-                next_obs, _, reward, reset_buf, extras = self.env.step(action)
+                next_obs, _, reward, reset_buf, _ = self.env.step(action)
                 self.buf.store_outcome(reward, reset_buf.float())
-
                 self._env_ret += reward
                 self._env_len += 1
                 done_idx = reset_buf.nonzero(as_tuple=False).flatten()
@@ -1127,9 +1287,7 @@ class PPOTrainer:
                     self.ep_lengths.append(int(self._env_len[idx]))
                 self._env_ret[done_idx] = 0.0
                 self._env_len[done_idx] = 0
-
                 obs = next_obs
-
             last_value = self.net.get_value(obs)
             self.buf.compute_gae(last_value, self.cfg["gamma"], self.cfg["lam"])
         return obs
@@ -1137,67 +1295,86 @@ class PPOTrainer:
     def _ppo_update(self):
         self.net.train()
         cfg = self.cfg
-
         obs_f, act_f, lp_f, adv_f, ret_f, val_f = self.buf.get_flat()
-        adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
 
-        total   = obs_f.shape[0]
-        metrics = {"policy_loss":[], "value_loss":[], "entropy":[], "clip_frac":[]}
+        if not (torch.isfinite(adv_f).all() and torch.isfinite(ret_f).all()):
+            print("  [warn] non-finite rollout; skipping update.")
+            return {"policy_loss":0., "value_loss":0.,
+                    "entropy":0., "clip_frac":0., "approx_kl":0.}
+
+        backup    = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+        adv_f     = ((adv_f - adv_f.mean()) / (adv_f.std()+1e-8)).clamp(-10., 10.)
+        total     = obs_f.shape[0]
+        target_kl = cfg.get("target_kl", 0.02)
+        vloss_cap = cfg.get("vloss_skip", 1e3)
+        m         = {"policy_loss":[], "value_loss":[], "entropy":[],
+                     "clip_frac":[], "approx_kl":[]}
+        bad = False
 
         for _ in range(cfg["n_epochs"]):
             idx = torch.randperm(total, device=self.device)
+            epoch_kl = []
             for start in range(0, total, cfg["minibatch_size"]):
-                mb         = idx[start : start + cfg["minibatch_size"]]
+                mb = idx[start:start+cfg["minibatch_size"]]
                 new_lp, entropy, value = self.net.evaluate(obs_f[mb], act_f[mb])
-                ratio      = (new_lp - lp_f[mb]).exp()
-                surr1      = ratio * adv_f[mb]
-                surr2      = ratio.clamp(1-cfg["clip_eps"], 1+cfg["clip_eps"]) * adv_f[mb]
-                policy_loss= -torch.min(surr1, surr2).mean()
+                logratio  = new_lp - lp_f[mb]
+                ratio     = logratio.exp()
+                with torch.no_grad():
+                    akl = ((ratio-1.0) - logratio).mean().item()
+                epoch_kl.append(akl); m["approx_kl"].append(akl)
 
-                vclip      = val_f[mb] + (value - val_f[mb]).clamp(-cfg["clip_eps"], cfg["clip_eps"])
-                value_loss = torch.max(
-                    (value - ret_f[mb]).pow(2),
-                    (vclip  - ret_f[mb]).pow(2),
-                ).mean()
+                surr1 = ratio * adv_f[mb]
+                surr2 = ratio.clamp(1-cfg["clip_eps"], 1+cfg["clip_eps"]) * adv_f[mb]
+                pl    = -torch.min(surr1, surr2).mean()
+                vc    = val_f[mb] + (value-val_f[mb]).clamp(-cfg["clip_eps"], cfg["clip_eps"])
+                vl    = torch.max((value-ret_f[mb]).pow(2), (vc-ret_f[mb]).pow(2)).mean()
+                loss  = pl + cfg["vf_coef"]*vl - cfg["ent_coef"]*entropy.mean()
 
-                loss = policy_loss + cfg["vf_coef"] * value_loss - cfg["ent_coef"] * entropy.mean()
-                self.opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.net.parameters(), cfg["max_grad_norm"])
+                if (not torch.isfinite(loss)) or (vl.item() > vloss_cap):
+                    bad = True; break
+                self.opt.zero_grad(); loss.backward()
+                gnorm = nn.utils.clip_grad_norm_(
+                    self.net.parameters(), cfg["max_grad_norm"])
+                if not torch.isfinite(gnorm):
+                    bad = True; break
                 self.opt.step()
+                m["policy_loss"].append(pl.item())
+                m["value_loss"].append(vl.item())
+                m["entropy"].append(entropy.mean().item())
+                m["clip_frac"].append(
+                    ((ratio-1.0).abs() > cfg["clip_eps"]).float().mean().item())
+            if bad: break
+            if np.mean(epoch_kl) > 1.5*target_kl: break
 
-                clip_frac = ((ratio - 1.0).abs() > cfg["clip_eps"]).float().mean()
-                metrics["policy_loss"].append(policy_loss.item())
-                metrics["value_loss"].append(value_loss.item())
-                metrics["entropy"].append(entropy.mean().item())
-                metrics["clip_frac"].append(clip_frac.item())
-
-        return {k: float(np.mean(v)) for k, v in metrics.items()}
+        if bad:
+            self.net.load_state_dict(backup)
+            self.opt.zero_grad(set_to_none=True)
+        return {k: float(np.mean(v)) if v else 0.0 for k, v in m.items()}
 
     def _save_checkpoint(self, tag=None):
-        name = f"checkpoint_step_{self.global_step:09d}" if not tag else f"checkpoint_{tag}"
+        name = f"checkpoint_{tag}" if tag \
+               else f"checkpoint_step_{self.global_step:09d}"
         path = os.path.join(self.cfg["run_dir"], f"{name}.pt")
         torch.save({
             "step":        self.global_step,
-            "model_state": self.net.state_dict(),
+            "model_state": clean_state_dict(self.net.state_dict()),
             "optim_state": self.opt.state_dict(),
             "config":      self.cfg,
-            "obs_dim":          self.env.OBS_DIM,
-            "n_sectors":        N_SECTORS,
-            "curriculum_phase": self.env.curriculum_phase,
+            "obs_dim":     OBS_DIM,
+            "act_dim":     ACT_DIM,
             "metrics": {
-                "mean_return": np.mean(self.ep_returns[-20:]) if self.ep_returns else 0.0,
-                "mean_length": np.mean(self.ep_lengths[-20:]) if self.ep_lengths else 0.0,
+                "mean_return": np.mean(self.ep_returns[-50:]) if self.ep_returns else 0.0,
+                "mean_length": np.mean(self.ep_lengths[-50:]) if self.ep_lengths else 0.0,
             },
         }, path)
-        print(f"  [ckpt] Saved {path}")
+        print(f"  [ckpt] {path}")
 
     @classmethod
     def load_checkpoint(cls, path):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         ckpt   = torch.load(path, weights_only=False, map_location=device)
-        trainer= cls(ckpt["config"])
-        trainer.net.load_state_dict(ckpt["model_state"])
+        trainer = cls(ckpt["config"])
+        trainer.net.load_state_dict(clean_state_dict(ckpt["model_state"]))
         trainer.opt.load_state_dict(ckpt["optim_state"])
         trainer.global_step = ckpt["step"]
         print(f"  Resumed step={trainer.global_step:,}  "
@@ -1209,98 +1386,59 @@ class PPOTrainer:
 #  Evaluation
 # ==========================================================================
 
-def evaluate(checkpoint_path, n_episodes=5):
+def evaluate(checkpoint_path, n_episodes=3,
+             command=(0.5, 0.0, 0.0), headless=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt   = torch.load(checkpoint_path, weights_only=False, map_location=device)
     cfg    = ckpt["config"]
+    sd     = clean_state_dict(ckpt["model_state"])
 
-    # Read actual obs_dim from checkpoint weights — don't rely on env
-    obs_dim = ckpt["model_state"]["trunk.0.weight"].shape[1]
-    act_dim = ckpt["model_state"]["actor_head.2.weight"].shape[0]
-    hidden  = cfg.get("hidden_size", 512)
-    print(f"  Checkpoint: obs_dim={obs_dim} act_dim={act_dim} hidden={hidden}")
+    obs_dim = sd["trunk.0.weight"].shape[1]
+    act_dim = sd["log_std"].shape[0]
+    print(f"  Checkpoint: obs_dim={obs_dim}  act_dim={act_dim}  "
+          f"step={ckpt.get('step',0):,}")
 
-    env = Go2LidarNavEnv(
+    if obs_dim != OBS_DIM:
+        print(f"  [warn] obs mismatch: ckpt={obs_dim} script={OBS_DIM}. Retrain.")
+        return
+
+    env = Go2CPGNavEnv(
         n_envs            = 1,
-        headless          = False,
+        headless          = headless,
         max_episode_steps = cfg["max_episode_steps"],
         dt                = cfg["dt"],
         device            = device,
-        scene_json        = cfg.get("scene_json"),
-        asset_root        = cfg.get("asset_root"),
-        use_heightfield   = cfg.get("use_heightfield", True),
     )
-
-    net = ActorCritic(obs_dim, act_dim, hidden)
-    net.load_state_dict(ckpt["model_state"])
+    net = ActorCritic(obs_dim, act_dim, cfg.get("hidden_size", 512))
+    net.load_state_dict(sd)
     net.eval().to(device)
 
+    cmd = torch.tensor([command], device=device, dtype=gs.tc_float)
     for ep in range(n_episodes):
         obs, _ = env.reset()
-
-        # Pad or trim obs to match checkpoint obs_dim if env returns different size
-        # This handles the case where LiDAR gives different ray counts on CPU vs GPU
-        if obs.shape[-1] != obs_dim:
-            print(f"  ⚠️  obs dim mismatch: env={obs.shape[-1]} checkpoint={obs_dim}")
-            print(f"     Padding/trimming to match checkpoint.")
-            if obs.shape[-1] < obs_dim:
-                pad = torch.zeros(obs.shape[0], obs_dim - obs.shape[-1], device=device)
-                obs = torch.cat([obs, pad], dim=-1)
-            else:
-                obs = obs[:, :obs_dim]
-
-        # One-time full sector breakdown at start of episode 1
-        if ep == 0:
-            sectors = env.lidar_sectors[0].cpu().numpy()
-            print(f"\n  LiDAR sector breakdown (episode 1 start):")
-            print(f"  {'Sector':>6}  {'Angle':>7}  {'Distance':>10}")
-            for i, d in enumerate(sectors):
-                angle = i * (360.0 / N_SECTORS)
-                flag  = " ← CLOSE" if d < 1.0 else " ← caution" if d < 2.0 else ""
-                print(f"  {i:>6}  {angle:>6.0f}°  {d:>8.2f}m{flag}")
-            print(f"  Min: {sectors.min():.2f}m  Mean: {sectors.mean():.2f}m  "
-                  f"Max: {sectors.max():.2f}m")
-            print(f"  All at max range ({LIDAR_MAX_RANGE}m)? "
-                  f"{'YES — sensor may not be detecting walls' if sectors.min() > LIDAR_MAX_RANGE * 0.99 else 'NO — sensor working'}\n")
-
         done   = torch.zeros(1, dtype=torch.bool)
-        ep_ret, ep_len = 0.0, 0
-        lidar_mins = []
-
+        ep_ret, ep_len, vx_err = 0.0, 0, []
         while not done[0]:
+            env.commands[:] = cmd
             with torch.no_grad():
                 act, _, _ = net.get_action(obs, deterministic=True)
             obs, _, reward, reset_buf, _ = env.step(act)
-
-            # Apply same dim correction each step
-            if obs.shape[-1] != obs_dim:
-                if obs.shape[-1] < obs_dim:
-                    pad = torch.zeros(obs.shape[0], obs_dim - obs.shape[-1], device=device)
-                    obs = torch.cat([obs, pad], dim=-1)
-                else:
-                    obs = obs[:, :obs_dim]
-
-            # Track LiDAR diagnostics
-            min_dist  = env.lidar_sectors.min().item()
-            mean_dist = env.lidar_sectors.mean().item()
-            lidar_mins.append(min_dist)
-
             ep_ret += reward[0].item()
             ep_len += 1
             done    = reset_buf.bool()
-
-            # Print LiDAR every 50 steps
+            vx_err.append(abs(command[0] - env.base_lin_vel[0,0].item()))
             if ep_len % 50 == 0:
+                r   = env.cpg_r[0].cpu().numpy()
+                md  = env.lidar_sectors[0].min().item()
                 print(f"    step {ep_len:4d}  "
-                      f"min_lidar={min_dist:.2f}m  "
-                      f"mean_lidar={mean_dist:.2f}m  "
-                      f"reward={reward[0].item():.3f}")
-
-        print(f"  Episode {ep+1} | return={ep_ret:.2f} | length={ep_len}")
-        if lidar_mins:
-            print(f"    LiDAR stats — min={min(lidar_mins):.2f}m  "
-                  f"mean={sum(lidar_mins)/len(lidar_mins):.2f}m  "
-                  f"max={max(lidar_mins):.2f}m")
+                      f"vx={env.base_lin_vel[0,0].item():+.2f}/{command[0]:.2f}  "
+                      f"wz={env.base_ang_vel[0,2].item():+.2f}  "
+                      f"h={env.base_pos[0,2].item():.2f}  "
+                      f"min_lidar={md:.2f}m  "
+                      f"r=[{r[0]:.2f} {r[1]:.2f} {r[2]:.2f} {r[3]:.2f}]")
+        print(f"  Episode {ep+1} | return={ep_ret:7.2f} | "
+              f"length={ep_len:4d} | "
+              f"mean|vx_err|={np.mean(vx_err):.3f}\n")
 
 
 # ==========================================================================
@@ -1308,8 +1446,7 @@ def evaluate(checkpoint_path, n_episodes=5):
 # ==========================================================================
 
 def get_config(args):
-    total_buffer   = args.n_envs * args.rollout_steps
-    minibatch_size = max(total_buffer // 4, 256)
+    total_buffer = args.n_envs * args.rollout_steps
     return dict(
         n_envs             = args.n_envs,
         dt                 = 0.02,
@@ -1318,7 +1455,7 @@ def get_config(args):
         hidden_size        = 512,
         total_steps        = args.total_steps,
         rollout_steps      = args.rollout_steps,
-        minibatch_size     = minibatch_size,
+        minibatch_size     = max(total_buffer // 4, 256),
         n_epochs           = 5,
         gamma              = 0.99,
         lam                = 0.95,
@@ -1331,44 +1468,41 @@ def get_config(args):
         run_dir            = args.run_dir,
         log_interval       = 10,
         save_interval      = 100,
+        target_kl          = 0.02,
+        vloss_skip         = 1e3,
+        lr_floor_frac      = 0.05,
         pretrained         = args.pretrained,
-        scene_json         = args.scene,
-        asset_root         = args.asset_root,
-        use_heightfield    = not args.no_heightfield,   # default False
+        freeze_trunk_steps = 5_000_000 if args.pretrained else 0,
     )
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--n-envs",        type=int,  default=4096)
-    parser.add_argument("--total-steps",   type=int,  default=200_000_000)
-    parser.add_argument("--rollout-steps", type=int,  default=24)
-    parser.add_argument("--device",        type=str,  default="cuda",
-                        choices=["cpu", "cuda", "mps"])
-    parser.add_argument("--run-dir",       type=str,  default="../../runs/go2_lidar")
-    parser.add_argument("--headless",      action="store_true", default=True)
-    parser.add_argument("--resume",        type=str,  default=None)
-    parser.add_argument("--eval",          type=str,  default=None)
-    parser.add_argument("--pretrained",    type=str,  default=None,
-                        help="Path to flat-terrain walking checkpoint for warm-start")
-    parser.add_argument("--scene",         type=str,  default=None,
-                        help="Path to ReplicaCAD scene JSON (e.g. data/replica_cad/configs/scenes/apt_0.scene_instance.json)")
-    parser.add_argument("--asset-root",    type=str,  default="data/replica_cad/",
-                        help="Root directory of ReplicaCAD dataset")
-    parser.add_argument("--no-heightfield", action="store_true", default=True,
-                        help="Disable heightfield (default — walls absent without stage collision)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--n-envs",        type=int,  default=4096)
+    p.add_argument("--total-steps",   type=int,  default=200_000_000)
+    p.add_argument("--rollout-steps", type=int,  default=24)
+    p.add_argument("--device",        type=str,  default="cuda",
+                   choices=["cpu","cuda","mps"])
+    p.add_argument("--run-dir",       type=str,  default="../../runs/go2_cpg_nav")
+    p.add_argument("--headless",      action="store_true", default=False)
+    p.add_argument("--resume",        type=str,  default=None)
+    p.add_argument("--eval",          type=str,  default=None)
+    p.add_argument("--pretrained",    type=str,  default=None,
+                   help="Warm-start from go2_cpg_rl.py checkpoint (OBS_DIM=76)")
+    p.add_argument("--vx",   type=float, default=0.5)
+    p.add_argument("--vy",   type=float, default=0.0)
+    p.add_argument("--vyaw", type=float, default=0.0)
+    args = p.parse_args()
+
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
 
     if args.eval:
-        evaluate(args.eval)
+        evaluate(args.eval, command=(args.vx, args.vy, args.vyaw))
         return
 
-    if args.resume:
-        trainer = PPOTrainer.load_checkpoint(args.resume)
-    else:
-        cfg     = get_config(args)
-        trainer = PPOTrainer(cfg)
-
+    trainer = (PPOTrainer.load_checkpoint(args.resume)
+               if args.resume else PPOTrainer(get_config(args)))
     trainer.train()
 
 

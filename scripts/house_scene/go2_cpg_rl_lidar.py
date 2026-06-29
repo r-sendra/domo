@@ -100,10 +100,10 @@ LIDAR_INTERVAL   = 5          # update every N steps (10 Hz at 50 Hz control)
 LIDAR_POS_OFFSET = (0.0, 0.0, 0.35)   # above chassis — safe from self-hits
 
 # Collision thresholds for reward
-LIDAR_COLLISION  = 0.25       # metres — episode termination
-LIDAR_DANGER     = 0.60       # metres — strong quadratic penalty
-LIDAR_CAUTION    = 1.50       # metres — linear penalty
-LIDAR_ANTICIPATE = 3.00       # metres — early steering signal
+LIDAR_COLLISION  = 0.20       # metres — episode termination
+LIDAR_DANGER     = 0.50       # metres — strong quadratic penalty
+LIDAR_CAUTION    = 1.20       # metres — linear penalty
+LIDAR_ANTICIPATE = 2.50       # metres — early steering signal
 
 # ==========================================================================
 #  Constants — obstacles
@@ -119,7 +119,7 @@ N_OBSTACLES    = N_OBS_CHAIRS*4 + N_OBS_SOFAS + N_OBS_PILLARS + N_OBS_STEPS + N_
 ARENA_HALF        = 4.0
 ARENA_WALL_HEIGHT = 0.6
 ARENA_WALL_THICK  = 0.15
-OBSTACLE_RING_MIN = 1.2
+OBSTACLE_RING_MIN = 2.0    # safe spawn clearance — chair legs won't be at collision dist
 OBSTACLE_RING_MAX = 3.5
 
 # Chair: 4 thin legs in a square
@@ -234,6 +234,11 @@ class Go2CPGNavEnv:
                 "survival":           +0.10,
             },
         }
+
+        # Avoidance curriculum — disabled during eval (n_envs=1)
+        self.curriculum_steps    = 20_000_000
+        self.curriculum_step_ctr = 0
+        self._use_curriculum     = (n_envs > 1)   # off during eval
         self.command_cfg = {
             "lin_vel_x_range": [0.3, 1.5],
             "lin_vel_y_range": [-0.3, 0.3],
@@ -761,8 +766,10 @@ class Go2CPGNavEnv:
         self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
         self.reset_buf |= self.base_pos[:, 2] < self.env_cfg["termination_if_height_less_than"]
-        # Collision termination — too close to any obstacle
-        self.reset_buf |= self.lidar_sectors.min(dim=1).values < LIDAR_COLLISION
+        # Collision termination — only after first LiDAR update (step >= LIDAR_INTERVAL)
+        # Avoids false termination from stale max-range initialisation at spawn
+        if self._lidar_step >= LIDAR_INTERVAL:
+            self.reset_buf |= self.lidar_sectors.min(dim=1).values < LIDAR_COLLISION
         # Arena boundary
         self.reset_buf |= self.base_pos[:, 0].abs() > self.arena_term_dist
         self.reset_buf |= self.base_pos[:, 1].abs() > self.arena_term_dist
@@ -776,10 +783,23 @@ class Go2CPGNavEnv:
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
 
+        self.curriculum_step_ctr += self.n_envs
+
+        # Curriculum tracking scale — ramps 0→1 during training, fixed 1.0 at eval
+        if self._use_curriculum:
+            tracking_scale = min(
+                self.curriculum_step_ctr / max(self.curriculum_steps, 1), 1.0
+            )
+        else:
+            tracking_scale = 1.0
+
         # Reward
         self.rew_buf[:] = 0.0
         for name, fn in self.reward_functions.items():
             rew = fn() * self.reward_scales[name]
+            # Scale tracking rewards during curriculum phase 1
+            if name.startswith("tracking_"):
+                rew = rew * tracking_scale
             self.rew_buf += rew
             self.episode_sums[name] += rew
         self.rew_buf = torch.clamp(self.rew_buf, -10.0, 10.0)
@@ -868,8 +888,17 @@ class Go2CPGNavEnv:
         if len(envs_idx) == 0:
             return
         n = len(envs_idx)
+        # Curriculum: scale vx commands 0→max over curriculum_steps
+        # Phase 1: slow commands → survival is main objective
+        # Phase 2: full range → track velocity while avoiding
+        tracking_scale = min(
+            self.curriculum_step_ctr / max(self.curriculum_steps, 1), 1.0
+        )
+        vx_lo = self.command_cfg["lin_vel_x_range"][0]
+        vx_hi = self.command_cfg["lin_vel_x_range"][1]
+        vx_hi_curr = max(vx_lo, vx_hi * tracking_scale)
         self.commands[envs_idx, 0] = gs_rand_float(
-            *self.command_cfg["lin_vel_x_range"], (n,), self.device)
+            vx_lo, vx_hi_curr, (n,), self.device)
         self.commands[envs_idx, 1] = gs_rand_float(
             *self.command_cfg["lin_vel_y_range"], (n,), self.device)
         self.commands[envs_idx, 2] = gs_rand_float(

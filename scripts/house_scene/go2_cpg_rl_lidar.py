@@ -60,8 +60,8 @@ LIDAR_POS_OFFSET = (0.0, 0.0, 0.35)
 # Reward thresholds
 LIDAR_COLLISION  = 0.25
 LIDAR_DANGER     = 0.60
-LIDAR_CAUTION    = 1.50
-LIDAR_ANTICIPATE = 2.50
+LIDAR_CAUTION    = 0.9 
+LIDAR_ANTICIPATE = 1.40
 
 # Avoidance network obs/act dims
 AVOID_OBS_DIM = N_LIDAR_SECTORS   # just LiDAR — nothing else needed
@@ -663,7 +663,7 @@ class Go2AvoidanceEnv:
             survival          * self.dt
             + avoidance_penalty  * self.dt * 5.0
             + smoothness_penalty * self.dt
-            + command_tracking   * self.dt * 2.0   # strong — this is the fix
+            + command_tracking   * self.dt * 3.0   # strong — this is the fix
         )
 
         self.episode_sums["avoidance"]        += avoidance_penalty

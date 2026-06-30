@@ -31,6 +31,7 @@ Evaluation:
 import os
 import time
 import math
+import json
 import argparse
 import numpy as np
 import torch
@@ -72,35 +73,6 @@ DELTA_VX_MAX   = 0.8    # can slow down or reverse up to 0.8 m/s
 DELTA_VY_MAX   = 0.5    # lateral correction
 DELTA_VYAW_MAX = 1.5    # yaw correction — generous so it can turn sharply
 
-# Arena
-N_OBS_CHAIRS   = 6
-N_OBS_SOFAS    = 3
-N_OBS_PILLARS  = 4
-N_OBS_STEPS    = 2
-N_OBS_BALLS    = 2
-N_OBSTACLES    = N_OBS_CHAIRS*4 + N_OBS_SOFAS + N_OBS_PILLARS + N_OBS_STEPS + N_OBS_BALLS
-
-ARENA_HALF        = 4.0
-ARENA_WALL_HEIGHT = 0.6
-ARENA_WALL_THICK  = 0.15
-OBSTACLE_RING_MIN = 2.0
-OBSTACLE_RING_MAX = 3.5
-
-CHAIR_LEG_RADIUS = 0.03
-CHAIR_LEG_HEIGHT = 0.45
-CHAIR_LEG_SPREAD = 0.25
-
-SOFA_WIDTH_RANGE  = (0.8,  1.6)
-SOFA_DEPTH_RANGE  = (0.3,  0.5)
-SOFA_HEIGHT_RANGE = (0.35, 0.50)
-
-PILLAR_RADIUS_RANGE = (0.04, 0.10)
-PILLAR_HEIGHT_RANGE = (0.60, 1.20)
-
-STEP_SIZE_RANGE   = (0.20, 0.50)
-STEP_HEIGHT_RANGE = (0.04, 0.15)
-
-SPHERE_RAD_RANGE  = (0.06, 0.16)
 
 # Base forward command — fixed during avoidance training
 BASE_VX   = 0.6    # m/s forward
@@ -115,6 +87,113 @@ def gs_rand_float(lower, upper, shape, device):
 def clean_sd(sd):
     return {k.replace("_orig_mod.", "").replace("module.", ""): v
             for k, v in sd.items()}
+
+# ==========================================================================
+#  Scene loading (your original code, unchanged)
+# ==========================================================================
+
+def convert_habitat_to_genesis(pos, quat_wxyz):
+    """Swizzles Habitat Y-up → Genesis Z-up."""
+    x, y, z   = pos
+    qw, qx, qy, qz = quat_wxyz
+    return [x, -z, y], [qw, qx, -qz, qy]
+
+
+def resolve_asset_path(template_path, root_dir):
+    """Hunts for the matching Habitat config file and returns the asset path."""
+    base_name  = os.path.basename(template_path)
+    search_dir = os.path.join(root_dir, "configs")
+    if not os.path.exists(search_dir):
+        search_dir = root_dir
+
+    for subdir, dirs, files in os.walk(search_dir):
+        for file in files:
+            if file.startswith(base_name) and file.endswith(".json"):
+                json_path = os.path.join(subdir, file)
+                try:
+                    with open(json_path, "r") as f:
+                        obj_config = json.load(f)
+                    asset_rel = (obj_config.get("urdf_filepath") or
+                                 obj_config.get("render_asset"))
+                    if asset_rel:
+                        abs_path = os.path.abspath(
+                            os.path.join(os.path.dirname(json_path), asset_rel)
+                        )
+                        if os.path.exists(abs_path):
+                            return abs_path
+                except Exception:
+                    pass
+    return None
+
+
+def spawn_entity(scene, template_name, asset_path, pos, quat,
+                 is_fixed, scale=1.0):
+    try:
+        if asset_path.endswith(".urdf"):
+            scene.add_entity(gs.morphs.URDF(
+                file=asset_path, pos=pos, quat=quat, fixed=is_fixed
+            ))
+        elif asset_path.endswith((".glb", ".obj")):
+            scene.add_entity(gs.morphs.Mesh(
+                file=asset_path, pos=pos, quat=quat, fixed=is_fixed,
+                scale=(scale, scale, scale)
+            ))
+        print(f"  ✅  {os.path.basename(template_name)}")
+    except Exception as e:
+        print(f"  ❌  {os.path.basename(template_name)}: {e}")
+
+
+def build_scene(scene_json: str, asset_root: str, scene) -> None:
+    # scene.add_entity(gs.morphs.Plane(pos=(0.0, 0.0, -0.1)))
+    """Load the ReplicaCAD scene into an existing Genesis scene object."""
+    with open(scene_json, "r") as f:
+        config = json.load(f)
+
+    # Stage (room shell)
+    print("\n── Stage ──")
+    stage_info = config.get("stage_instance", {})
+    stage_tmpl = stage_info.get("template_name")
+    if stage_tmpl:
+        room_asset = resolve_asset_path(stage_tmpl, asset_root)
+        if room_asset:
+            rp, rq = convert_habitat_to_genesis(
+                stage_info.get("translation", [0, 0, 0]),
+                stage_info.get("rotation",    [1, 0, 0, 0]),
+            )
+            rp[2] -= 0.05  # Nudge up to prevent z-fighting with the floor plane
+            spawn_entity(scene, stage_tmpl, room_asset,
+                         pos=rp, quat=rq, is_fixed=True)
+        else:
+            print(f"  ⚠️  Could not resolve stage: {stage_tmpl}")
+
+    # Rigid objects
+    print("\n── Rigid objects ──")
+    for obj in config.get("object_instances", []):
+        tmpl  = obj["template_name"]
+        asset = resolve_asset_path(tmpl, asset_root)
+        if asset:
+            np_, nq = convert_habitat_to_genesis(
+                obj["translation"], obj["rotation"]
+            )
+            spawn_entity(scene, tmpl, asset,
+                         pos=np_, quat=nq,
+                         is_fixed=(obj.get("motion_type") == "STATIC"),
+                         scale=obj.get("uniform_scale", 1.0))
+
+    # Articulated objects
+    print("\n── Articulated objects ──")
+    for obj in config.get("articulated_object_instances", []):
+        tmpl  = obj["template_name"]
+        asset = resolve_asset_path(tmpl, asset_root)
+        if asset:
+            np_, nq = convert_habitat_to_genesis(
+                obj["translation"], obj["rotation"]
+            )
+            spawn_entity(scene, tmpl, asset,
+                         pos=np_, quat=nq,
+                         is_fixed=obj.get("fixed_base", True),
+                         scale=obj.get("uniform_scale", 1.0))
+
 
 
 # ==========================================================================
@@ -196,7 +275,6 @@ class Go2AvoidanceEnv:
     Wraps Go2CPGEnv with:
       - Frozen CPG policy tracking base velocity command
       - LiDAR sensor for obstacle detection
-      - Arena with randomised obstacles
       - Observation: 36 normalised LiDAR sector distances
       - Action: 3 velocity corrections (Δvx, Δvy, Δvyaw)
     """
@@ -247,71 +325,18 @@ class Go2AvoidanceEnv:
             renderer    = gs.renderers.Rasterizer(),
             show_viewer = not headless,
         )
+        # ── Load room scene ────────────────────────────────────────────────────
+        indoor_scene = "data/replica_cad/configs/scenes/apt_0.scene_instance.json" 
+        asset_root = "data/replica_cad/"
+        build_scene(indoor_scene, asset_root, self.scene)
+
 
         # ── Ground ────────────────────────────────────────────────────────
-        self.scene.add_entity(gs.morphs.Plane())
+        self.scene.add_entity(gs.morphs.Plane(pos=(0,0,0.2)))
 
-        # ── Arena walls ───────────────────────────────────────────────────
-        s, t, h = ARENA_HALF, ARENA_WALL_THICK, ARENA_WALL_HEIGHT
-        for wx, wy, sx, sy in [
-            ( 0.0,  s,  2*s+2*t, t),
-            ( 0.0, -s,  2*s+2*t, t),
-            ( s,   0.0, t,       2*s),
-            (-s,   0.0, t,       2*s),
-        ]:
-            self.scene.add_entity(gs.morphs.Box(
-                size=(sx, sy, h), pos=(wx, wy, h/2), fixed=True))
-        self.arena_term_dist = s + 0.5
-
-        # ── Obstacles ─────────────────────────────────────────────────────
-        self.obstacles = []
-        leg_offsets = [
-            ( CHAIR_LEG_SPREAD,  CHAIR_LEG_SPREAD),
-            ( CHAIR_LEG_SPREAD, -CHAIR_LEG_SPREAD),
-            (-CHAIR_LEG_SPREAD,  CHAIR_LEG_SPREAD),
-            (-CHAIR_LEG_SPREAD, -CHAIR_LEG_SPREAD),
-        ]
-        for _ in range(N_OBS_CHAIRS):
-            legs = [self.scene.add_entity(gs.morphs.Cylinder(
-                radius=CHAIR_LEG_RADIUS, height=CHAIR_LEG_HEIGHT,
-                pos=(99.0, 99.0, CHAIR_LEG_HEIGHT/2), fixed=True))
-                for _ in leg_offsets]
-            self.obstacles.append(("chair", legs, CHAIR_LEG_HEIGHT, leg_offsets))
-
-        for i in range(N_OBS_SOFAS):
-            t2 = i/max(N_OBS_SOFAS-1,1)
-            w  = SOFA_WIDTH_RANGE[0]  + (SOFA_WIDTH_RANGE[1]-SOFA_WIDTH_RANGE[0])*t2
-            d  = SOFA_DEPTH_RANGE[0]  + (SOFA_DEPTH_RANGE[1]-SOFA_DEPTH_RANGE[0])*t2
-            hh = SOFA_HEIGHT_RANGE[0] + (SOFA_HEIGHT_RANGE[1]-SOFA_HEIGHT_RANGE[0])*t2
-            e  = self.scene.add_entity(gs.morphs.Box(
-                size=(w,d,hh), pos=(99.0,99.0,hh/2), fixed=True))
-            self.obstacles.append(("sofa", e, hh, None))
-
-        for i in range(N_OBS_PILLARS):
-            t2 = i/max(N_OBS_PILLARS-1,1)
-            r  = PILLAR_RADIUS_RANGE[0]+(PILLAR_RADIUS_RANGE[1]-PILLAR_RADIUS_RANGE[0])*t2
-            hh = PILLAR_HEIGHT_RANGE[0]+(PILLAR_HEIGHT_RANGE[1]-PILLAR_HEIGHT_RANGE[0])*t2
-            e  = self.scene.add_entity(gs.morphs.Cylinder(
-                radius=r, height=hh, pos=(99.0,99.0,hh/2), fixed=True))
-            self.obstacles.append(("pillar", e, hh, None))
-
-        for i in range(N_OBS_STEPS):
-            t2 = i/max(N_OBS_STEPS-1,1)
-            ss = STEP_SIZE_RANGE[0]  +(STEP_SIZE_RANGE[1]-STEP_SIZE_RANGE[0])*t2
-            hh = STEP_HEIGHT_RANGE[0]+(STEP_HEIGHT_RANGE[1]-STEP_HEIGHT_RANGE[0])*t2
-            e  = self.scene.add_entity(gs.morphs.Box(
-                size=(ss,ss,hh), pos=(99.0,99.0,hh/2), fixed=True))
-            self.obstacles.append(("step", e, hh, None))
-
-        for i in range(N_OBS_BALLS):
-            t2 = i/max(N_OBS_BALLS-1,1)
-            r  = SPHERE_RAD_RANGE[0]+(SPHERE_RAD_RANGE[1]-SPHERE_RAD_RANGE[0])*t2
-            e  = self.scene.add_entity(gs.morphs.Sphere(
-                radius=r, pos=(99.0,99.0,r), fixed=True))
-            self.obstacles.append(("ball", e, r*2, None))
 
         # ── Robot ─────────────────────────────────────────────────────────
-        self.base_init_pos  = torch.tensor([0.0, 0.0, 0.42], device=self.device)
+        self.base_init_pos  = torch.tensor([3.0, -3.0, 0.44], device=self.device)
         self.base_init_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
         self.inv_base_init_quat = inv_quat(self.base_init_quat)
 
@@ -396,8 +421,6 @@ class Go2AvoidanceEnv:
         print(f"  CPG policy   : FROZEN ({sum(p.numel() for p in self.cpg_net.parameters()):,} params)")
         print(f"  Avoid obs    : {AVOID_OBS_DIM} (LiDAR sectors only)")
         print(f"  Avoid act    : {AVOID_ACT_DIM} (Δvx, Δvy, Δvyaw)")
-        print(f"  Obstacles    : {N_OBSTACLES} total")
-        print(f"  Arena        : {2*ARENA_HALF:.0f}×{2*ARENA_HALF:.0f}m")
         print(f"{'='*60}\n")
 
         # ── State buffers ─────────────────────────────────────────────────
@@ -599,8 +622,6 @@ class Go2AvoidanceEnv:
         self.reset_buf |= torch.abs(self.base_euler[:,1]) > 1.0
         self.reset_buf |= torch.abs(self.base_euler[:,0]) > 1.0
         self.reset_buf |= self.base_pos[:,2] < 0.18
-        self.reset_buf |= self.base_pos[:,0].abs() > self.arena_term_dist
-        self.reset_buf |= self.base_pos[:,1].abs() > self.arena_term_dist
         # Collision termination (after first LiDAR update)
         if self._lidar_step >= LIDAR_INTERVAL:
             self.reset_buf |= self.lidar_sectors.min(dim=1).values < LIDAR_COLLISION
@@ -738,7 +759,6 @@ class Go2AvoidanceEnv:
         self.cpg_phi[envs_idx]   = self.trot_phase * 0.1
 
         self.lidar_sectors[envs_idx] = LIDAR_MAX_RANGE
-        self._randomise_obstacles(envs_idx)
 
         self.last_cpg_actions[envs_idx]   = 0.0
         self.last_correction[envs_idx]    = 0.0
@@ -748,29 +768,6 @@ class Go2AvoidanceEnv:
         for k in self.episode_sums:
             self.episode_sums[k][envs_idx] = 0.0
 
-    def _randomise_obstacles(self, envs_idx):
-        if len(envs_idx) == 0:
-            return
-        n = len(envs_idx)
-        spawn = self.base_init_pos
-        for obs_type, entity, height, meta in self.obstacles:
-            angles = gs_rand_float(0.0, 2*math.pi, (n,), self.device)
-            radii  = gs_rand_float(OBSTACLE_RING_MIN, OBSTACLE_RING_MAX,
-                                   (n,), self.device)
-            cx = spawn[0] + radii * torch.cos(angles)
-            cy = spawn[1] + radii * torch.sin(angles)
-            if obs_type == "chair":
-                yaw = gs_rand_float(0.0, 2*math.pi, (n,), self.device)
-                for leg_e, (dx, dy) in zip(entity, meta):
-                    lx = cx + dx*torch.cos(yaw) - dy*torch.sin(yaw)
-                    ly = cy + dx*torch.sin(yaw) + dy*torch.cos(yaw)
-                    lz = torch.full((n,), height/2, device=self.device)
-                    leg_e.set_pos(torch.stack([lx,ly,lz],dim=-1),
-                                  envs_idx=envs_idx)
-            else:
-                z   = torch.full((n,), height/2, device=self.device)
-                pos = torch.stack([cx,cy,z],dim=-1)
-                entity.set_pos(pos, envs_idx=envs_idx)
 
 
 # ==========================================================================
@@ -1027,7 +1024,7 @@ def evaluate(checkpoint_path, cpg_checkpoint, n_episodes=5, command_vx=0.6):
     env = Go2AvoidanceEnv(
         cpg_checkpoint    = cfg["cpg_checkpoint"],
         n_envs            = 1,
-        headless          = cfg["headless"],
+        headless          = False,
         max_episode_steps = cfg["max_episode_steps"],
         dt                = cfg["dt"],
         device            = device,
@@ -1091,6 +1088,8 @@ def get_config(args):
         save_interval      = 100,
         target_kl          = 0.02,
         lr_floor_frac      = 0.05,
+        scene = args.scene,
+        asset_root = args.asset_root,
     )
 
 
@@ -1108,6 +1107,17 @@ def main():
     p.add_argument("--resume",        type=str,   default=None)
     p.add_argument("--eval",          type=str,   default=None)
     p.add_argument("--vx",            type=float, default=0.6)
+
+    p.add_argument(
+        "--scene", "-s",
+        default="data/replica_cad/configs/scenes/apt_0.scene_instance.json",
+        help="Path to ReplicaCAD scene JSON"
+    )
+    p.add_argument(
+        "--asset-root",
+        default="data/replica_cad/",
+        help="Root directory of the ReplicaCAD dataset"
+    )
     args = p.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():

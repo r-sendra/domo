@@ -441,8 +441,9 @@ class Go2AvoidanceEnv:
         self.reset_buf          = torch.ones( (N,), device=self.device, dtype=gs.tc_int)
         self.episode_length_buf = torch.zeros((N,), device=self.device, dtype=gs.tc_int)
         self.episode_sums       = {
-            "avoidance":  torch.zeros((N,), device=self.device, dtype=f),
-            "survival":   torch.zeros((N,), device=self.device, dtype=f),
+            "avoidance":         torch.zeros((N,), device=self.device, dtype=f),
+            "survival":          torch.zeros((N,), device=self.device, dtype=f),
+            "command_tracking":  torch.zeros((N,), device=self.device, dtype=f),
         }
         self.extras = {}
         self._cam_step = 0
@@ -635,22 +636,39 @@ class Go2AvoidanceEnv:
         avoidance_penalty = -(anticipate + caution + danger + collision)
 
         # Smoothness penalty (REASAN-style) — discourages oscillating
-        # corrections between consecutive steps. This is the term that
-        # was missing and likely responsible for the "wz chaos" pattern
-        # seen in earlier joint-training attempts.
+        # corrections between consecutive steps.
         correction_rate = torch.sum(
             torch.square(correction - self.last_correction), dim=1)
         smoothness_penalty = -correction_rate * 0.05
         self.last_correction = correction.detach()
 
+        # Command-tracking reward — rewards the net for outputting ZERO
+        # correction (i.e. trusting the base command) when clear of
+        # obstacles. This is what was missing: without it, any constant
+        # nonzero correction satisfies the smoothness term just as well
+        # as zero, so the net had no reason to ever return to baseline.
+        #
+        # Gated by clearance via `safety_margin` (1 when far from anything,
+        # fading to 0 inside the caution zone) so this term never fights
+        # the avoidance penalty when a turn is actually needed.
+        safety_margin = torch.clamp(
+            (min_d - LIDAR_CAUTION) / (LIDAR_ANTICIPATE - LIDAR_CAUTION),
+            0.0, 1.0
+        )
+        correction_mag = torch.sum(torch.square(correction), dim=1)
+        # exp(-mag) is 1.0 at zero correction, decays as correction grows
+        command_tracking = safety_margin * torch.exp(-correction_mag * 2.0)
+
         self.rew_buf = (
-            survival * self.dt
+            survival          * self.dt
             + avoidance_penalty  * self.dt * 5.0
             + smoothness_penalty * self.dt
+            + command_tracking   * self.dt * 2.0   # strong — this is the fix
         )
 
-        self.episode_sums["avoidance"] += avoidance_penalty
-        self.episode_sums["survival"]  += survival
+        self.episode_sums["avoidance"]        += avoidance_penalty
+        self.episode_sums["survival"]         += survival
+        self.episode_sums["command_tracking"] += command_tracking
 
         # 8. Observation — normalised LiDAR sectors only
         self.obs_buf = torch.clamp(
@@ -1014,9 +1032,9 @@ def evaluate(checkpoint_path, cpg_checkpoint, n_episodes=5, command_vx=0.6):
         dt                = cfg["dt"],
         device            = device,
     )
-    # Override base forward speed for eval
-    import go2_avoidance as _self_mod
-    _self_mod.BASE_VX = command_vx
+    # Override base forward speed for eval — use globals() so this works
+    # regardless of what filename this script is saved/renamed as
+    globals()["BASE_VX"] = command_vx
 
     net = AvoidanceNet()
     net.load_state_dict(ckpt["model_state"])

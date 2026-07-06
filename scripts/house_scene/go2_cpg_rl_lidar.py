@@ -1027,7 +1027,7 @@ def evaluate(checkpoint_path, cpg_checkpoint, n_episodes=5, command_vx=0.6):
     env = Go2AvoidanceEnv(
         cpg_checkpoint    = cfg["cpg_checkpoint"],
         n_envs            = 1,
-        headless          = cfg["headless"],
+        headless          = False,#cfg["headless"],
         max_episode_steps = cfg["max_episode_steps"],
         dt                = cfg["dt"],
         device            = device,

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "domo"
+version = "0.1.0"
+description = "DOMO — Developmental Orchestration of Motor-skill Onset: LLM-supervised lifelong skill acquisition for legged robots"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+]
+
+[project.optional-dependencies]
+# Physics backends are optional: the control/rl/utils layers are pure torch.
+genesis = ["genesis-world"]
+rl = ["tensorboard"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["domo*"]
+
+[tool.ruff]
+line-length = 100

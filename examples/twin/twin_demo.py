@@ -75,7 +75,7 @@ class ExploreMission(PlanningController):
         self.world.randomise_obstacles()
         # Alternate heading a little between legs to cover more ground.
         vyaw = 0.3 if self.legs_done % 2 == 0 else -0.3
-        return (f"(avoid @ walk(vx=0.5, vyaw={vyaw})).until(moved(2.5)) "
+        return (f"(avoid @ walk(vx=1, vyaw={vyaw})).until(moved(2)) "
                 f">> stand.for(1)")
 
 

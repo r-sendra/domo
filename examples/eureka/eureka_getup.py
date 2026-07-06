@@ -12,14 +12,22 @@ finally deploys the learned skill back into the twin to watch it get up.
     python examples/eureka/eureka_getup.py \\
         --samples 4 --iterations 3 --train-steps 5000000 --device cuda
 
-    # Add the DrEureka robustness stage
-    python examples/eureka/eureka_getup.py --dr ...
+    # Local model served by vLLM (OpenAI-compatible), via LangChain
+    #   vllm serve Qwen/Qwen2.5-Coder-7B-Instruct --port 8000
+    python examples/eureka/eureka_getup.py --llm vllm \\
+        --llm-model Qwen/Qwen2.5-Coder-7B-Instruct ...
+
+    # DrEureka robustness stage (RAPP → m DR configs → train all → best)
+    python examples/eureka/eureka_getup.py --dr --dr-samples 8 ...
 
     # Offline / no API key: scripted LLM with a hand-written reward
     python examples/eureka/eureka_getup.py --llm scripted ...
 
     # Watch a learned checkpoint get up in the twin
     python examples/eureka/eureka_getup.py --demo runs/eureka/getup/...pt
+
+The pipeline is orchestrated with LangGraph (--no-graph for the imperative
+driver). The LLM layer is provider-agnostic (Gemini / vLLM / OpenAI).
 """
 
 import argparse
@@ -30,7 +38,7 @@ import torch
 from domo.checkpoints import pick_device
 from domo.eureka import (DrEurekaConfig, EurekaConfig, SkillLearningRequest,
                          learn_skill)
-from domo.llm.client import GeminiClient, ScriptedClient
+from domo.llm.client import ScriptedClient
 
 REQUEST_DESCRIPTION = (
     "The quadruped (Unitree Go2) lies fallen on its side or back with "
@@ -126,9 +134,18 @@ def main():
     p.add_argument("--n-envs", type=int, default=2048)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--llm", type=str, default="gemini",
-                   choices=["gemini", "scripted"])
+                   choices=["gemini", "vllm", "openai", "gemini-lc", "scripted"],
+                   help="LLM provider. vllm/openai use LangChain.")
+    p.add_argument("--llm-model", type=str, default=None,
+                   help="Model name for vllm/openai (e.g. Qwen/Qwen2.5-Coder-7B-Instruct)")
+    p.add_argument("--llm-base-url", type=str, default=None,
+                   help="Endpoint for vllm/openai (vLLM default http://localhost:8000/v1)")
+    p.add_argument("--no-graph", action="store_true", default=False,
+                   help="Use the imperative driver instead of LangGraph")
     p.add_argument("--dr", action="store_true", default=False,
                    help="Run the DrEureka robustness stage on the winner")
+    p.add_argument("--dr-samples", type=int, default=4,
+                   help="Independent DR configs to train & compare (paper: 16)")
     p.add_argument("--dr-retrain-steps", type=int, default=None)
     p.add_argument("--run-root", type=str, default="runs/eureka")
     p.add_argument("--demo", type=str, default=None,
@@ -141,6 +158,14 @@ def main():
         demo(args.demo, device, args.headless)
         return
 
+    # LLM kwargs for the LangChain-backed providers.
+    llm_kwargs = {}
+    if args.llm in ("vllm", "openai", "gemini-lc"):
+        if args.llm_model:
+            llm_kwargs["model"] = args.llm_model
+        if args.llm_base_url:
+            llm_kwargs["base_url"] = args.llm_base_url
+
     request = SkillLearningRequest(
         skill_name="getup",
         description=REQUEST_DESCRIPTION,
@@ -150,10 +175,13 @@ def main():
             n_envs=args.n_envs, train_steps=args.train_steps,
             device=device),
         run_dr=args.dr,
-        dr=DrEurekaConfig(retrain_steps=(args.dr_retrain_steps
+        dr=DrEurekaConfig(samples=args.dr_samples,
+                          retrain_steps=(args.dr_retrain_steps
                                          or args.train_steps)),
         run_root=args.run_root,
         llm=args.llm,
+        llm_kwargs=llm_kwargs or None,
+        use_graph=not args.no_graph,
     )
 
     if args.llm == "scripted":
@@ -166,7 +194,7 @@ def main():
                 return SCRIPTED_REWARD
         llm = OfflineClient(["-"])
     else:
-        llm = GeminiClient()
+        llm = None            # built from request.llm (+ llm_kwargs) by the routine
 
     skill = learn_skill(request, llm=llm)
 

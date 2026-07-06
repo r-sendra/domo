@@ -34,6 +34,17 @@ class _ControlLoopBase:
     def __init__(self, robot, controller, dt: float,
                  sensors: Sequence = (),
                  command_filter: Optional[CommandFilter] = None):
+        """
+        Base class for control loops.
+
+        Args:
+            robot: The robot instance to control.
+            controller: The controller that decides which actions to take.
+            dt: The time step for each control cycle in seconds.
+            sensors: A sequence of exteroceptive sensors (e.g., Lidar) to tick.
+            command_filter: An optional safety layer function that can modify
+                commands before they are sent to the actuators.
+        """
         self.robot = robot
         self.controller = controller
         self.dt = dt
@@ -41,6 +52,10 @@ class _ControlLoopBase:
         self.command_filter = command_filter
 
     def reset(self):
+        """
+        Resets the robot, controller, and all sensors to their initial states.
+        This is called at the beginning of a new run or episode.
+        """
         all_envs = torch.arange(self.robot.n_envs, device=self.robot.device)
         self.robot.reset_idx(all_envs)
         self.controller.reset_idx(all_envs)
@@ -51,12 +66,20 @@ class _ControlLoopBase:
         return self.robot.state
 
     def _cycle_pre(self):
+        """
+        The first half of a control cycle: get a command from the controller,
+        pass it through the safety filter, and send it to the robot's actuators.
+        """
         command = self.controller.update(self.robot.state, self.dt)
         if self.command_filter is not None:
             command = self.command_filter(command, self.robot.state)
         self.robot.set_joint_targets(command)
 
     def _cycle_post(self):
+        """
+        The second half of a control cycle: after time has advanced, refresh the
+        robot's internal state from its sensors and tick any external sensors.
+        """
         self.robot.refresh()
         for sensor in self.sensors:
             if hasattr(sensor, "tick"):
@@ -64,7 +87,14 @@ class _ControlLoopBase:
         return self.robot.state
 
     def run(self, n_steps: int, callback: Optional[Callable] = None):
-        """Run n control cycles; callback(step, state) after each if given."""
+        """
+        Run a fixed number of control cycles.
+
+        Args:
+            n_steps: The number of control steps to execute.
+            callback: An optional function `callback(step_index, robot_state)`
+                called after each step.
+        """
         state = self.robot.state
         for i in range(n_steps):
             state = self.step()
@@ -79,10 +109,22 @@ class SimControlLoop(_ControlLoopBase):
     def __init__(self, scene, robot, controller, dt: float,
                  sensors: Sequence = (),
                  command_filter: Optional[CommandFilter] = None):
+        """
+        Initialises the simulation control loop.
+
+        Args:
+            scene: The physics scene to step.
+            robot: The robot instance in the simulation.
+            controller: The controller orchestrating the robot's skills.
+            dt: The control loop time step.
+            sensors: External sensors to update each step.
+            command_filter: Optional safety filter for outgoing commands.
+        """
         super().__init__(robot, controller, dt, sensors, command_filter)
         self.scene = scene
 
     def step(self):
+        """Executes one full control cycle by stepping the physics scene."""
         self._cycle_pre()
         self.scene.step()
         return self._cycle_post()
@@ -97,6 +139,7 @@ class RealControlLoop(_ControlLoopBase):
     """
 
     def step(self):
+        """Executes one full control cycle, paced against the system wall clock."""
         cycle_start = time.monotonic()
         self._cycle_pre()
         remaining = self.dt - (time.monotonic() - cycle_start)

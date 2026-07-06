@@ -122,15 +122,74 @@ def test_reflection_includes_stats_and_failures():
 
 
 def test_dr_prompt_and_config_roundtrip():
-    text = dr_prompt("getup", 0.6, "  friction=0.5: success 40%  [FEASIBLE ]")
+    text = dr_prompt("getup", 0.6, "friction: feasible [0.5, 2.0]",
+                     "  friction=0.5: success 40%  [FEASIBLE ]")
     assert "domain randomization" in text and "40%" in text
+    assert "feasible" in text
     dr = DomainRandomization.from_dict(
-        {"friction_range": [0.5, 1.5], "obs_noise_std": 0.02,
-         "unknown_key": 1})
+        {"friction_range": [0.5, 1.5], "com_shift_range": [-0.05, 0.05],
+         "obs_noise_std": 0.02, "unknown_key": 1})
     assert dr.friction_range == (0.5, 1.5)
+    assert dr.com_shift_range == (-0.05, 0.05)
     assert dr.obs_noise_std == 0.02
     assert "unknown_key" not in dr.to_dict()
-    assert DomainRandomization.from_dict(dr.to_dict()).friction_range == (0.5, 1.5)
+    assert DomainRandomization.from_dict(dr.to_dict()).com_shift_range == (-0.05, 0.05)
+
+
+def test_safety_instruction_in_reward_prompt():
+    from domo.eureka.prompts import reward_prompt
+    from domo.eureka.spec import EurekaConfig, SkillLearningRequest, TASK_REGISTRY
+    req = SkillLearningRequest(skill_name="g", description="Stand up.",
+                               eureka=EurekaConfig(iterations=1, samples=1))
+    ts = TASK_REGISTRY["go2_getup"]
+    with_safety = reward_prompt(req, ts, safety=True)
+    without = reward_prompt(req, ts, safety=False)
+    assert "sim-to-real" in with_safety.lower() and "smoothness" in with_safety.lower()
+    assert "sim-to-real" not in without.lower()
+
+
+def test_rapp_feasible_bounds():
+    from domo.eureka.dr import feasible_bounds
+    from domo.eureka.spec import DrEurekaConfig
+    cfg = DrEurekaConfig(feasible_ratio=0.5, feasible_floor=0.1)
+    # nominal 0.6 → threshold 0.30. friction feasible at 0.5 and 1.5, not 4.0.
+    sweeps = [
+        {"label": "nominal", "param": None, "value": 0.0, "success_rate": 0.6},
+        {"label": "friction=0.5", "param": "friction", "value": 0.5, "success_rate": 0.5},
+        {"label": "friction=1.5", "param": "friction", "value": 1.5, "success_rate": 0.4},
+        {"label": "friction=4.0", "param": "friction", "value": 4.0, "success_rate": 0.05},
+        {"label": "com_shift=0.1", "param": "com_shift", "value": 0.1, "success_rate": 0.45},
+    ]
+    bounds, text = feasible_bounds(sweeps, cfg, nominal=0.6)
+    # friction feasible from default 1.0 down to 0.5 and up to 1.5 (not 4.0)
+    assert bounds["friction_range"] == (0.5, 1.5)
+    # com symmetric: feasible magnitude 0.1 → [-0.1, 0.1]
+    assert bounds["com_shift_range"] == (-0.1, 0.1)
+    assert "feasible" in text
+
+
+def test_dr_config_clamped_to_bounds():
+    from domo.eureka.dr import _clamp_to_bounds
+    bounds = {"friction_range": (0.5, 1.5), "obs_noise_std": (0.0, 0.05)}
+    # LLM proposes wider than feasible → clamped inward
+    out = _clamp_to_bounds({"friction_range": [0.2, 3.0], "obs_noise_std": 0.2}, bounds)
+    assert out["friction_range"] == [0.5, 1.5]
+    assert out["obs_noise_std"] == 0.05
+
+
+def test_make_llm_dispatch():
+    from domo.llm import make_llm
+    from domo.llm.client import ScriptedClient
+    assert isinstance(make_llm("scripted", responses=["a"]), ScriptedClient)
+    with pytest.raises(ValueError, match="unknown LLM provider"):
+        make_llm("nonesuch")
+
+
+def test_langgraph_pipeline_structure():
+    from domo.eureka.graph import build_graph
+    graph = build_graph()
+    nodes = set(graph.get_graph().nodes.keys())
+    assert {"iterate", "select", "dr", "finish"} <= nodes
 
 
 # ---------------------------------------------------------------------------

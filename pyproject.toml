@@ -17,6 +17,12 @@ dependencies = [
 # Physics backends are optional: the control/rl/utils layers are pure torch.
 genesis = ["genesis-world"]
 rl = ["tensorboard"]
+# LLM supervisor (Eureka/DrEureka). google-genai is the light default;
+# langchain/langgraph enable vLLM + OpenAI + the graph orchestration.
+llm = ["google-genai"]
+langchain = ["langgraph", "langchain-core", "langchain-openai"]
+gemini-langchain = ["langchain-google-genai"]
+voice = ["openai-whisper", "sounddevice"]
 dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]

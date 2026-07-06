@@ -142,6 +142,10 @@ class Articulation(ABC):
         """shift_kg: [len(envs_idx)] added payload mass on the base link."""
         raise NotImplementedError(f"{type(self).__name__} does not support mass DR")
 
+    def set_base_com_shift(self, shift_m: torch.Tensor, envs_idx: torch.Tensor) -> None:
+        """shift_m: [len(envs_idx), 3] center-of-mass offset on the base link (m)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support COM DR")
+
     def set_pd_gains_scaled(self, kp: torch.Tensor, kd: torch.Tensor,
                             dof_idx: Sequence[int],
                             envs_idx: torch.Tensor) -> None:

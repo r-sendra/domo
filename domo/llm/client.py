@@ -21,8 +21,8 @@ import re
 import time
 from typing import List, Optional
 
-__all__ = ["LLMClient", "GeminiClient", "ScriptedClient", "extract_code_block",
-           "extract_json_block"]
+__all__ = ["LLMClient", "GeminiClient", "ScriptedClient", "make_llm",
+           "extract_code_block", "extract_json_block"]
 
 
 class LLMClient:
@@ -151,3 +151,38 @@ def extract_json_block(text: str) -> Optional[str]:
     # bare JSON object
     m = re.search(r"\{.*\}", text, re.DOTALL)
     return m.group(0).strip() if m else None
+
+
+# ---------------------------------------------------------------------------
+# Provider factory
+# ---------------------------------------------------------------------------
+
+def make_llm(provider: str = "gemini", **kwargs) -> "LLMClient":
+    """
+    Construct an LLM client by provider name — the single dispatch point for
+    Eureka / DrEureka and any future supervisor.
+
+      "gemini"    → direct google-genai (GeminiClient), no LangChain needed
+      "vllm"      → local model via vLLM OpenAI-compatible server (LangChain)
+      "openai"    → OpenAI or an OpenAI-compatible gateway (LangChain)
+      "gemini-lc" → Gemini via langchain-google-genai (LangChain)
+      "scripted"  → canned responses; kwargs: responses=[...]
+
+    kwargs are forwarded to the underlying constructor (model, base_url,
+    api_key, max_tokens, ...).
+    """
+    provider = provider.lower()
+    if provider == "gemini":
+        return GeminiClient(**kwargs)
+    if provider == "scripted":
+        return ScriptedClient(kwargs.get("responses") or ["-"])
+    if provider in ("vllm", "openai", "gemini-lc", "gemini_langchain"):
+        from .langchain_client import (gemini_langchain_client, openai_client,
+                                       vllm_client)
+        if provider == "vllm":
+            return vllm_client(**kwargs)
+        if provider == "openai":
+            return openai_client(**kwargs)
+        return gemini_langchain_client(**kwargs)
+    raise ValueError(f"unknown LLM provider '{provider}' "
+                     "(gemini | vllm | openai | gemini-lc | scripted)")

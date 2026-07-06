@@ -67,17 +67,23 @@ domo/
 │               rebuilds any checkpoint (incl. legacy script ones) from weight shapes.
 ├── hri/        Human-robot interaction (M6 precursor): voice → velocity
 │               commands (whisper + Gemini, lazy deps).
-├── llm/        LLM clients (GeminiClient — free-tier 2.5-flash — and
-│               ScriptedClient for offline runs). Supervisor logic (M1) upcoming.
-├── eureka/     The Eureka + DrEureka skill-learning routine (M2+M3):
-│               learn_skill(SkillLearningRequest) → LLM reward generation →
-│               candidate training in worker subprocesses → ranking on the
-│               task's FIXED success metric → reward reflection → iterate;
-│               then optionally the DrEureka stage: reward-aware physics
-│               prior sweep → LLM-proposed DomainRandomization → robust
-│               retrain. Callable from the twin, a CLI, or the future
-│               real-robot supervisor. Example: examples/eureka/
-│               eureka_getup.py (closes the twin demo's get-up skill gap).
+├── llm/        Provider-agnostic LLM clients behind one interface
+│               (generate → str), selected by make_llm(provider): "gemini"
+│               (direct google-genai), "vllm" (local model via LangChain +
+│               vLLM OpenAI-compatible server), "openai", "gemini-lc"
+│               (Gemini via LangChain), "scripted" (offline/tests). LangChain
+│               is lazy — the core needs no LLM deps.
+├── eureka/     The Eureka + DrEureka skill-learning routine (M2+M3),
+│               faithful to Yu et al. 2024. learn_skill(SkillLearningRequest):
+│               (1) SAFETY-REGULARIZED reward generation (l_task + l_safety) →
+│               candidate training in worker subprocesses → rank on the task's
+│               FIXED success metric → reward reflection → iterate;
+│               (2) DrEureka: Reward-Aware Physics Prior (single-param sweeps →
+│               feasible bounds) → LLM samples m independent DomainRandomization
+│               configs (clamped to bounds) → train ALL, keep best. Orchestrated
+│               with LangGraph (graph.py; use_graph=False for the imperative
+│               driver). Callable from the twin, a CLI, or the real-robot
+│               supervisor. Example: examples/eureka/eureka_getup.py.
 └── utils/      Pure math (quaternion ops, wxyz convention).
 ```
 

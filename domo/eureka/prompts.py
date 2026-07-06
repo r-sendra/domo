@@ -10,7 +10,7 @@ from typing import List
 
 from .spec import CandidateResult, SkillLearningRequest, TaskSpec
 
-__all__ = ["reward_prompt", "reflection_block", "dr_prompt"]
+__all__ = ["reward_prompt", "reflection_block", "dr_prompt", "SAFETY_INSTRUCTION"]
 
 
 _REWARD_SYSTEM = """\
@@ -33,12 +33,32 @@ Rules:
 - Policy success is measured by a FIXED external metric you cannot change,
   described below. Your reward is good iff that metric improves."""
 
+# DrEureka Stage 1: safety-regularized reward design. Appended to the task
+# specification (l_task + l_safety) so the LLM shapes rewards that produce
+# behaviour robust enough to transfer — without hand-tuned safety term scales.
+SAFETY_INSTRUCTION = """\
+This policy is intended for SIM-TO-REAL transfer to physical hardware, so the
+learned behaviour must be safe and feasible on a real robot. Encourage:
+- stability: keep the torso steady, penalise large roll/pitch and violent
+  base motion;
+- smoothness: penalise action rate, jerk, and rapid oscillation so motors are
+  not slammed;
+- feasibility: discourage extreme joint velocities/torques, self-collision,
+  and postures near joint limits.
+Fold these into the reward as shaping terms (do NOT hand-pick large fixed
+penalty scales — keep them proportionate to the task terms). A jittery or
+violent policy that maximises the metric in simulation will not transfer, so
+smoothness genuinely matters."""
+
 
 def reward_prompt(request: SkillLearningRequest, task_spec: TaskSpec,
-                  reflection: str = "") -> str:
+                  reflection: str = "", safety: bool = True) -> str:
+    task_block = f"\n## Skill to train\n{request.description}"
+    if safety:
+        task_block += "\n\n### Safety & transfer requirements\n" + SAFETY_INSTRUCTION
     parts = [
         _REWARD_SYSTEM,
-        f"\n## Skill to train\n{request.description}",
+        task_block,
         f"\n## Fixed success metric\n{task_spec.success_description}",
         f"\n## Environment interface\n{task_spec.env_interface}",
     ]
@@ -89,29 +109,38 @@ def reflection_block(candidates: List[CandidateResult]) -> str:
 
 
 _DR_SYSTEM = """\
-You are configuring domain randomization to make a trained legged-robot
-policy robust for sim-to-real transfer (DrEureka-style). Below is the
-policy's measured success under single-parameter perturbations — its
-reward-aware physics prior. Choose training randomization RANGES that are
-as wide as possible while staying inside regions where the policy still
-substantially works (avoid ranges where success collapsed: training there
-wastes samples and destabilises learning).
+You are configuring domain randomization (DR) to make a trained legged-robot
+policy robust for sim-to-real transfer (DrEureka-style).
 
-Output ONE json code block, exactly this schema (omit keys to leave a
+You are given a Reward-Aware Physics Prior (RAPP): for each physics
+parameter, the FEASIBLE bounds — the widest range over which the trained
+policy still succeeds when that parameter alone is perturbed. Also shown is
+the per-value success under each perturbation.
+
+Choose training randomization RANGES that are as WIDE AS POSSIBLE while
+staying INSIDE the feasible bounds (training outside them wastes samples and
+destabilises learning). Do not exceed the feasible min/max. It is fine to be
+slightly narrower than the bounds for safety, but prefer wide ranges — wide
+DR is what makes transfer work.
+
+Output ONE json code block, exactly this schema (omit a key to leave that
 parameter unrandomised):
 ```json
 {
   "friction_range": [low, high],
   "base_mass_range": [low, high],
+  "com_shift_range": [low, high],
   "kp_scale_range": [low, high],
+  "kd_scale_range": [low, high],
   "obs_noise_std": value
 }
 ```"""
 
 
 def dr_prompt(skill_name: str, nominal_success: float,
-              prior_table: str) -> str:
+              feasible_bounds: str, prior_table: str) -> str:
     return (f"{_DR_SYSTEM}\n\n## Policy\n'{skill_name}', nominal success "
             f"{nominal_success:.0%} (no perturbation).\n\n"
-            f"## Measured physics prior\n{prior_table}\n\n"
+            f"## RAPP feasible bounds (stay inside these)\n{feasible_bounds}\n\n"
+            f"## Per-value success detail\n{prior_table}\n\n"
             f"Choose the randomization config now.")

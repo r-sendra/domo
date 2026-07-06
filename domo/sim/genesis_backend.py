@@ -109,6 +109,11 @@ class GenesisArticulation(Articulation):
         self._entity.set_mass_shift(
             shift_kg.unsqueeze(1), links_idx_local=[0], envs_idx=envs_idx)
 
+    def set_base_com_shift(self, shift_m: torch.Tensor, envs_idx: torch.Tensor) -> None:
+        # Genesis expects [n_envs, n_links, 3]; apply to the base link only.
+        self._entity.set_COM_shift(
+            shift_m.unsqueeze(1), links_idx_local=[0], envs_idx=envs_idx)
+
     def set_pd_gains_scaled(self, kp: torch.Tensor, kd: torch.Tensor,
                             dof_idx: Sequence[int],
                             envs_idx: torch.Tensor) -> None:

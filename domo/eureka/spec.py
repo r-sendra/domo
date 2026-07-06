@@ -66,6 +66,7 @@ class EurekaConfig:
     iterations: int = 3            # evolutionary rounds
     samples: int = 4               # reward candidates per round
     temperature: float = 1.0       # sampling diversity
+    safety_reward: bool = True     # DrEureka Stage 1: safety-regularized prompt
 
     # Per-candidate training budget
     n_envs: int = 2048
@@ -82,15 +83,20 @@ class EurekaConfig:
 @dataclass
 class DrEurekaConfig:
     """Reward-aware physics prior sweep + LLM-proposed randomization."""
-    # Values swept per parameter to find the feasible range
-    friction_values: List[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 1.5, 2.0])
-    base_mass_values: List[float] = field(default_factory=lambda: [-1.0, 0.0, 1.0, 2.0, 3.0])
-    kp_scale_values: List[float] = field(default_factory=lambda: [0.7, 0.85, 1.0, 1.15, 1.3])
+    # RAPP: values swept per parameter to find the feasible bounds. One
+    # frozen-policy evaluation per value, one parameter perturbed at a time.
+    friction_values: List[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 1.5, 2.0, 4.0])
+    base_mass_values: List[float] = field(default_factory=lambda: [-1.0, 0.0, 1.0, 2.0, 3.0, 5.0])
+    com_shift_values: List[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1, 0.15])
+    kp_scale_values: List[float] = field(default_factory=lambda: [0.5, 0.7, 0.85, 1.0, 1.15, 1.3, 1.5])
     obs_noise_values: List[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1])
     # A setting is feasible if success ≥ max(floor, ratio × nominal success)
     feasible_ratio: float = 0.5
     feasible_floor: float = 0.1
     eval_episodes: int = 32
+    # DrEureka Stage 3: the LLM proposes `samples` INDEPENDENT DR configs;
+    # all are trained and the best is kept (paper uses m=16).
+    samples: int = 4
     retrain_steps: int = 4_000_000
 
 
@@ -103,7 +109,9 @@ class SkillLearningRequest:
     run_dr: bool = False           # append the DrEureka robustness stage
     dr: DrEurekaConfig = field(default_factory=DrEurekaConfig)
     run_root: str = "runs/eureka"
-    llm: str = "gemini"            # "gemini" | "scripted" (client override wins)
+    llm: str = "gemini"            # gemini | vllm | openai | gemini-lc | scripted
+    llm_kwargs: Optional[dict] = None   # forwarded to the client (model, base_url, ...)
+    use_graph: bool = True         # orchestrate via LangGraph when available
 
 
 # ---------------------------------------------------------------------------

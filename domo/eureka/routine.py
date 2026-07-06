@@ -22,7 +22,7 @@ import sys
 from dataclasses import asdict
 from typing import List, Optional
 
-from domo.llm.client import GeminiClient, LLMClient, ScriptedClient
+from domo.llm.client import LLMClient, make_llm
 
 from . import prompts
 from .rewards import extract_reward_code, validate_reward_code
@@ -33,9 +33,8 @@ __all__ = ["learn_skill", "run_worker", "make_client"]
 
 
 def make_client(request: SkillLearningRequest) -> LLMClient:
-    if request.llm == "gemini":
-        return GeminiClient()
-    raise ValueError(f"no default client for llm='{request.llm}' — pass llm=")
+    """Build the LLM client named by request.llm (an explicit client wins)."""
+    return make_llm(request.llm, **(request.llm_kwargs or {}))
 
 
 def run_worker(spec: dict, timeout_s: float) -> dict:
@@ -81,85 +80,138 @@ def _sample_candidates(llm: LLMClient, prompt: str, k: int,
     return candidates
 
 
-def learn_skill(request: SkillLearningRequest,
-                llm: Optional[LLMClient] = None) -> LearnedSkill:
-    if request.task not in TASK_REGISTRY:
-        raise ValueError(f"unknown task '{request.task}' "
-                         f"(registry: {sorted(TASK_REGISTRY)})")
-    task_spec = TASK_REGISTRY[request.task]
-    llm = llm or make_client(request)
+# ---------------------------------------------------------------------------
+# Reusable stage functions (shared by the imperative path and the LangGraph)
+# ---------------------------------------------------------------------------
+
+def train_candidate(request: SkillLearningRequest, cand: CandidateResult,
+                    it_dir: str) -> CandidateResult:
+    """Train one validated reward candidate in a worker; fill its result."""
     cfg = request.eureka
-    root = os.path.join(request.run_root, request.skill_name)
-    os.makedirs(root, exist_ok=True)
+    run_dir = os.path.join(it_dir, f"train_{cand.index}")
+    spec = {
+        "mode": "train",
+        "task": request.task,
+        "task_overrides": {"n_envs": cfg.n_envs, "device": cfg.device,
+                           "headless": cfg.headless},
+        "reward_code_file": os.path.join(it_dir, f"candidate_{cand.index}.py"),
+        "ppo": {
+            "total_steps": cfg.train_steps,
+            "rollout_steps": cfg.rollout_steps,
+            "minibatch_size": max(cfg.n_envs * cfg.rollout_steps // 4, 64),
+            "hidden_size": cfg.hidden_size,
+            "guard_nonfinite": True,
+            "lr_schedule": "linear",
+        },
+        "run_dir": run_dir,
+        "eval_episodes": cfg.eval_episodes,
+        "snapshots": cfg.snapshots,
+    }
+    results = run_worker(spec, cfg.worker_timeout_s)
+    cand.error = results.get("error")
+    if cand.ok:
+        cand.success_rate = results["success_rate"]
+        cand.mean_ep_len = results["mean_ep_len"]
+        cand.snapshots = results.get("snapshots", [])
+        cand.checkpoint = results.get("checkpoint")
+    return cand
 
-    history: List[IterationResult] = []
-    reflection = ""
-    print(f"\n{'=' * 60}\n  EUREKA — learning '{request.skill_name}' "
-          f"({cfg.iterations} iters × {cfg.samples} candidates)\n{'=' * 60}")
 
-    for it in range(cfg.iterations):
-        it_dir = os.path.join(root, f"iter_{it}")
-        os.makedirs(it_dir, exist_ok=True)
-        prompt = prompts.reward_prompt(request, task_spec, reflection)
-        with open(os.path.join(it_dir, "prompt.txt"), "w") as f:
-            f.write(prompt)
+def run_iteration(request: SkillLearningRequest, task_spec, llm,
+                  reflection: str, it_dir: str, it_index: int
+                  ) -> IterationResult:
+    """One Eureka round: prompt → sample → validate → train → reflect."""
+    cfg = request.eureka
+    os.makedirs(it_dir, exist_ok=True)
+    prompt = prompts.reward_prompt(request, task_spec, reflection,
+                                   safety=cfg.safety_reward)
+    with open(os.path.join(it_dir, "prompt.txt"), "w") as f:
+        f.write(prompt)
 
-        candidates = _sample_candidates(llm, prompt, cfg.samples,
-                                        cfg.temperature, it_dir)
+    candidates = _sample_candidates(llm, prompt, cfg.samples,
+                                    cfg.temperature, it_dir)
+    for cand in candidates:
+        if not cand.ok:
+            print(f"  iter {it_index + 1} cand {cand.index}: rejected "
+                  f"({cand.error})")
+            continue
+        print(f"  iter {it_index + 1} cand {cand.index}: training "
+              f"({cfg.train_steps:,} steps)...")
+        train_candidate(request, cand, it_dir)
+        if cand.ok:
+            print(f"  iter {it_index + 1} cand {cand.index}: "
+                  f"success {cand.success_rate:.0%}")
+        else:
+            print(f"  iter {it_index + 1} cand {cand.index}: FAILED")
 
-        for cand in candidates:
-            if not cand.ok:
-                print(f"  iter {it + 1} cand {cand.index}: rejected "
-                      f"({cand.error})")
-                continue
-            run_dir = os.path.join(it_dir, f"train_{cand.index}")
-            spec = {
-                "mode": "train",
-                "task": request.task,
-                "task_overrides": {
-                    "n_envs": cfg.n_envs, "device": cfg.device,
-                    "headless": cfg.headless,
-                },
-                "reward_code_file": os.path.join(
-                    it_dir, f"candidate_{cand.index}.py"),
-                "ppo": {
-                    "total_steps": cfg.train_steps,
-                    "rollout_steps": cfg.rollout_steps,
-                    "minibatch_size": max(
-                        cfg.n_envs * cfg.rollout_steps // 4, 64),
-                    "hidden_size": cfg.hidden_size,
-                    "guard_nonfinite": True,
-                    "lr_schedule": "linear",
-                },
-                "run_dir": run_dir,
-                "eval_episodes": cfg.eval_episodes,
-                "snapshots": cfg.snapshots,
-            }
-            print(f"  iter {it + 1} cand {cand.index}: training "
-                  f"({cfg.train_steps:,} steps)...")
-            results = run_worker(spec, cfg.worker_timeout_s)
-            cand.error = results.get("error")
-            if cand.ok:
-                cand.success_rate = results["success_rate"]
-                cand.mean_ep_len = results["mean_ep_len"]
-                cand.snapshots = results.get("snapshots", [])
-                cand.checkpoint = results.get("checkpoint")
-                print(f"  iter {it + 1} cand {cand.index}: "
-                      f"success {cand.success_rate:.0%}")
-            else:
-                print(f"  iter {it + 1} cand {cand.index}: FAILED")
+    with open(os.path.join(it_dir, "reflection.txt"), "w") as f:
+        f.write(prompts.reflection_block(candidates))
+    return IterationResult(index=it_index, candidates=candidates)
 
-        iteration = IterationResult(index=it, candidates=candidates)
-        history.append(iteration)
-        reflection = prompts.reflection_block(candidates)
-        with open(os.path.join(it_dir, "reflection.txt"), "w") as f:
-            f.write(reflection)
 
+def select_global_best(history: List[IterationResult]) -> Optional[CandidateResult]:
     best = None
     for it in history:
         b = it.best
         if b and (best is None or b.success_rate > best.success_rate):
             best = b
+    return best
+
+
+def finalize_skill(request: SkillLearningRequest, skill: LearnedSkill) -> LearnedSkill:
+    root = os.path.join(request.run_root, request.skill_name)
+    with open(os.path.join(root, "result.json"), "w") as f:
+        json.dump({"name": skill.name, "checkpoint": skill.checkpoint,
+                   "success_rate": skill.success_rate,
+                   "dr_config": skill.dr_config,
+                   "dr_success_rate": skill.dr_success_rate,
+                   "reward_code": skill.reward_code}, f, indent=2)
+    print(f"\n{skill.summary()}\n")
+    return skill
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def learn_skill(request: SkillLearningRequest,
+                llm: Optional[LLMClient] = None) -> LearnedSkill:
+    if request.task not in TASK_REGISTRY:
+        raise ValueError(f"unknown task '{request.task}' "
+                         f"(registry: {sorted(TASK_REGISTRY)})")
+    llm = llm or make_client(request)
+
+    # Prefer the LangGraph orchestration when requested and available.
+    if request.use_graph:
+        try:
+            from .graph import run_graph
+        except ImportError:
+            print("  [eureka] langgraph not installed — using imperative path")
+        else:
+            return run_graph(request, llm)
+
+    return _learn_skill_imperative(request, llm)
+
+
+def _learn_skill_imperative(request: SkillLearningRequest,
+                            llm: LLMClient) -> LearnedSkill:
+    task_spec = TASK_REGISTRY[request.task]
+    cfg = request.eureka
+    root = os.path.join(request.run_root, request.skill_name)
+    os.makedirs(root, exist_ok=True)
+
+    print(f"\n{'=' * 60}\n  EUREKA — learning '{request.skill_name}' "
+          f"({cfg.iterations} iters × {cfg.samples} candidates)\n{'=' * 60}")
+
+    history: List[IterationResult] = []
+    reflection = ""
+    for it in range(cfg.iterations):
+        iteration = run_iteration(request, task_spec, llm, reflection,
+                                  os.path.join(root, f"iter_{it}"), it)
+        history.append(iteration)
+        reflection = prompts.reflection_block(iteration.candidates)
+
+    best = select_global_best(history)
     if best is None:
         raise RuntimeError(
             "Eureka produced no runnable candidate — see iter_*/reflection.txt")
@@ -173,11 +225,4 @@ def learn_skill(request: SkillLearningRequest,
         from .dr import run_dr_eureka
         skill = run_dr_eureka(request, skill, llm)
 
-    with open(os.path.join(root, "result.json"), "w") as f:
-        json.dump({"name": skill.name, "checkpoint": skill.checkpoint,
-                   "success_rate": skill.success_rate,
-                   "dr_config": skill.dr_config,
-                   "dr_success_rate": skill.dr_success_rate,
-                   "reward_code": skill.reward_code}, f, indent=2)
-    print(f"\n{skill.summary()}\n")
-    return skill
+    return finalize_skill(request, skill)

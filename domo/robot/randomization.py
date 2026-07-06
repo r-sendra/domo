@@ -31,6 +31,7 @@ class DomainRandomization:
     # Physics (per env, resampled at reset)
     friction_range: Optional[Tuple[float, float]] = None       # ratio, ~1.0
     base_mass_range: Optional[Tuple[float, float]] = None      # added kg
+    com_shift_range: Optional[Tuple[float, float]] = None      # ±m, each xyz axis
     kp_scale_range: Optional[Tuple[float, float]] = None       # × nominal kp
     kd_scale_range: Optional[Tuple[float, float]] = None       # × nominal kd
 
@@ -76,6 +77,11 @@ class DomainRandomization:
         if self.base_mass_range is not None:
             self._try("base_mass", art.set_base_mass_shift,
                       _u(*self.base_mass_range, n, device), envs_idx)
+
+        if self.com_shift_range is not None:
+            # Independent offset on each of x, y, z within the range.
+            com = _u(*self.com_shift_range, (n, 3), device)
+            self._try("com_shift", art.set_base_com_shift, com, envs_idx)
 
         if self.kp_scale_range is not None or self.kd_scale_range is not None:
             # One draw per reset group (engine gains broadcast over envs);

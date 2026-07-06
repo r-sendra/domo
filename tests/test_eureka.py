@@ -49,9 +49,27 @@ def test_extract_code_and_json():
     assert extract_json_block('inline {"b": [1,2]} tail') == '{"b": [1,2]}'
 
 
+def test_extract_tolerates_gemini_variants():
+    # capitalised / short language tags
+    assert extract_reward_code(f"```py\n{GOOD_CODE}```") is not None
+    assert extract_reward_code(f"```Python\n{GOOD_CODE}```") is not None
+    # TRUNCATED block: opening fence, no closing fence (thinking-model cutoff)
+    truncated = f"Here you go:\n```python\n{GOOD_CODE}"
+    assert extract_reward_code(truncated) is not None
+    # empty response → None, not a crash
+    assert extract_reward_code("") is None
+    assert extract_reward_code(None) is None
+
+
 def test_validate_rejects_dangerous_and_broken():
     assert validate_reward_code(GOOD_CODE) is None
-    assert "forbidden" in validate_reward_code("import os\n" + GOOD_CODE)
+    # benign imports the LLM writes by habit are now allowed
+    assert validate_reward_code("import torch\nimport math\n" + GOOD_CODE) is None
+    # other imports are still rejected
+    assert "disallowed import" in validate_reward_code("import os\n" + GOOD_CODE)
+    assert "disallowed import" in validate_reward_code("import numpy as np\n" + GOOD_CODE)
+    # subprocess is caught by the substring guard (rejected, either message)
+    assert validate_reward_code("from subprocess import run\n" + GOOD_CODE) is not None
     assert "forbidden" in validate_reward_code(
         "def compute_reward(task):\n    return task.__dict__, {}")
     assert "syntax" in validate_reward_code("def compute_reward(task:")

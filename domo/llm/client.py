@@ -33,7 +33,7 @@ class LLMClient:
 class GeminiClient(LLMClient):
     def __init__(self, model: str = "gemini-2.5-flash",
                  api_key: Optional[str] = None,
-                 max_output_tokens: int = 8192,
+                 max_output_tokens: int = 16384,
                  max_retries: int = 4, verbose: bool = True):
         try:
             from google import genai
@@ -62,7 +62,7 @@ class GeminiClient(LLMClient):
                         temperature=temperature,
                         max_output_tokens=self.max_output_tokens),
                 )
-                return response.text or ""
+                return self._response_text(response)
             except Exception as e:            # rate limits on the free tier
                 if attempt == self.max_retries - 1:
                     raise
@@ -71,6 +71,36 @@ class GeminiClient(LLMClient):
                 time.sleep(delay)
                 delay *= 2
         return ""
+
+    def _response_text(self, response) -> str:
+        """
+        Robustly extract the answer text. `gemini-2.5-flash` is a thinking
+        model: if reasoning exhausts max_output_tokens the answer is empty or
+        truncated (finish_reason MAX_TOKENS). Warn clearly in that case — the
+        fix is a larger token budget, not a retry.
+        """
+        text = None
+        try:
+            text = response.text
+        except Exception:
+            text = None
+        if not text:                          # fall back to raw candidate parts
+            try:
+                parts = response.candidates[0].content.parts or []
+                text = "".join(getattr(p, "text", "") or "" for p in parts)
+            except Exception:
+                text = ""
+        if self.verbose:
+            try:
+                reason = getattr(response.candidates[0], "finish_reason", None)
+                name = getattr(reason, "name", str(reason))
+                if name == "MAX_TOKENS":
+                    print(f"  [llm] response hit MAX_TOKENS "
+                          f"(budget {self.max_output_tokens}) — likely truncated; "
+                          f"raise max_output_tokens")
+            except Exception:
+                pass
+        return text or ""
 
 
 class ScriptedClient(LLMClient):
@@ -92,11 +122,26 @@ class ScriptedClient(LLMClient):
 # ---------------------------------------------------------------------------
 
 def extract_code_block(text: str, language: str = "python") -> Optional[str]:
-    """First fenced code block; tolerates a missing language tag."""
-    m = re.search(rf"```{language}\s*\n(.*?)```", text, re.DOTALL)
-    if m is None:
-        m = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
-    return m.group(1).strip() if m else None
+    """
+    Extract a fenced code block, tolerantly: any/no language tag and
+    case, `python` or `py`, CRLF, and — importantly for thinking models —
+    a TRUNCATED block whose closing fence never arrived. Falls back to
+    unfenced text that already reads like code.
+    """
+    if not text:
+        return None
+    # Closed fenced block, any/no language tag.
+    m = re.search(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Unclosed fence (truncated response): take everything after it.
+    m = re.search(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n(.*)$", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # No fences at all, but it already looks like code.
+    if "def " in text:
+        return text.strip()
+    return None
 
 
 def extract_json_block(text: str) -> Optional[str]:

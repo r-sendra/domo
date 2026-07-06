@@ -10,6 +10,7 @@ in the worker subprocess with the trainer, never in the caller's process.
 from __future__ import annotations
 
 import math
+import re
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -19,6 +20,11 @@ from domo.llm.client import extract_code_block
 __all__ = ["extract_reward_code", "validate_reward_code", "load_reward_fn"]
 
 REWARD_FN_NAME = "compute_reward"
+
+# torch and math are already provided to the reward namespace; importing them
+# is a harmless no-op that LLMs write by habit, so allow it. Anything else is
+# rejected (the guard against accidental file/network/system access).
+ALLOWED_IMPORTS = {"torch", "math"}
 
 
 def extract_reward_code(llm_response: str) -> Optional[str]:
@@ -30,9 +36,15 @@ def extract_reward_code(llm_response: str) -> Optional[str]:
 
 def validate_reward_code(code: str) -> Optional[str]:
     """Static checks. Returns an error string or None if plausible."""
-    for forbidden in ("import ", "__", "open(", "exec(", "eval("):
+    for forbidden in ("__", "open(", "exec(", "eval(", "subprocess"):
         if forbidden in code:
-            return f"forbidden construct in reward code: '{forbidden.strip()}'"
+            return f"forbidden construct in reward code: '{forbidden}'"
+    # Imports: only torch / math (already in the namespace) are allowed.
+    for m in re.finditer(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][\w.]*)", code):
+        root = m.group(1).split(".")[0]
+        if root not in ALLOWED_IMPORTS:
+            return (f"disallowed import '{root}' — only "
+                    f"{', '.join(sorted(ALLOWED_IMPORTS))} are available")
     try:
         compiled = compile(code, "<reward>", "exec")
     except SyntaxError as e:

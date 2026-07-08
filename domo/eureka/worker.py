@@ -47,23 +47,40 @@ def _build_task(spec, dr_override=None):
     return task_cls(config_cls(**overrides))
 
 
-def _evaluate_success(task, net, episodes: int) -> tuple:
+def _record_stats(records) -> dict:
+    """Aggregate a list of per-episode outcome dicts (or legacy bools)."""
+    if not records:
+        return {"success_rate": 0.0, "fitness": 0.0, "peak_height": 0.0,
+                "ever_upright_rate": 0.0}
+    if isinstance(records[0], dict):
+        n = len(records)
+        return {
+            "success_rate": sum(r["success"] for r in records) / n,
+            "fitness": sum(r.get("fitness", 0.0) for r in records) / n,
+            "peak_height": sum(r.get("peak_height", 0.0) for r in records) / n,
+            "ever_upright_rate": sum(r.get("ever_upright", False)
+                                     for r in records) / n,
+        }
+    # Legacy: list of success bools (fitness == success).
+    rate = sum(bool(r) for r in records) / len(records)
+    return {"success_rate": rate, "fitness": rate, "peak_height": 0.0,
+            "ever_upright_rate": rate}
+
+
+def _evaluate_success(task, net, episodes: int) -> dict:
     """Deterministic rollouts until `episodes` episodes finish."""
     start = len(task.episode_outcomes)
     obs, _ = task.reset()
-    lengths, step_cap = [], episodes * task.max_episode_length + 200
+    step_cap = episodes * task.max_episode_length + 200
     steps = 0
     while len(task.episode_outcomes) - start < episodes and steps < step_cap:
         with torch.no_grad():
             act, _, _ = net.get_action(obs, deterministic=True)
         obs, _, _, reset_buf, _ = task.step(act)
         steps += 1
-        lengths.extend([steps] * int(reset_buf.sum()))
-    outcomes = task.episode_outcomes[start:start + episodes]
-    rate = sum(outcomes) / max(len(outcomes), 1)
-    mean_len = (sum(lengths[:len(outcomes)]) / max(len(outcomes), 1)
-                if lengths else float(task.max_episode_length))
-    return rate, mean_len
+    stats = _record_stats(task.episode_outcomes[start:start + episodes])
+    stats["mean_ep_len"] = float(task.max_episode_length)
+    return stats
 
 
 def _run_train(spec) -> dict:
@@ -98,11 +115,14 @@ def _run_train(spec) -> dict:
         if update % every != 0 and update != total_updates:
             return
         comps = {k: float(v.mean()) for k, v in task.reward_components.items()}
-        recent = task.episode_outcomes[-200:]
+        stats = _record_stats(task.episode_outcomes[-200:])
         snapshots.append({
             "frac": update / total_updates,
             "components": comps,
-            "success_rate": sum(recent) / max(len(recent), 1),
+            "success_rate": stats["success_rate"],
+            "fitness": stats["fitness"],
+            "peak_height": stats["peak_height"],
+            "ever_upright_rate": stats["ever_upright_rate"],
             "mean_ep_len": (float(sum(tr.ep_lengths[-50:]) / max(len(tr.ep_lengths[-50:]), 1))
                             if tr.ep_lengths else 0.0),
         })
@@ -111,10 +131,8 @@ def _run_train(spec) -> dict:
     trainer.train()
 
     ckpt = os.path.join(spec["run_dir"], "checkpoint_final.pt")
-    rate, mean_len = _evaluate_success(task, trainer.net,
-                                       spec.get("eval_episodes", 32))
-    return {"error": None, "success_rate": rate, "mean_ep_len": mean_len,
-            "snapshots": snapshots, "checkpoint": ckpt}
+    stats = _evaluate_success(task, trainer.net, spec.get("eval_episodes", 32))
+    return {"error": None, "snapshots": snapshots, "checkpoint": ckpt, **stats}
 
 
 def _run_dr_eval(spec) -> dict:
@@ -136,11 +154,13 @@ def _run_dr_eval(spec) -> dict:
             task.dr = (DomainRandomization.from_dict(sweep["dr"])
                        if sweep["dr"] else None)
         net_dev = net.to(task.device)
-        rate, mean_len = _evaluate_success(task, net_dev,
-                                           spec.get("eval_episodes", 32))
+        stats = _evaluate_success(task, net_dev, spec.get("eval_episodes", 32))
         results.append({"label": sweep["label"], "dr": sweep["dr"],
-                        "success_rate": rate, "mean_ep_len": mean_len})
-        print(f"  [dr_eval] {sweep['label']}: {rate:.0%}")
+                        "success_rate": stats["success_rate"],
+                        "fitness": stats["fitness"],
+                        "mean_ep_len": stats["mean_ep_len"]})
+        print(f"  [dr_eval] {sweep['label']}: success {stats['success_rate']:.0%} "
+              f"fitness {stats['fitness']:.2f}")
     return {"error": None, "sweeps": results}
 
 

@@ -123,6 +123,9 @@ class CandidateResult:
     index: int
     code: str
     success_rate: float = -1.0
+    fitness: float = 0.0            # dense progress (Eureka F) — ranks candidates
+    peak_height: float = 0.0        # diagnostic: mean peak base height
+    ever_upright_rate: float = 0.0  # diagnostic: fraction that ever stood ≥1 step
     mean_ep_len: float = 0.0
     snapshots: List[dict] = field(default_factory=list)
     checkpoint: Optional[str] = None
@@ -131,6 +134,12 @@ class CandidateResult:
     @property
     def ok(self) -> bool:
         return self.error is None
+
+    @property
+    def rank_key(self):
+        # Rank by binary success first, then the dense fitness proxy — so the
+        # search keeps a gradient even when no candidate has succeeded yet.
+        return (-self.success_rate, -self.fitness, self.mean_ep_len)
 
 
 @dataclass
@@ -141,7 +150,7 @@ class IterationResult:
     @property
     def best(self) -> Optional[CandidateResult]:
         ranked = sorted((c for c in self.candidates if c.ok),
-                        key=lambda c: (-c.success_rate, c.mean_ep_len))
+                        key=lambda c: c.rank_key)
         return ranked[0] if ranked else None
 
 

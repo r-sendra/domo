@@ -111,6 +111,9 @@ def train_candidate(request: SkillLearningRequest, cand: CandidateResult,
     cand.error = results.get("error")
     if cand.ok:
         cand.success_rate = results["success_rate"]
+        cand.fitness = results.get("fitness", results["success_rate"])
+        cand.peak_height = results.get("peak_height", 0.0)
+        cand.ever_upright_rate = results.get("ever_upright_rate", 0.0)
         cand.mean_ep_len = results["mean_ep_len"]
         cand.snapshots = results.get("snapshots", [])
         cand.checkpoint = results.get("checkpoint")
@@ -140,7 +143,9 @@ def run_iteration(request: SkillLearningRequest, task_spec, llm,
         train_candidate(request, cand, it_dir)
         if cand.ok:
             print(f"  iter {it_index + 1} cand {cand.index}: "
-                  f"success {cand.success_rate:.0%}")
+                  f"success {cand.success_rate:.0%} | fitness {cand.fitness:.2f} "
+                  f"| ever-upright {cand.ever_upright_rate:.0%} "
+                  f"| peak-h {cand.peak_height:.2f}m")
         else:
             print(f"  iter {it_index + 1} cand {cand.index}: FAILED")
 
@@ -153,7 +158,7 @@ def select_global_best(history: List[IterationResult]) -> Optional[CandidateResu
     best = None
     for it in history:
         b = it.best
-        if b and (best is None or b.success_rate > best.success_rate):
+        if b and (best is None or b.rank_key < best.rank_key):
             best = b
     return best
 

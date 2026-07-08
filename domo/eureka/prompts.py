@@ -75,14 +75,23 @@ def reward_prompt(request: SkillLearningRequest, task_spec: TaskSpec,
 
 
 def reflection_block(candidates: List[CandidateResult]) -> str:
-    """Eureka-style reward reflection: outcomes + component trajectories."""
+    """
+    Eureka reward reflection: outcomes + component trajectories. Candidates
+    are compared on the DENSE fitness (0–1 progress toward the goal), not
+    only the binary success — so the feedback carries a gradient even when no
+    candidate has fully succeeded yet, plus diagnostics (did the robot ever
+    reach the goal pose, how high did the base get).
+    """
     ok = [c for c in candidates if c.ok]
-    best = max(ok, key=lambda c: c.success_rate) if ok else None
-    lines = ["Candidate outcomes (fixed success metric):"]
+    best = min(ok, key=lambda c: c.rank_key) if ok else None
+    lines = ["Candidate outcomes — ranked by dense fitness (0=no progress, "
+             "1=goal), with the binary success metric alongside:"]
     for c in candidates:
         if c.ok:
-            lines.append(f"  #{c.index}: success {c.success_rate:.0%}, "
-                         f"mean episode length {c.mean_ep_len:.0f} steps")
+            lines.append(
+                f"  #{c.index}: fitness {c.fitness:.2f} | success {c.success_rate:.0%} "
+                f"| ever-reached-goal {c.ever_upright_rate:.0%} "
+                f"| peak base height {c.peak_height:.2f} m")
         else:
             first = (c.error or "").strip().splitlines()
             lines.append(f"  #{c.index}: FAILED to run — {first[-1] if first else 'error'}")
@@ -91,20 +100,33 @@ def reflection_block(candidates: List[CandidateResult]) -> str:
                      "fields, wrong tensor shapes, python-level loops.")
         return "\n".join(lines)
 
-    lines.append(f"\nBest candidate was #{best.index}. Its code:")
+    if best.success_rate == 0.0:
+        lines.append(
+            "\nNOTE: no candidate reached the success threshold yet. Judge "
+            "progress by fitness / peak height / ever-reached-goal, and reshape "
+            "the reward so the robot makes MORE progress toward the upright, "
+            "raised posture — stronger/denser shaping of uprightness and base "
+            "height, and terms that reward intermediate progress (pushing the "
+            "base up, tucking legs under the body), not only the final pose.")
+
+    lines.append(f"\nBest candidate was #{best.index} (fitness {best.fitness:.2f}). "
+                 f"Its code:")
     lines.append(f"```python\n{best.code}\n```")
     if best.snapshots:
-        lines.append("Its reward components during training "
+        lines.append("Its signals during training "
                      "(mean per env-step at ~equal intervals):")
         names = sorted(best.snapshots[-1].get("components", {}))
         for name in names:
             series = [f"{s['components'].get(name, 0.0):+.4f}"
                       for s in best.snapshots]
             lines.append(f"  {name:>20s}: {' → '.join(series)}")
-        succ = [f"{s.get('success_rate', 0.0):.0%}" for s in best.snapshots]
-        lens = [f"{s.get('mean_ep_len', 0.0):.0f}" for s in best.snapshots]
-        lines.append(f"  {'success rate':>20s}: {' → '.join(succ)}")
-        lines.append(f"  {'episode length':>20s}: {' → '.join(lens)}")
+        for key, label, fmt in [("fitness", "fitness (0-1)", "{:.2f}"),
+                                ("peak_height", "peak height (m)", "{:.2f}"),
+                                ("ever_upright_rate", "ever-reached-goal", "{:.0%}"),
+                                ("success_rate", "success rate", "{:.0%}"),
+                                ("mean_ep_len", "episode length", "{:.0f}")]:
+            series = [fmt.format(s.get(key, 0.0)) for s in best.snapshots]
+            lines.append(f"  {label:>20s}: {' → '.join(series)}")
     return "\n".join(lines)
 
 

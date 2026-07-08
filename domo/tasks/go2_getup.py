@@ -65,20 +65,22 @@ def build_getup_observation(state: RobotState, default_dof_pos: torch.Tensor,
 class Go2GetUpConfig:
     n_envs: int = 4096
     dt: float = 0.02
-    max_episode_steps: int = 250          # 5 s to get up
+    max_episode_steps: int = 400          # 8 s to get up (was 5 s — too tight)
     device: str = "cuda"
     headless: bool = True
     engine: str = "genesis"
 
     # Control
-    action_scale: float = 0.35
+    action_scale: float = 0.5             # wider joint range for the flip-up
     clip_actions: float = 100.0
     kp: float = 100.0
     kd: float = 2.0
 
-    # Fallen spawn
+    # Fallen spawn. |roll| range excludes the near-inverted (belly-up) poses
+    # that are nearly impossible to bootstrap from scratch; a real curriculum
+    # can widen this once a base policy exists.
     spawn_height: float = 0.18
-    spawn_roll_range: Tuple[float, float] = (math.pi / 2, math.pi)  # |roll|
+    spawn_roll_range: Tuple[float, float] = (math.pi / 3, 5 * math.pi / 6)  # 60°–150°
     spawn_joint_noise: float = 0.3        # rad, around default angles
 
     # Fixed success metric (reward-independent)
@@ -121,7 +123,12 @@ class Go2GetUpTask(VecTask):
         self.actions = torch.zeros((N, self.ACT_DIM), device=device, dtype=f)
         self.last_actions = torch.zeros_like(self.actions)
         self._hold = torch.zeros((N,), device=device, dtype=torch.int32)
-        # Rolling episode outcome stats (read by evaluation/workers)
+        # Per-episode progress trackers (dense fitness + diagnostics).
+        self._max_fitness = torch.zeros((N,), device=device, dtype=f)
+        self._peak_height = torch.zeros((N,), device=device, dtype=f)
+        self._ever_upright = torch.zeros((N,), device=device, dtype=torch.bool)
+        # Rolling per-episode records: dict(success, fitness, peak_height,
+        # ever_upright). Read by evaluation/workers.
         self.episode_outcomes: list = []
 
         print(f"\n{'=' * 58}")
@@ -145,6 +152,22 @@ class Go2GetUpTask(VecTask):
         upright &= state.base_euler[:, 1].abs() < self.cfg.success_tilt
         return upright
 
+    def compute_fitness(self) -> torch.Tensor:
+        """
+        Dense, reward-independent progress in [0, 1] — Eureka's fitness F.
+        The binary success metric is too sparse to rank reward candidates
+        before any of them fully succeeds; this continuous proxy (how
+        upright AND how high the base is) gives the evolutionary search a
+        gradient to climb from the very first iteration.
+          uprightness: 1 when the base z-axis points up, 0 on its side.
+          height:      base height as a fraction of the success height.
+        """
+        state = self.robot.state
+        uprightness = torch.clamp(-state.projected_gravity[:, 2], 0.0, 1.0)
+        height = torch.clamp(state.base_pos[:, 2] / self.cfg.success_height,
+                             0.0, 1.0)
+        return uprightness * height
+
     def step(self, actions: torch.Tensor):
         cfg = self.cfg
         state = self.robot.state
@@ -157,21 +180,30 @@ class Go2GetUpTask(VecTask):
         self.episode_length_buf += 1
         self.robot.refresh()
 
-        # Success hold counter (the fixed metric)
+        # Dense progress (Eureka fitness) + binary success metric.
+        fitness = self.compute_fitness()
+        self._max_fitness = torch.maximum(self._max_fitness, fitness)
+        self._peak_height = torch.maximum(self._peak_height, state.base_pos[:, 2])
         upright = self.compute_success()
+        self._ever_upright |= upright
         self._hold = torch.where(upright, self._hold + 1,
                                  torch.zeros_like(self._hold))
         succeeded = self._hold >= cfg.success_hold_steps
 
         # Termination: success or timeout (no fall termination — the robot
-        # STARTS fallen; thrashing simply wastes its 5 s budget).
+        # STARTS fallen; thrashing simply wastes its budget).
         timeout = self.episode_length_buf > self.max_episode_length
         self.reset_buf = succeeded | timeout
 
         self.extras["time_outs"] = timeout.float()
         self.extras["success"] = succeeded.float()
         for idx in self.reset_buf.nonzero(as_tuple=False).flatten():
-            self.episode_outcomes.append(bool(succeeded[idx]))
+            self.episode_outcomes.append({
+                "success": bool(succeeded[idx]),
+                "fitness": float(self._max_fitness[idx]),
+                "peak_height": float(self._peak_height[idx]),
+                "ever_upright": bool(self._ever_upright[idx]),
+            })
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
 
@@ -233,6 +265,9 @@ class Go2GetUpTask(VecTask):
 
         self.last_actions[envs_idx] = 0.0
         self._hold[envs_idx] = 0
+        self._max_fitness[envs_idx] = 0.0
+        self._peak_height[envs_idx] = 0.0
+        self._ever_upright[envs_idx] = False
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
         self.log_episode_sums(envs_idx, self.episode_length_s)

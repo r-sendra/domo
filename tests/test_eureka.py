@@ -192,6 +192,45 @@ def test_langgraph_pipeline_structure():
     assert {"iterate", "select", "dr", "finish"} <= nodes
 
 
+def test_dense_fitness_breaks_zero_success_ties():
+    # Two candidates, both 0% success, different dense fitness → the one that
+    # made more progress must rank first (the fix for the flat-search bug).
+    a = CandidateResult(index=0, code="a", success_rate=0.0, fitness=0.12)
+    b = CandidateResult(index=1, code="b", success_rate=0.0, fitness=0.47)
+    it = IterationResult(index=0, candidates=[a, b])
+    assert it.best is b
+    # success still dominates fitness when present
+    c = CandidateResult(index=2, code="c", success_rate=0.3, fitness=0.05)
+    it2 = IterationResult(index=1, candidates=[a, b, c])
+    assert it2.best is c
+
+
+def test_record_stats_dicts_and_legacy():
+    from domo.eureka.worker import _record_stats
+    recs = [{"success": True, "fitness": 1.0, "peak_height": 0.30, "ever_upright": True},
+            {"success": False, "fitness": 0.4, "peak_height": 0.15, "ever_upright": False}]
+    s = _record_stats(recs)
+    assert s["success_rate"] == 0.5
+    assert abs(s["fitness"] - 0.7) < 1e-6
+    assert s["ever_upright_rate"] == 0.5
+    # legacy list-of-bools still parses (fitness mirrors success)
+    s2 = _record_stats([True, False, False])
+    assert abs(s2["success_rate"] - 1 / 3) < 1e-6 and s2["fitness"] == s2["success_rate"]
+
+
+def test_reflection_uses_fitness_when_no_success():
+    good = CandidateResult(index=0, code=GOOD_CODE, success_rate=0.0,
+                           fitness=0.42, peak_height=0.22, ever_upright_rate=0.1,
+                           snapshots=[{"frac": 1.0, "components": {"up": 0.4},
+                                       "success_rate": 0.0, "fitness": 0.42,
+                                       "peak_height": 0.22, "ever_upright_rate": 0.1,
+                                       "mean_ep_len": 400}])
+    worse = CandidateResult(index=1, code="x", success_rate=0.0, fitness=0.05)
+    text = reflection_block([good, worse])
+    assert "fitness 0.42" in text and "no candidate reached" in text
+    assert "Best candidate was #0" in text          # chosen by fitness, not success
+
+
 # ---------------------------------------------------------------------------
 # Reward override on a VecTask (no physics: exercise base-class machinery)
 # ---------------------------------------------------------------------------

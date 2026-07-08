@@ -114,6 +114,7 @@ def train_candidate(request: SkillLearningRequest, cand: CandidateResult,
         cand.fitness = results.get("fitness", results["success_rate"])
         cand.peak_height = results.get("peak_height", 0.0)
         cand.ever_upright_rate = results.get("ever_upright_rate", 0.0)
+        cand.max_hold = results.get("max_hold", 0.0)
         cand.mean_ep_len = results["mean_ep_len"]
         cand.snapshots = results.get("snapshots", [])
         cand.checkpoint = results.get("checkpoint")
@@ -145,7 +146,8 @@ def run_iteration(request: SkillLearningRequest, task_spec, llm,
             print(f"  iter {it_index + 1} cand {cand.index}: "
                   f"success {cand.success_rate:.0%} | fitness {cand.fitness:.2f} "
                   f"| ever-upright {cand.ever_upright_rate:.0%} "
-                  f"| peak-h {cand.peak_height:.2f}m")
+                  f"| peak-h {cand.peak_height:.2f}m "
+                  f"| hold {cand.max_hold:.0f}/{25}")
         else:
             print(f"  iter {it_index + 1} cand {cand.index}: FAILED")
 

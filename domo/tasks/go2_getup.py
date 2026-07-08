@@ -83,10 +83,14 @@ class Go2GetUpConfig:
     spawn_roll_range: Tuple[float, float] = (math.pi / 3, 5 * math.pi / 6)  # 60°–150°
     spawn_joint_noise: float = 0.3        # rad, around default angles
 
-    # Fixed success metric (reward-independent)
+    # Fixed success metric (reward-independent). Standing height is ~0.32 m,
+    # so 0.26 m is reachable with margin. Hold is 0.5 s: a just-righted robot
+    # can rarely hold a full second, and "stood up and stayed up half a
+    # second" is still a legitimate success — this lets the metric register
+    # for a policy that demonstrably reaches the pose.
     success_height: float = 0.26
     success_tilt: float = 0.4             # rad, roll AND pitch
-    success_hold_steps: int = 50          # 1 s upright
+    success_hold_steps: int = 25          # 0.5 s upright (was 50 / 1 s)
 
     # Domain randomization (serialised as dict for checkpoints/specs)
     dr: Optional[dict] = None
@@ -127,6 +131,7 @@ class Go2GetUpTask(VecTask):
         self._max_fitness = torch.zeros((N,), device=device, dtype=f)
         self._peak_height = torch.zeros((N,), device=device, dtype=f)
         self._ever_upright = torch.zeros((N,), device=device, dtype=torch.bool)
+        self._max_hold = torch.zeros((N,), device=device, dtype=torch.int32)
         # Rolling per-episode records: dict(success, fitness, peak_height,
         # ever_upright). Read by evaluation/workers.
         self.episode_outcomes: list = []
@@ -188,6 +193,7 @@ class Go2GetUpTask(VecTask):
         self._ever_upright |= upright
         self._hold = torch.where(upright, self._hold + 1,
                                  torch.zeros_like(self._hold))
+        self._max_hold = torch.maximum(self._max_hold, self._hold)
         succeeded = self._hold >= cfg.success_hold_steps
 
         # Termination: success or timeout (no fall termination — the robot
@@ -203,6 +209,7 @@ class Go2GetUpTask(VecTask):
                 "fitness": float(self._max_fitness[idx]),
                 "peak_height": float(self._peak_height[idx]),
                 "ever_upright": bool(self._ever_upright[idx]),
+                "max_hold": int(self._max_hold[idx]),
             })
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
@@ -265,6 +272,7 @@ class Go2GetUpTask(VecTask):
 
         self.last_actions[envs_idx] = 0.0
         self._hold[envs_idx] = 0
+        self._max_hold[envs_idx] = 0
         self._max_fitness[envs_idx] = 0.0
         self._peak_height[envs_idx] = 0.0
         self._ever_upright[envs_idx] = False

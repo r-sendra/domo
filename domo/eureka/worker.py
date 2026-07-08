@@ -51,7 +51,7 @@ def _record_stats(records) -> dict:
     """Aggregate a list of per-episode outcome dicts (or legacy bools)."""
     if not records:
         return {"success_rate": 0.0, "fitness": 0.0, "peak_height": 0.0,
-                "ever_upright_rate": 0.0}
+                "ever_upright_rate": 0.0, "max_hold": 0.0}
     if isinstance(records[0], dict):
         n = len(records)
         return {
@@ -60,6 +60,7 @@ def _record_stats(records) -> dict:
             "peak_height": sum(r.get("peak_height", 0.0) for r in records) / n,
             "ever_upright_rate": sum(r.get("ever_upright", False)
                                      for r in records) / n,
+            "max_hold": sum(r.get("max_hold", 0) for r in records) / n,
         }
     # Legacy: list of success bools (fitness == success).
     rate = sum(bool(r) for r in records) / len(records)

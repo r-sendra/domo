@@ -126,6 +126,7 @@ class CandidateResult:
     fitness: float = 0.0            # dense progress (Eureka F) — ranks candidates
     peak_height: float = 0.0        # diagnostic: mean peak base height
     ever_upright_rate: float = 0.0  # diagnostic: fraction that ever stood ≥1 step
+    max_hold: float = 0.0           # diagnostic: mean longest upright streak (steps)
     mean_ep_len: float = 0.0
     snapshots: List[dict] = field(default_factory=list)
     checkpoint: Optional[str] = None

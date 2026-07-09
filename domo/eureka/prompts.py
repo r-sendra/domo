@@ -101,13 +101,28 @@ def reflection_block(candidates: List[CandidateResult]) -> str:
         return "\n".join(lines)
 
     if best.success_rate == 0.0:
-        lines.append(
-            "\nNOTE: no candidate reached the success threshold yet. Judge "
-            "progress by fitness / peak height / ever-reached-goal, and reshape "
-            "the reward so the robot makes MORE progress toward the upright, "
-            "raised posture — stronger/denser shaping of uprightness and base "
-            "height, and terms that reward intermediate progress (pushing the "
-            "base up, tucking legs under the body), not only the final pose.")
+        # Distinguish the two failure regimes from the diagnostics so the
+        # reward fix is targeted, not generic.
+        if best.ever_upright_rate > 0.05 and best.max_hold < 8:
+            lines.append(
+                f"\nDIAGNOSIS: the robot REACHES the goal pose "
+                f"({best.ever_upright_rate:.0%} of episodes) but does NOT HOLD it "
+                f"(longest upright streak only {best.max_hold:.0f} steps, needs "
+                f"~25). It is passing THROUGH the upright pose ballistically and "
+                f"toppling. Fix: add a strong term rewarding STAYING upright at "
+                f"LOW base linear AND angular velocity — i.e. settling to rest in "
+                f"the standing stance — gated on being upright and at height. "
+                f"Reward sustained low-velocity uprightness, not just reaching it. "
+                f"A settled-standing bonus (upright × tall × still) weighted "
+                f"heavily will convert reaches into holds.")
+        else:
+            lines.append(
+                "\nNOTE: no candidate reached the success threshold yet. Judge "
+                "progress by fitness / peak height / ever-reached-goal, and "
+                "reshape the reward so the robot makes MORE progress toward the "
+                "upright, raised posture — stronger shaping of uprightness and "
+                "base height, and terms that reward intermediate progress "
+                "(pushing the base up, tucking legs under the body).")
 
     lines.append(f"\nBest candidate was #{best.index} (fitness {best.fitness:.2f}). "
                  f"Its code:")

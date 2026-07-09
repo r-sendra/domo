@@ -128,7 +128,11 @@ class Go2GetUpTask(VecTask):
         self.last_actions = torch.zeros_like(self.actions)
         self._hold = torch.zeros((N,), device=device, dtype=torch.int32)
         # Per-episode progress trackers (dense fitness + diagnostics).
-        self._max_fitness = torch.zeros((N,), device=device, dtype=f)
+        # Fitness is the time-AVERAGE of the progress signal (dwell), not its
+        # peak: a ballistic lunge that touches the goal for one frame must
+        # score LOWER than a policy that stands and holds, so the search
+        # gradient points at staying upright, not spiking through it.
+        self._fitness_sum = torch.zeros((N,), device=device, dtype=f)
         self._peak_height = torch.zeros((N,), device=device, dtype=f)
         self._ever_upright = torch.zeros((N,), device=device, dtype=torch.bool)
         self._max_hold = torch.zeros((N,), device=device, dtype=torch.int32)
@@ -187,7 +191,7 @@ class Go2GetUpTask(VecTask):
 
         # Dense progress (Eureka fitness) + binary success metric.
         fitness = self.compute_fitness()
-        self._max_fitness = torch.maximum(self._max_fitness, fitness)
+        self._fitness_sum += fitness                      # time-integrated (dwell)
         self._peak_height = torch.maximum(self._peak_height, state.base_pos[:, 2])
         upright = self.compute_success()
         self._ever_upright |= upright
@@ -204,9 +208,10 @@ class Go2GetUpTask(VecTask):
         self.extras["time_outs"] = timeout.float()
         self.extras["success"] = succeeded.float()
         for idx in self.reset_buf.nonzero(as_tuple=False).flatten():
+            steps = max(int(self.episode_length_buf[idx]), 1)
             self.episode_outcomes.append({
                 "success": bool(succeeded[idx]),
-                "fitness": float(self._max_fitness[idx]),
+                "fitness": float(self._fitness_sum[idx]) / steps,  # time-avg dwell
                 "peak_height": float(self._peak_height[idx]),
                 "ever_upright": bool(self._ever_upright[idx]),
                 "max_hold": int(self._max_hold[idx]),
@@ -273,7 +278,7 @@ class Go2GetUpTask(VecTask):
         self.last_actions[envs_idx] = 0.0
         self._hold[envs_idx] = 0
         self._max_hold[envs_idx] = 0
-        self._max_fitness[envs_idx] = 0.0
+        self._fitness_sum[envs_idx] = 0.0
         self._peak_height[envs_idx] = 0.0
         self._ever_upright[envs_idx] = False
         self.episode_length_buf[envs_idx] = 0

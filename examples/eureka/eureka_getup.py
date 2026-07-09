@@ -48,27 +48,39 @@ REQUEST_DESCRIPTION = (
     "or joint-limit slamming).")
 
 # A reasonable hand-written reward, used by --llm scripted so the whole
-# pipeline runs offline. It doubles as a baseline for Gemini's candidates.
+# pipeline runs offline. It doubles as a baseline for the LLM's candidates.
+# The key term is `settled`: a large bonus for being upright AND tall AND at
+# rest, so the policy is driven to STAND AND HOLD rather than lunge through
+# the pose (the ballistic-overshoot failure the diagnostics revealed).
 SCRIPTED_REWARD = '''\
 Here is a reward function for the get-up task:
 
 ```python
 def compute_reward(task):
     state = task.robot.state
-    up = -state.projected_gravity[:, 2]              # 1 when upright
-    uprightness = torch.clamp(up, 0.0, 1.0) ** 2
-    height = torch.clamp(state.base_pos[:, 2] / 0.30, 0.0, 1.2)
-    posture = torch.exp(-1.0 * (state.dof_pos
-                                - task.robot.default_dof_pos).abs().sum(-1))
-    still = torch.exp(-0.5 * state.base_ang_vel.norm(dim=-1)) * uprightness
+    up = torch.clamp(-state.projected_gravity[:, 2], 0.0, 1.0)   # 1 when upright
+    uprightness = up ** 2
+    height = torch.clamp(state.base_pos[:, 2] / 0.30, 0.0, 1.0)
+    posture = torch.exp(-(state.dof_pos - task.robot.default_dof_pos)
+                        .abs().sum(-1))
+
+    # Velocity of the base — low when settled at rest.
+    lin_v = state.base_lin_vel.norm(dim=-1)
+    ang_v = state.base_ang_vel.norm(dim=-1)
+    at_rest = torch.exp(-1.5 * lin_v - 0.5 * ang_v)
+
+    # THE goal term: upright, tall AND still, all at once. Heavily weighted so
+    # holding the settled stance dominates a one-frame ballistic peak.
+    settled = 4.0 * uprightness * height * at_rest
+
     energy = -0.0005 * (task.actions - task.last_actions).pow(2).sum(-1)
-    total = (1.5 * uprightness + 1.0 * height * uprightness
-             + 0.5 * posture * uprightness + 0.5 * still + energy)
+    total = (1.0 * uprightness + 1.0 * height * uprightness
+             + 0.5 * posture * uprightness + settled + energy)
     return total, {
-        "uprightness": 1.5 * uprightness,
+        "uprightness": 1.0 * uprightness,
         "height": 1.0 * height * uprightness,
         "posture": 0.5 * posture * uprightness,
-        "stillness": 0.5 * still,
+        "settled": settled,
         "energy": energy,
     }
 ```'''

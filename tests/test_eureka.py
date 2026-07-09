@@ -219,16 +219,24 @@ def test_record_stats_dicts_and_legacy():
 
 
 def test_reflection_uses_fitness_when_no_success():
+    # Progress but never reaches the goal → generic "make more progress" note.
     good = CandidateResult(index=0, code=GOOD_CODE, success_rate=0.0,
-                           fitness=0.42, peak_height=0.22, ever_upright_rate=0.1,
-                           snapshots=[{"frac": 1.0, "components": {"up": 0.4},
-                                       "success_rate": 0.0, "fitness": 0.42,
-                                       "peak_height": 0.22, "ever_upright_rate": 0.1,
-                                       "mean_ep_len": 400}])
+                           fitness=0.42, peak_height=0.22, ever_upright_rate=0.0,
+                           max_hold=0.0)
     worse = CandidateResult(index=1, code="x", success_rate=0.0, fitness=0.05)
     text = reflection_block([good, worse])
     assert "fitness 0.42" in text and "no candidate reached" in text
     assert "Best candidate was #0" in text          # chosen by fitness, not success
+
+
+def test_reflection_diagnoses_ballistic_hold_failure():
+    # Reaches the goal often but holds ~1 step → targeted "settle" diagnosis.
+    c = CandidateResult(index=0, code=GOOD_CODE, success_rate=0.0,
+                        fitness=0.5, peak_height=0.31, ever_upright_rate=0.28,
+                        max_hold=1.0)
+    text = reflection_block([c])
+    assert "REACHES the goal pose" in text and "does NOT HOLD" in text
+    assert "velocity" in text and "settl" in text.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -184,6 +184,12 @@ class LayerNode(ExecNode):
         targets = self.base.update(state, dt, extra_cmd=total)
 
         self.status = self.base.status
+        # A goal-directed command skill (e.g. navigation) can complete the
+        # layer on its own once every env reaches the goal.
+        done = self.top_skill.success_flags(state)
+        if self.status == RUNNING and done is not None and bool(done.all()):
+            self.status = SUCCESS
+            self.ctx.log(f"{self.top_name} → SUCCESS (goal reached)")
         fail = _eval_conds(self.top_fail_conds, state, self.t_local)
         if fail is not None and bool(fail.any()):
             self.status = FAILURE

@@ -130,6 +130,13 @@ class SimulatedLidar(ExteroceptiveSensor):
             model.max_range, device=device)
         self._sectors = torch.full(
             (n_envs, n_sectors), model.max_range, device=device)
+        # Per-beam world-frame hit points + validity (populated if the sim
+        # backend exposes them; enables 3D reconstruction / dense mapping).
+        n_beams = model.n_vertical * model.n_horizontal
+        self._points = torch.zeros((n_envs, n_beams, 3), device=device)
+        self._points_valid = torch.zeros((n_envs, n_beams), dtype=torch.bool,
+                                         device=device)
+        self._has_points = True
 
     @property
     def update_interval(self) -> int:
@@ -162,12 +169,32 @@ class SimulatedLidar(ExteroceptiveSensor):
         self._sectors = ranges.min(dim=1).values.view(
             n_env, self.n_sectors, per_sector).min(dim=2).values
 
+        # World-frame points (for 3D reconstruction), with the same device
+        # imperfections applied to their validity as no-returns / dropout.
+        if self._has_points:
+            try:
+                pts, prng = self._handle.read_points()
+            except NotImplementedError:
+                self._has_points = False
+            else:
+                valid = (prng > m.min_range) & (prng < m.max_range)
+                if m.dropout_prob > 0.0:
+                    valid = valid & (torch.rand_like(prng) >= m.dropout_prob)
+                self._points, self._points_valid = pts, valid
+
     def read(self) -> torch.Tensor:
         return self._sectors
 
     def read_raw(self) -> torch.Tensor:
         return self._raw
 
+    def read_points(self):
+        """World-frame hit points [N, n_beams, 3] and a validity mask
+        [N, n_beams] (True = a real return, no-returns/dropouts removed)."""
+        return self._points, self._points_valid
+
     def reset_idx(self, envs_idx: torch.Tensor) -> None:
         self._raw[envs_idx] = self.max_range
         self._sectors[envs_idx] = self.max_range
+        self._points[envs_idx] = 0.0
+        self._points_valid[envs_idx] = False

@@ -17,6 +17,7 @@ import genesis as gs
 
 from .base import (
     Articulation,
+    CameraHandle,
     LidarConfig,
     LidarSensorHandle,
     PhysicsEngine,
@@ -198,6 +199,30 @@ class GenesisLidar(LidarSensorHandle):
             ranges = flat.view(n_env, cfg.n_vertical, cfg.n_horizontal)
         return torch.clamp(ranges, 0.0, cfg.max_range)
 
+    def read_points(self):
+        """World-frame hit points [N, n_beams, 3] + ranges [N, n_beams].
+        Genesis returns the sensor in world frame (return_world_frame=True);
+        beam (horizontal/vertical) layout is irrelevant once flattened."""
+        data = self._sensor.read()
+        pts = data.points                              # [N, n_h, n_v, 3]
+        rng = data.distances                           # [N, n_h, n_v]
+        n_env = pts.shape[0]
+        return (pts.reshape(n_env, -1, 3).to(self._device),
+                torch.clamp(rng.reshape(n_env, -1), 0.0,
+                            self.config.max_range).to(self._device))
+
+
+class GenesisCamera(CameraHandle):
+    """Offscreen RGB camera; render() returns a uint8 [H, W, 3] frame."""
+
+    def __init__(self, cam):
+        self._cam = cam
+
+    def render(self):
+        out = self._cam.render()             # (rgb, depth, seg, normal)
+        rgb = out[0] if isinstance(out, tuple) else out
+        return rgb
+
 
 # ---------------------------------------------------------------------------
 # Scene
@@ -284,6 +309,12 @@ class GenesisScene(Scene):
             draw_debug=cfg.draw_debug,
         ))
         return GenesisLidar(sensor, cfg, self._device)
+
+    def add_camera(self, res=(320, 240), pos=(3.0, -3.0, 2.0),
+                   lookat=(0.0, 0.0, 0.3), fov: float = 50.0) -> CameraHandle:
+        cam = self._scene.add_camera(res=tuple(res), pos=tuple(pos),
+                                     lookat=tuple(lookat), fov=fov, GUI=False)
+        return GenesisCamera(cam)
 
     def build(self, n_envs: int) -> None:
         self._scene.build(n_envs=n_envs)

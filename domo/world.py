@@ -67,6 +67,12 @@ class WorldConfig:
         default_factory=generic_sector_lidar)
     lidar_sectors: int = 36
 
+    # Optional offscreen dashboard camera (None → none). (w, h) resolution.
+    # Rendering it costs frame time — twin/eval viz only, never training.
+    camera_res: Optional[Tuple[int, int]] = None
+    camera_pos: Tuple[float, float, float] = (4.0, -4.0, 3.0)
+    camera_lookat: Tuple[float, float, float] = (0.0, 0.0, 0.3)
+
 
 class World:
     """Engine + scene + robot + sensors, built and bound. Goal-free."""
@@ -115,6 +121,13 @@ class World:
         if cfg.lidar_model is not None:
             lidar_handle = self.scene.add_lidar(
                 self.robot.articulation, cfg.lidar_model.to_lidar_config())
+
+        # Optional dashboard camera (must be added before build).
+        self.camera = None
+        if cfg.camera_res is not None:
+            self.camera = self.scene.add_camera(
+                res=cfg.camera_res, pos=cfg.camera_pos,
+                lookat=cfg.camera_lookat, fov=cfg.viewer.camera_fov)
 
         self.scene.build(n_envs)
         self.robot.bind(n_envs)

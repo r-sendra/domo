@@ -2,8 +2,8 @@
 Engine-agnostic simulation interfaces.
 
 This module defines the *only* contract the rest of DOMO is allowed to code
-against. Concrete physics engines (Genesis today; MuJoCo, Isaac, or the real
-robot's state-publishing stack tomorrow) implement these ABCs in their own
+against. Concrete physics engines (Genesis; MuJoCo, Isaac, or the real
+robot's state-publishing) implement these ABCs in their own
 backend module and register themselves in `domo.sim` — nothing outside
 `domo/sim/` may import a physics package directly.
 
@@ -196,6 +196,26 @@ class LidarSensorHandle(ABC):
         `config.max_range`. Channel 0 is the lowest-elevation beam.
         """
 
+    def read_points(self):
+        """
+        World-frame hit points and their ranges for every beam:
+        points [n_envs, n_beams, 3], ranges [n_envs, n_beams]
+        (n_beams = n_horizontal × n_vertical, flattened). Beams that did not
+        hit a surface within max_range are still present — mask them with the
+        returned ranges (>= max_range ⇒ no return). Optional: backends that do
+        not expose per-beam points raise NotImplementedError.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose per-beam points")
+
+
+class CameraHandle(ABC):
+    """Offscreen RGB camera for visualisation. `render()` costs frame time."""
+
+    @abstractmethod
+    def render(self):
+        """Return the latest RGB frame as a uint8 array [H, W, 3]."""
+
 
 # ---------------------------------------------------------------------------
 # Scene & engine
@@ -247,6 +267,17 @@ class Scene(ABC):
 
     @abstractmethod
     def add_lidar(self, articulation: Articulation, cfg: LidarConfig) -> LidarSensorHandle: ...
+
+    def add_camera(self, res=(320, 240), pos=(3.0, -3.0, 2.0),
+                   lookat=(0.0, 0.0, 0.3), fov: float = 50.0) -> "CameraHandle":
+        """
+        Optional offscreen RGB camera for visualisation (e.g. the dashboard's
+        'Genesis window'). Must be called BEFORE build(). Backends that do not
+        support it raise NotImplementedError. NOT part of the sim contract —
+        rendering it costs frame time, so it is only for twin/eval viz.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no offscreen camera")
 
     @abstractmethod
     def build(self, n_envs: int) -> None: ...

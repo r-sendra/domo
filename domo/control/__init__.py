@@ -11,7 +11,9 @@ from .kinematics import LegKinematics, leg_fk, leg_ik
 from .loop import RealControlLoop, SimControlLoop
 from .navigation import NavConfig, PositionController
 from .skill import (CommandSkill, CPGLocomotionSkill, LearnedJointSkill,
-                    LidarAvoidanceSkill, Skill, StandSkill)
+                    LidarAvoidanceSkill, NavGains, Skill, StandSkill,
+                    TrajectoryTrackingSkill)
+from .slam import SlamConfig, SlamSkill
 
 __all__ = [
     "CPGConfig", "CPGLegController", "CPGOscillators",
@@ -20,6 +22,8 @@ __all__ = [
     "NavConfig", "PositionController",
     "Skill", "StandSkill", "CPGLocomotionSkill", "LearnedJointSkill",
     "CommandSkill", "LidarAvoidanceSkill",
+    "NavGains", "TrajectoryTrackingSkill",
+    "SlamConfig", "SlamSkill",
     "Controller", "SingleSkillController",
     "SimControlLoop", "RealControlLoop",
 ]

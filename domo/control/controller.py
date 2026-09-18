@@ -98,7 +98,7 @@ class Controller(ABC):
 
 
 class SingleSkillController(Controller):
-    """Run exactly one skill forever — the Paper-1 'execute this skill' case."""
+    """Run exactly one skill forever. """
 
     def __init__(self, skill: Skill, name: str = None):
         name = name or skill.name

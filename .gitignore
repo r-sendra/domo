@@ -93,3 +93,6 @@ multirun/
 .ruff_cache/
 .coverage
 htmlcov/
+
+# ── Local-only helper scripts (not tracked) ───────────────────────────
+/pull_eureka.sh

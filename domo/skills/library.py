@@ -157,11 +157,16 @@ class SkillLibrary:
                         f"cannot layer '{top.name}' (drives '{channel}') on "
                         f"'{base_card.name}' (accepts "
                         f"'{base_card.accepts or 'nothing'}')")
-                top_skill = instance(top.name)
+                # Command skills carry per-occurrence goal state (e.g. a nav
+                # target), so each '@' gets its own instance — never shared —
+                # and the grammar's parameters are applied to it.
+                top_skill = self._factories[top.name]()
                 if not isinstance(top_skill, CommandSkill):
                     raise CompileError(
                         f"'{top.name}' card says {top_card.interface} but the "
                         f"instance is not a CommandSkill")
+                top_skill.configure(**top.params)
+                instances[f"{top.name}#{len(instances)}"] = top_skill
                 return LayerNode(ctx, top.name, top_skill, top_card,
                                  conds(top_card.fail_when), base)
 

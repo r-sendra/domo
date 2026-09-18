@@ -21,6 +21,7 @@ and on the real robot.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
@@ -29,7 +30,8 @@ from .cpg import CPGConfig, CPGLegController, build_cpg_observation, CPG_OBS_SCA
 from .kinematics import LegKinematics
 
 __all__ = ["Skill", "StandSkill", "CPGLocomotionSkill",
-           "CommandSkill", "LidarAvoidanceSkill", "LearnedJointSkill"]
+           "CommandSkill", "LidarAvoidanceSkill", "LearnedJointSkill",
+           "NavGains", "TrajectoryTrackingSkill"]
 
 
 class Skill(ABC):
@@ -167,7 +169,25 @@ class CommandSkill(Skill):
     """
 
     channel: str = "velocity"     # must match the base skill's accepted channel
-    additive: bool = True
+    additive: bool = True         # True: add to base command; False: author it
+
+    def configure(self, **params) -> None:
+        """
+        Apply grammar parameters (`skill(a=..., b=...)`) to this instance at
+        compile time. Grammar values are floats. Default: no parameters.
+        """
+        if params:
+            raise TypeError(
+                f"{type(self).__name__} takes no parameters (got {params})")
+
+    def success_flags(self, state) -> Optional[torch.Tensor]:
+        """
+        Optional per-env completion signal [N] (bool). When a layered command
+        skill returns all-True, the hosting LayerNode reports SUCCESS — this is
+        how a goal-directed command skill (e.g. navigation) terminates a
+        composition. Default None = "never succeeds on its own".
+        """
+        return None
 
     @abstractmethod
     def update_command(self, state, dt: float) -> torch.Tensor:
@@ -215,3 +235,143 @@ class LidarAvoidanceSkill(CommandSkill):
         with torch.no_grad():
             raw = self.policy_fn(obs)
         return torch.tanh(raw) * self._delta
+
+
+@dataclass
+class NavGains:
+    """P gains + limits for TrajectoryTrackingSkill (merged from NavConfig)."""
+    kp_par: float = 1.0       # along-track: remaining distance → forward speed
+    kp_perp: float = 1.2      # cross-track: lateral deviation → sideways speed
+    kp_ang: float = 1.5       # heading error → yaw rate
+    min_speed: float = 0.3    # along-track floor while en route: keeps the
+                              # command above the locomotion policy's deadband
+                              # so it never stalls short of the target
+    max_vy: float = 0.4       # |lateral correction| cap (m/s)
+    max_vyaw: float = 1.0     # |yaw rate| cap (rad/s)
+    tol_pos: float = 0.2      # m — target reached
+
+
+class TrajectoryTrackingSkill(CommandSkill):
+    """
+    Straight-line navigation as a velocity-command AUTHOR.
+
+    Layered on a velocity-tracking motor skill ('forward @ walk'), it drives
+    the robot to a goal while actively minimizing lateral deviation from the
+    intended straight line between the start pose and the goal. It closes the
+    loop on the base pose (RobotState) every tick, so tracking error is
+    corrected instead of accumulating — that is what keeps a commanded
+    "go forward 2 m" straight and stops odometry drift from smearing the path.
+
+    Override command skill (additive=False): it emits the full body-frame
+    (vx, vy, vyaw); the base motor skill still clamps it to its own limits.
+
+    Modes (fixed by the factory, goal set via configure()/grammar params):
+      "forward"  — travel `distance` m along the heading held at activation
+      "backward" — travel `distance` m opposite that heading (robot keeps
+                   facing forward and walks in reverse)
+      "goto"     — travel to absolute planar target (x, y)
+
+    Generalises domo.control.PositionController's P-control into a line-tracking
+    (along-track + cross-track + heading) law, packaged as a library skill.
+    """
+
+    name = "navigate"
+    channel = "velocity"
+    additive = False
+
+    def __init__(self, mode: str = "forward", distance: float = 1.0,
+                 target=(0.0, 0.0), speed: float = 0.5,
+                 cfg: Optional[NavGains] = None):
+        if mode not in ("forward", "backward", "goto"):
+            raise ValueError(f"unknown nav mode '{mode}'")
+        self.mode = mode
+        self.distance = float(distance)
+        self.target = (float(target[0]), float(target[1]))
+        self.speed = float(speed)
+        self.cfg = cfg or NavGains()
+
+    def configure(self, **params) -> None:
+        if "distance" in params:
+            self.distance = float(params["distance"])
+        if "speed" in params:
+            self.speed = float(params["speed"])
+        if "x" in params or "y" in params:
+            self.target = (float(params.get("x", self.target[0])),
+                           float(params.get("y", self.target[1])))
+
+    def setup(self, robot) -> None:
+        super().setup(robot)
+        n, dev = robot.n_envs, robot.device
+        self._start = torch.zeros(n, 2, device=dev)   # world start position
+        self._u = torch.zeros(n, 2, device=dev)        # world unit path dir
+        self._face = torch.zeros(n, device=dev)        # desired yaw to hold
+        self._len = torch.zeros(n, device=dev)         # full path length
+        self._need_init = torch.ones(n, dtype=torch.bool, device=dev)
+        self._arrived = torch.zeros(n, dtype=torch.bool, device=dev)
+
+    def reset_idx(self, envs_idx: torch.Tensor) -> None:
+        # Re-latch the trajectory from wherever the robot is on (re)activation.
+        self._need_init[envs_idx] = True
+        self._arrived[envs_idx] = False
+
+    def success_flags(self, state) -> torch.Tensor:
+        return self._arrived
+
+    def _init_envs(self, state, mask: torch.Tensor) -> None:
+        pos = state.base_pos[mask, :2]
+        yaw = state.base_euler[mask, 2]
+        heading = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)
+        if self.mode == "goto":
+            tgt = torch.tensor(self.target, device=pos.device,
+                               dtype=pos.dtype).expand_as(pos)
+            d = tgt - pos
+            length = torch.linalg.norm(d, dim=1).clamp_min(1e-6)
+            u = d / length.unsqueeze(1)
+            face = torch.atan2(u[:, 1], u[:, 0])       # face toward the target
+        else:
+            sign = 1.0 if self.mode == "forward" else -1.0
+            u = sign * heading
+            face = yaw                                  # keep facing forward
+            length = torch.full((int(mask.sum()),), self.distance,
+                                device=pos.device, dtype=pos.dtype)
+        self._start[mask] = pos
+        self._u[mask] = u
+        self._face[mask] = face
+        self._len[mask] = length
+        self._need_init[mask] = False
+        self._arrived[mask] = False
+
+    def update_command(self, state, dt: float) -> torch.Tensor:
+        if bool(self._need_init.any()):
+            self._init_envs(state, self._need_init)
+
+        pos = state.base_pos[:, :2]
+        yaw = state.base_euler[:, 2]
+        rel = pos - self._start                         # [N, 2]
+        perp = torch.stack([-self._u[:, 1], self._u[:, 0]], dim=1)
+        along = (rel * self._u).sum(dim=1)              # progress along path
+        cross = (rel * perp).sum(dim=1)                 # signed lateral offset
+        remaining = self._len - along
+
+        c = self.cfg
+        # World-frame desired velocity: advance along the line, and push back
+        # onto it in proportion to the perpendicular deviation. The along-track
+        # speed is floored at min_speed (capped by the leg's cruise speed) so it
+        # stays above the locomotion policy's deadband and never stalls short.
+        min_v = min(self.speed, c.min_speed)
+        v_par = torch.clamp(c.kp_par * remaining, min=min_v, max=self.speed)
+        v_perp = torch.clamp(-c.kp_perp * cross, min=-c.max_vy, max=c.max_vy)
+        v_world = v_par.unsqueeze(1) * self._u + v_perp.unsqueeze(1) * perp
+
+        # Rotate world velocity into the body frame the motor skill expects.
+        cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+        vx = cos_y * v_world[:, 0] + sin_y * v_world[:, 1]
+        vy = -sin_y * v_world[:, 0] + cos_y * v_world[:, 1]
+        yaw_err = self._face - yaw
+        yaw_err = torch.atan2(torch.sin(yaw_err), torch.cos(yaw_err))
+        vyaw = torch.clamp(c.kp_ang * yaw_err, min=-c.max_vyaw, max=c.max_vyaw)
+
+        self._arrived |= remaining <= c.tol_pos
+        cmd = torch.stack([vx, vy, vyaw], dim=1)
+        cmd[self._arrived] = 0.0                         # hold once arrived
+        return cmd

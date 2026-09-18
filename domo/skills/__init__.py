@@ -11,7 +11,8 @@ modifiers), a type-checking compiler, and executable CompositeSkills.
 """
 
 from .card import CMD_VELOCITY, MOTOR, ParamSpec, SkillCard
-from .builtin import AVOID_CARD, STAND_CARD, WALK_CARD, make_go2_library
+from .builtin import (AVOID_CARD, BACKWARD_CARD, FORWARD_CARD, GOTO_CARD,
+                     SLAM_CARD, STAND_CARD, WALK_CARD, make_go2_library)
 from .conditions import ConditionRegistry, standard_conditions
 from .grammar import GrammarError, parse
 from .library import CompileError, SkillLibrary
@@ -24,5 +25,6 @@ __all__ = [
     "CompositeSkill", "RUNNING", "SUCCESS", "FAILURE",
     "ConditionRegistry", "standard_conditions",
     "make_go2_library", "STAND_CARD", "WALK_CARD", "AVOID_CARD",
+    "FORWARD_CARD", "BACKWARD_CARD", "GOTO_CARD", "SLAM_CARD",
     "PlanningController", "PlanOutcome",
 ]

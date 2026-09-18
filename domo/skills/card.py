@@ -68,9 +68,12 @@ class SkillCard:
 
     def describe(self) -> str:
         """Render as an LLM prompt block."""
-        lines = [f"SKILL {self.name}  [{self.interface}"
-                 + (f", drives '{self.accepts}' of a base skill]" if self.interface != MOTOR
-                    else (f", accepts '{self.accepts}']" if self.accepts else "]")),
+        if self.interface != MOTOR:
+            channel = self.interface.split(":", 1)[1]
+            head = f", drives the '{channel}' channel of a base skill]"
+        else:
+            head = f", accepts '{self.accepts}']" if self.accepts else "]"
+        lines = [f"SKILL {self.name}  [{self.interface}" + head,
                  f"  {self.description}"]
         if self.params:
             lines.append("  parameters:")

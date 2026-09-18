@@ -95,6 +95,6 @@ See [running.md](running.md) for budgets, resuming and evaluation.
 * [project-overview.md](project-overview.md): what DOMO is and how the repository is organised.
 * [architecture.md](architecture.md): the layer stack and the rules that keep it engine-agnostic.
 * [examples.md](examples.md): every example, what it demonstrates and how to run it.
-* [api/](api/README.md): module-by-module reference.
+* [api/](README.md#api-reference): module-by-module reference.
 * [extending.md](extending.md): adding a task, a skill, a sensor, a physics backend, an LLM provider.
 * [troubleshooting.md](troubleshooting.md): known Genesis quirks and common errors.

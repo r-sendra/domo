@@ -9,6 +9,10 @@ This repository contains the `domo` library (the system being built, layer by
 layer) and `scripts/` (frozen standalone experiments the library is distilled
 from — do not import from them).
 
+**Documentation:** start with [docs/getting-started.md](docs/getting-started.md);
+the full guide (architecture, conventions, running, examples, API reference,
+extending, troubleshooting) is indexed in [docs/README.md](docs/README.md).
+
 ## Library architecture
 
 ```
@@ -119,28 +123,48 @@ Dependency rule: `utils ← {sim, robot, control, tasks}`, `sim ← robot ← ta
 
 ```bash
 conda activate domo
-pip install -e .
+pip install -e '.[dev]'
 
-# Train Go2 velocity-tracking locomotion
-python main.py --n-envs 4096 --device cuda --headless
-
-# Evaluate / resume
-python main.py --eval   runs/go2_walk/checkpoint_final.pt
-python main.py --resume runs/go2_walk/checkpoint_step_xxx.pt
-
-# Tests (pure math + engine-free layers)
+# Engine-free tests (a few seconds)
 pytest tests/
 
+# The digital twin on CPU: a compiled skill program drives the robot around a square
+python examples/basic_examples/skill_demo.py policies/walk.pt --headless --device cpu --steps 500
+
+# Train the CPG gait everything else uses (GPU), then evaluate it
+python examples/locomotion/go2_cpg_rl.py --n-envs 4096 --device cuda --headless
+python examples/locomotion/go2_cpg_rl.py --eval runs/go2_cpg/checkpoint_final.pt --vx 0.5
+
+# Joint-space locomotion baseline (GPU)
+python main.py --n-envs 4096 --device cuda --headless
+python main.py --eval runs/go2_walk/checkpoint_final.pt
+
 # Composed-skill evaluation (avoidance ON TOP OF locomotion): the mission
-# is authored inside a PlanningController in the example — not a CLI flag
-python examples/avoidance/go2_cpg_rl_lidar.py \
-    --eval runs/go2_avoidance/checkpoint_final.pt \
-    --cpg-checkpoint runs/go2_cpg/checkpoint_final.pt
+# is authored inside a PlanningController in the example, never a CLI flag
+python examples/avoidance/go2_cpg_rl_lidar.py --eval policies/avoid.pt --cpg-checkpoint policies/walk.pt --headless
 
 # The digital twin: goal-free World + re-planning mission controller
-python examples/twin/twin_demo.py --walk CKPT --avoid CKPT
-python examples/twin/twin_demo.py --walk CKPT --catalog   # LLM prompt
+python examples/twin/twin_demo.py --walk policies/walk.pt --avoid policies/avoid.pt
+python examples/twin/twin_demo.py --walk policies/walk.pt --catalog   # LLM prompt
+
+# SLAM in an arena with the live web dashboard
+python examples/slam/slam_demo.py --headless --device cpu --dashboard 8080
 ```
+
+Blessed checkpoints live in `policies/` (`walk.pt`, `avoid.pt`; git-ignored) and
+are resolved by name through `domo.policies`; see `policies/README.md` to
+promote a new one. Every example is described in
+[docs/examples.md](docs/examples.md).
+
+## Development
+
+```bash
+pytest tests/                                   # engine-free, ~10 s
+ruff check domo examples tests main.py          # lint rules in pyproject.toml
+```
+
+Conventions and layering rules: [docs/conventions.md](docs/conventions.md).
+Genesis quirks and known errors: [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Adding a physics backend
 

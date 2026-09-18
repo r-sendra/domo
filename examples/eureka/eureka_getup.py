@@ -8,6 +8,12 @@ Go2GetUpTask (fixed success metric: upright & held 1 s), reflects, iterates
 — optionally hardens the winner with DrEureka domain randomization — and
 finally deploys the learned skill back into the twin to watch it get up.
 
+Library pieces exercised: domo.eureka (learn_skill, EurekaConfig,
+DrEurekaConfig, SkillLearningRequest), domo.llm (ScriptedClient / provider
+dispatch), domo.tasks.go2_getup, domo.world + domo.control
+(LearnedJointSkill deployed in the twin for --demo). No frozen-script
+counterpart.
+
     # Learn the skill (Gemini free tier: export GEMINI_API_KEY=...)
     python examples/eureka/eureka_getup.py \\
         --samples 4 --iterations 3 --train-steps 5000000 --device cuda
@@ -22,12 +28,16 @@ finally deploys the learned skill back into the twin to watch it get up.
 
     # Offline / no API key: scripted LLM with a hand-written reward
     python examples/eureka/eureka_getup.py --llm scripted ...
+    # (CPU smoke: --llm scripted --device cpu --n-envs 8 --train-steps 2000 --samples 1 --iterations 1)
 
     # Watch a learned checkpoint get up in the twin
     python examples/eureka/eureka_getup.py --demo runs/eureka/getup/...pt
 
 The pipeline is orchestrated with LangGraph (--no-graph for the imperative
 driver). The LLM layer is provider-agnostic (Gemini / vLLM / OpenAI).
+Learning writes candidate rewards, checkpoints and stats under --run-root
+(runs/eureka) and prints the winner's checkpoint path; --demo prints one
+line per episode (time to stand or "did NOT get up") and saves nothing.
 """
 
 import argparse
@@ -89,9 +99,31 @@ SCRIPTED_DR = '''```json
  "kp_scale_range": [0.85, 1.15], "obs_noise_std": 0.02}
 ```'''
 
+# --demo: knock-over + success test, mirroring the task's own criterion.
+FALLEN_HEIGHT = 0.18        # spawn height of a robot lying on its side (m)
+UPRIGHT_HEIGHT = 0.26       # base height that counts as standing (m)
+UPRIGHT_TILT = 0.4          # max |roll|,|pitch| that counts as standing (rad)
+DEMO_STEPS = 400            # control steps per demo episode (8 s at 50 Hz)
+LANGCHAIN_PROVIDERS = ("vllm", "openai", "gemini-lc")
 
-def demo(checkpoint: str, device: str, headless: bool, episodes: int = 3):
-    """Deploy the learned policy as a skill in the twin: fallen → standing."""
+
+class OfflineClient(ScriptedClient):
+    """Answers by prompt kind — reward request vs. DR proposal — so the full
+    Eureka (+DrEureka) loop runs with no API key."""
+
+    def generate(self, prompt, temperature=1.0):
+        self.calls.append(prompt)
+        if "domain randomization" in prompt:
+            return SCRIPTED_DR
+        return SCRIPTED_REWARD
+
+
+# ---------------------------------------------------------------------------
+# --demo: deploy a learned checkpoint in the twin
+# ---------------------------------------------------------------------------
+
+def build_getup_twin(checkpoint: str, device: str, headless: bool):
+    """Flat-ground World + the checkpoint wrapped as a LearnedJointSkill."""
     from domo.control import LearnedJointSkill, SingleSkillController
     from domo.rl import ActorCritic, clean_state_dict
     from domo.tasks.go2_getup import build_getup_observation
@@ -99,7 +131,7 @@ def demo(checkpoint: str, device: str, headless: bool, episodes: int = 3):
 
     world = World(WorldConfig(device=device, headless=headless,
                               scene_kind="flat", kp=100.0, kd=2.0,
-                              base_init_pos=(0.0, 0.0, 0.18),
+                              base_init_pos=(0.0, 0.0, FALLEN_HEIGHT),
                               lidar_model=None))
     ckpt = torch.load(checkpoint, weights_only=False,
                       map_location=str(world.device))
@@ -111,25 +143,32 @@ def demo(checkpoint: str, device: str, headless: bool, episodes: int = 3):
         obs_builder=build_getup_observation, action_scale=0.35, name="getup")
     controller = SingleSkillController(skill)
     controller.setup(world.robot)
-    loop = world.make_loop(controller)
+    return world, world.make_loop(controller)
 
+
+def knock_over(world, ep: int) -> None:
+    """Lay the robot on a random side (roll ~ 100–170°, alternating sign)."""
+    roll = (math.radians(100) + torch.rand(1).item()
+            * math.radians(70)) * (1 if ep % 2 else -1)
+    quat = torch.tensor([[math.cos(roll / 2), math.sin(roll / 2), 0.0, 0.0]],
+                        device=world.device)          # wxyz, rotation about x
+    pos = torch.tensor([[0.0, 0.0, FALLEN_HEIGHT]], device=world.device)
+    world.robot.articulation.set_base_pose(
+        pos, quat, torch.tensor([0], device=world.device))
+    world.robot.refresh()
+
+
+def demo(checkpoint: str, device: str, headless: bool, episodes: int = 3):
+    """Deploy the learned policy as a skill in the twin: fallen → standing."""
+    world, loop = build_getup_twin(checkpoint, device, headless)
     for ep in range(episodes):
         loop.reset()
-        # Knock the robot over (roll ~ 100–170°, random side)
-        roll = (math.radians(100) + torch.rand(1).item()
-                * math.radians(70)) * (1 if ep % 2 else -1)
-        quat = torch.tensor([[math.cos(roll / 2), math.sin(roll / 2), 0.0, 0.0]],
-                            device=world.device)
-        pos = torch.tensor([[0.0, 0.0, 0.18]], device=world.device)
-        world.robot.articulation.set_base_pose(
-            pos, quat, torch.tensor([0], device=world.device))
-        world.robot.refresh()
-
+        knock_over(world, ep)
         got_up_at = None
-        for step in range(400):
+        for step in range(DEMO_STEPS):
             state = loop.step()
-            upright = (state.base_pos[0, 2] > 0.26
-                       and state.base_euler[0, :2].abs().max() < 0.4)
+            upright = (state.base_pos[0, 2] > UPRIGHT_HEIGHT
+                       and state.base_euler[0, :2].abs().max() < UPRIGHT_TILT)
             if upright and got_up_at is None:
                 got_up_at = step * world.dt
         print(f"  Episode {ep + 1}: "
@@ -137,7 +176,39 @@ def demo(checkpoint: str, device: str, headless: bool, episodes: int = 3):
               + f"final height {state.base_pos[0, 2]:.2f} m")
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Learning
+# ---------------------------------------------------------------------------
+
+def build_request(args, device: str) -> SkillLearningRequest:
+    # LLM kwargs only apply to the LangChain-backed providers.
+    llm_kwargs = {}
+    if args.llm in LANGCHAIN_PROVIDERS:
+        if args.llm_model:
+            llm_kwargs["model"] = args.llm_model
+        if args.llm_base_url:
+            llm_kwargs["base_url"] = args.llm_base_url
+
+    return SkillLearningRequest(
+        skill_name="getup",
+        description=REQUEST_DESCRIPTION,
+        task="go2_getup",
+        eureka=EurekaConfig(
+            iterations=args.iterations, samples=args.samples,
+            n_envs=args.n_envs, train_steps=args.train_steps,
+            device=device),
+        run_dr=args.dr,
+        dr=DrEurekaConfig(samples=args.dr_samples,
+                          retrain_steps=(args.dr_retrain_steps
+                                         or args.train_steps)),
+        run_root=args.run_root,
+        llm=args.llm,
+        llm_kwargs=llm_kwargs or None,
+        use_graph=not args.no_graph,
+    )
+
+
+def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--samples", type=int, default=4)
     p.add_argument("--iterations", type=int, default=3)
@@ -162,53 +233,24 @@ def main():
     p.add_argument("--demo", type=str, default=None,
                    help="Skip learning; deploy this checkpoint in the twin")
     p.add_argument("--headless", action="store_true", default=False)
-    args = p.parse_args()
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
     device = pick_device(args.device)
 
     if args.demo:
         demo(args.demo, device, args.headless)
         return
 
-    # LLM kwargs for the LangChain-backed providers.
-    llm_kwargs = {}
-    if args.llm in ("vllm", "openai", "gemini-lc"):
-        if args.llm_model:
-            llm_kwargs["model"] = args.llm_model
-        if args.llm_base_url:
-            llm_kwargs["base_url"] = args.llm_base_url
-
-    request = SkillLearningRequest(
-        skill_name="getup",
-        description=REQUEST_DESCRIPTION,
-        task="go2_getup",
-        eureka=EurekaConfig(
-            iterations=args.iterations, samples=args.samples,
-            n_envs=args.n_envs, train_steps=args.train_steps,
-            device=device),
-        run_dr=args.dr,
-        dr=DrEurekaConfig(samples=args.dr_samples,
-                          retrain_steps=(args.dr_retrain_steps
-                                         or args.train_steps)),
-        run_root=args.run_root,
-        llm=args.llm,
-        llm_kwargs=llm_kwargs or None,
-        use_graph=not args.no_graph,
-    )
-
-    if args.llm == "scripted":
-        class OfflineClient(ScriptedClient):
-            """Answers by prompt kind — reward request vs. DR proposal."""
-            def generate(self, prompt, temperature=1.0):
-                self.calls.append(prompt)
-                if "domain randomization" in prompt:
-                    return SCRIPTED_DR
-                return SCRIPTED_REWARD
-        llm = OfflineClient(["-"])
-    else:
-        llm = None            # built from request.llm (+ llm_kwargs) by the routine
-
+    # --- learn -------------------------------------------------------------
+    request = build_request(args, device)
+    # A real provider is built from request.llm (+ llm_kwargs) by the routine.
+    llm = OfflineClient(["-"]) if args.llm == "scripted" else None
     skill = learn_skill(request, llm=llm)
 
+    # --- report ------------------------------------------------------------
     print("\nTo watch it in the twin:")
     print(f"  python examples/eureka/eureka_getup.py "
           f"--demo {skill.checkpoint}")

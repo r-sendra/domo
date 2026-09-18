@@ -25,6 +25,10 @@ CMD_VELOCITY = "command:velocity"
 
 @dataclass(frozen=True)
 class ParamSpec:
+    """One grammar parameter of a skill (`skill(name=value)`).
+
+    Values are floats in the grammar; `range` is enforced at compile time.
+    """
     name: str
     description: str
     default: float = 0.0
@@ -34,6 +38,14 @@ class ParamSpec:
 
 @dataclass
 class SkillCard:
+    """LLM-legible metadata for one library skill (see module docstring).
+
+    Motor skills that consume a command channel declare it in `accepts`
+    (e.g. "velocity") and list the channel's components as `params` so the
+    grammar can set them (`walk(vx=0.5)`); command skills declare the channel
+    they drive via `interface` ("command:velocity") and list their own goal
+    parameters (`goto(x=2, y=1)`).
+    """
     name: str
     description: str                      # natural language, one paragraph
     interface: str = MOTOR                # MOTOR | CMD_VELOCITY
@@ -59,7 +71,19 @@ class SkillCard:
 
     # ------------------------------------------------------------------
 
+    @property
+    def channel(self) -> str | None:
+        """Command channel a command skill drives ("velocity"); None for motor."""
+        if self.interface == MOTOR:
+            return None
+        return self.interface.split(":", 1)[1]
+
     def param(self, name: str) -> ParamSpec:
+        """Look up a parameter spec by name.
+
+        Raises:
+            KeyError: the card declares no such parameter.
+        """
         for p in self.params:
             if p.name == name:
                 return p
@@ -68,8 +92,7 @@ class SkillCard:
     def describe(self) -> str:
         """Render as an LLM prompt block."""
         if self.interface != MOTOR:
-            channel = self.interface.split(":", 1)[1]
-            head = f", drives the '{channel}' channel of a base skill]"
+            head = f", drives the '{self.channel}' channel of a base skill]"
         else:
             head = f", accepts '{self.accepts}']" if self.accepts else "]"
         lines = [f"SKILL {self.name}  [{self.interface}" + head,

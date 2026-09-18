@@ -29,16 +29,25 @@ Condition = Callable[[object, float], torch.Tensor]   # (state, t_s) -> bool [N]
 
 
 class ConditionRegistry:
+    """Name → factory map; `make(name, *args)` instantiates a Condition."""
+
     def __init__(self):
         self._factories: dict[str, Callable[..., Condition]] = {}
 
     def register(self, name: str, factory: Callable[..., Condition]) -> None:
+        """Register `factory(*args) -> Condition` under `name` (replaces)."""
         self._factories[name] = factory
 
     def names(self):
+        """Registered condition names, sorted (listed in library.describe())."""
         return sorted(self._factories)
 
     def make(self, name: str, *args) -> Condition:
+        """Instantiate a condition from grammar literals.
+
+        Raises:
+            KeyError: unknown condition name.
+        """
         if name not in self._factories:
             raise KeyError(f"unknown condition '{name}' "
                            f"(known: {self.names()})")
@@ -76,7 +85,11 @@ def _still(v_limit: float = 0.05) -> Condition:
 
 
 class _Moved:
-    """Stateful: latches the entry position on first evaluation after reset."""
+    """Stateful: latches the entry position on first evaluation after reset.
+
+    Conditions get no reset() call, so re-entry of the enclosing node is
+    detected from the node-local clock going backwards (t_s < last t_s).
+    """
 
     def __init__(self, distance: float):
         self.distance = distance
@@ -92,10 +105,11 @@ class _Moved:
 
 
 def standard_conditions() -> ConditionRegistry:
+    """The state-only conditions listed in the module docstring."""
     reg = ConditionRegistry()
     reg.register("timeout", _timeout)
     reg.register("tipped", _tipped)
     reg.register("fallen", _fallen)
     reg.register("still", _still)
-    reg.register("moved", lambda d: _Moved(d))
+    reg.register("moved", _Moved)
     return reg

@@ -19,7 +19,8 @@ class ActorCritic(nn.Module):
     """
     Shared-trunk MLP with separate actor and critic heads.
 
-    Architecture (defaults reproduce the original locomotion network):
+    Architecture (defaults reproduce the original locomotion network)::
+
       Trunk    : trunk_layers × [Linear → ELU]              (shared)
       Actor    : Linear(head_hidden) → ELU → Linear(act_dim) (Gaussian mean)
       Critic   : Linear(head_hidden) → ELU → Linear(1)       (state value)
@@ -29,10 +30,19 @@ class ActorCritic(nn.Module):
     ActorCritic(36, 3, hidden=128, trunk_layers=3, head_hidden=64).
 
     Orthogonal init with small gain on actor output for stable early training.
+
+    State-dict keys (the checkpoint contract): `trunk.{2i}.weight/bias`,
+    `actor_head.{0,2}.*`, `critic_head.{0,2}.*`, `log_std`.
+
+    Args:
+        obs_dim, act_dim: input / action dimensions.
+        hidden: trunk width.
+        trunk_layers: number of Linear→ELU trunk blocks.
+        head_hidden: head width; None (or 0) → `hidden`.
     """
 
     def __init__(self, obs_dim: int, act_dim: int, hidden: int = 512,
-                 trunk_layers: int = 2, head_hidden: int = None):
+                 trunk_layers: int = 2, head_hidden: int | None = None):
         super().__init__()
         head_hidden = head_hidden or hidden
 
@@ -66,6 +76,9 @@ class ActorCritic(nn.Module):
         Rebuild the network purely from checkpoint weight shapes (tolerates
         old script checkpoints and any config drift). Accepts a raw
         state_dict; keys are cleaned of compile/DataParallel prefixes.
+
+        Raises:
+            KeyError: if the state dict is not from this architecture.
         """
         sd = clean_state_dict(sd)
         obs_dim = sd["trunk.0.weight"].shape[1]
@@ -79,6 +92,7 @@ class ActorCritic(nn.Module):
         return net
 
     def forward(self, obs: torch.Tensor):
+        """obs [N, obs_dim] → (mean [N, act_dim], std [N, act_dim], value [N])."""
         h = self.trunk(obs)
         mean = self.actor_head(h)
         value = self.critic_head(h).squeeze(-1)
@@ -86,7 +100,13 @@ class ActorCritic(nn.Module):
         return mean, std, value
 
     def get_action(self, obs: torch.Tensor, deterministic: bool = False):
-        """Sample action, return (action, log_prob, value)."""
+        """
+        Sample (or take the mean) action.
+
+        Returns:
+            (action [N, act_dim], log_prob [N], value [N]). Sampling uses
+            `rsample` so gradients could flow through the action if needed.
+        """
         mean, std, value = self.forward(obs)
         dist = torch.distributions.Normal(mean, std)
         action = mean if deterministic else dist.rsample()
@@ -94,11 +114,17 @@ class ActorCritic(nn.Module):
         return action, log_prob, value
 
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
+        """State value [N] (critic only)."""
         h = self.trunk(obs)
         return self.critic_head(h).squeeze(-1)
 
     def evaluate(self, obs: torch.Tensor, action: torch.Tensor):
-        """Evaluate stored actions for the PPO update."""
+        """
+        Evaluate stored actions for the PPO update.
+
+        Returns:
+            (log_prob [N], entropy [N], value [N]).
+        """
         mean, std, value = self.forward(obs)
         dist = torch.distributions.Normal(mean, std)
         log_prob = dist.log_prob(action).sum(-1)

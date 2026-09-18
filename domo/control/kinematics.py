@@ -19,11 +19,24 @@ from domo.robot.spec import QuadrupedGeometry
 
 __all__ = ["LegKinematics", "leg_fk", "leg_ik"]
 
+# Floor on the squared in-plane leg length in IK: keeps sqrt finite when the
+# foot target sits exactly on the abduction axis.
+_LENGTH_SQ_EPS = 1e-8
+
 
 def leg_fk(qh: torch.Tensor, qt: torch.Tensor, qc: torch.Tensor,
            side_sign: torch.Tensor, l1: float, l2: float, l3: float
            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward kinematics: joint angles → foot position in hip frame."""
+    """Forward kinematics: joint angles → foot position in the hip frame.
+
+    Args:
+        qh, qt, qc: hip-abduction, thigh, calf angles [N, 4] (rad).
+        side_sign: [4] +1 for left legs, −1 for right (hip offset direction).
+        l1, l2, l3: hip offset, thigh length, calf length (m).
+
+    Returns:
+        (px, py, pz) foot positions [N, 4] in each leg's hip frame.
+    """
     s = side_sign
     z_s = -l2 * torch.cos(qt) - l3 * torch.cos(qt + qc)
     px = -l2 * torch.sin(qt) - l3 * torch.sin(qt + qc)
@@ -35,9 +48,17 @@ def leg_fk(qh: torch.Tensor, qt: torch.Tensor, qc: torch.Tensor,
 def leg_ik(px: torch.Tensor, py: torch.Tensor, pz: torch.Tensor,
            side_sign: torch.Tensor, l1: float, l2: float, l3: float
            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Closed-form inverse kinematics: foot position in hip frame → angles."""
+    """Closed-form inverse kinematics: foot position in hip frame → angles.
+
+    Inverse of `leg_fk` (same argument conventions, foot targets [N, 4] in).
+    The knee is always the "backward" (negative qc) solution, as on the Go2;
+    unreachable targets are clamped to the workspace boundary.
+
+    Returns:
+        (qh, qt, qc) joint angles [N, 4] (rad).
+    """
     l1_s = side_sign * l1
-    L = torch.sqrt(torch.clamp(py * py + pz * pz - l1 * l1, min=1e-8))
+    L = torch.sqrt(torch.clamp(py * py + pz * pz - l1 * l1, min=_LENGTH_SQ_EPS))
     z_s = -L
     qh = torch.atan2(L * py + l1_s * pz, l1_s * py - L * pz)
     D2 = px * px + L * L
@@ -50,7 +71,7 @@ def leg_ik(px: torch.Tensor, py: torch.Tensor, pz: torch.Tensor,
 
 
 class LegKinematics:
-    """Geometry-bound convenience wrapper around leg_fk / leg_ik."""
+    """Geometry-bound convenience wrapper around leg_fk / leg_ik (all 4 legs)."""
 
     def __init__(self, geometry: QuadrupedGeometry, device: torch.device):
         self.geo = geometry
@@ -58,10 +79,12 @@ class LegKinematics:
                                       dtype=torch.float32)
 
     def fk(self, qh, qt, qc):
+        """Joint angles [N, 4] ×3 → foot positions (px, py, pz) [N, 4]."""
         return leg_fk(qh, qt, qc, self.side_sign,
                       self.geo.l_hip, self.geo.l_thigh, self.geo.l_calf)
 
     def ik(self, px, py, pz):
+        """Foot positions [N, 4] ×3 → joint angles (qh, qt, qc) [N, 4]."""
         return leg_ik(px, py, pz, self.side_sign,
                       self.geo.l_hip, self.geo.l_thigh, self.geo.l_calf)
 

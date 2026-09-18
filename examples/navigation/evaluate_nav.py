@@ -4,15 +4,30 @@ scripts/house_scene/evaluate_nav.py.
 
 The P-controller lives in domo.control.navigation (engine-agnostic, driven
 through injected step/pose callables); this script provides the sim wiring,
-stdin intervention, and the demo modes.
+stdin intervention, and the demo modes. Natural-language commands are parsed
+by a small rule-based parser, or by Gemini with `--gemini`.
+
+Library pieces exercised: domo.control (PositionController, NavConfig),
+domo.tasks (Go2CPGWalkTask as a single-env stepping harness),
+domo.checkpoints.
 
     python examples/navigation/evaluate_nav.py CHECKPOINT --demo waypoints
+    python examples/navigation/evaluate_nav.py CHECKPOINT --demo forward --headless
     python examples/navigation/evaluate_nav.py CHECKPOINT --demo interactive
     python examples/navigation/evaluate_nav.py CHECKPOINT --demo interactive --gemini
+    # CPU: same commands (device is auto-picked: cuda if available, else cpu)
+
+While a demo runs, type p/r/a/s/+/-/? + Enter on stdin to pause, resume,
+abort the current goal, stop, change speed, or print status. Prints the
+controller's progress and a "=== Done ===" footer; saves nothing.
+`--gemini` needs `pip install google-genai` and GEMINI_API_KEY.
 """
 
 import argparse
+import contextlib
+import json
 import os
+import select
 import sys
 
 import torch
@@ -20,6 +35,9 @@ import torch
 from domo.checkpoints import load_locomotion_policy, pick_device
 from domo.control import NavConfig, PositionController
 from domo.tasks import Go2CPGWalkConfig, Go2CPGWalkTask
+
+SPEED_STEP = 0.2            # m/s per '+'/'-' keypress
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # ==========================================================================
 #  Stdin intervention (non-blocking, no background thread)
@@ -39,41 +57,43 @@ class MissionControl:
         print("         p=pause r=resume a=abort s=stop +=faster -=slower ?=status")
 
     def poll(self):
-        import select
+        """Consume one stdin line if present; never blocks the control loop."""
         try:
             ready, _, _ = select.select([sys.stdin], [], [], 0.0)
             if not ready:
                 return
             line = sys.stdin.readline().strip().lower()
-            if not line:
-                return
-            if line in ("p", "pause"):
-                self._paused = True
-                print("  [ctrl] PAUSED — type 'r' to resume")
-            elif line in ("r", "resume"):
-                self._paused = False
-                print("  [ctrl] RESUMED")
-            elif line in ("a", "abort"):
-                self._aborted = True
-                self._paused = False
-                print("  [ctrl] ABORTING current goal")
-            elif line in ("s", "stop"):
-                self._stopped = True
-                self._aborted = True
-                self._paused = False
-                print("  [ctrl] STOPPING mission")
-            elif line in ("+", "faster"):
-                self._speed_delta += 0.2
-                print("  [ctrl] Speed +0.2")
-            elif line in ("-", "slower"):
-                self._speed_delta -= 0.2
-                print("  [ctrl] Speed -0.2")
-            elif line in ("?", "status"):
-                print(f"  [ctrl] paused={self._paused} aborted={self._aborted} "
-                      f"stopped={self._stopped} "
-                      f"speed_delta={self._speed_delta:+.1f}")
-        except Exception:
-            pass
+        except (OSError, ValueError):
+            return          # stdin closed / not selectable (e.g. piped or Windows)
+        if line:
+            self._apply(line)
+
+    def _apply(self, line: str) -> None:
+        if line in ("p", "pause"):
+            self._paused = True
+            print("  [ctrl] PAUSED — type 'r' to resume")
+        elif line in ("r", "resume"):
+            self._paused = False
+            print("  [ctrl] RESUMED")
+        elif line in ("a", "abort"):
+            self._aborted = True
+            self._paused = False
+            print("  [ctrl] ABORTING current goal")
+        elif line in ("s", "stop"):
+            self._stopped = True
+            self._aborted = True
+            self._paused = False
+            print("  [ctrl] STOPPING mission")
+        elif line in ("+", "faster"):
+            self._speed_delta += SPEED_STEP
+            print(f"  [ctrl] Speed +{SPEED_STEP}")
+        elif line in ("-", "slower"):
+            self._speed_delta -= SPEED_STEP
+            print(f"  [ctrl] Speed -{SPEED_STEP}")
+        elif line in ("?", "status"):
+            print(f"  [ctrl] paused={self._paused} aborted={self._aborted} "
+                  f"stopped={self._stopped} "
+                  f"speed_delta={self._speed_delta:+.1f}")
 
     @property
     def paused(self):
@@ -82,7 +102,7 @@ class MissionControl:
     @property
     def aborted(self):
         v = self._aborted
-        self._aborted = False
+        self._aborted = False           # read-and-clear: one abort per goal
         return v
 
     @property
@@ -106,10 +126,8 @@ def parse_simple(text: str) -> list:
     speed = None
     for i, w in enumerate(words):
         if w == "at" and i + 1 < len(words):
-            try:
+            with contextlib.suppress(ValueError):    # "at full" → no speed
                 speed = float(words[i + 1])
-            except ValueError:
-                pass
 
     def nums():
         return [float(w) for w in words if _is_number(w)]
@@ -170,7 +188,7 @@ Examples:
 
 
 def parse_gemini(text: str) -> list:
-    import json
+    """LLM parser: one Gemini call per utterance (google-genai, GEMINI_API_KEY)."""
     try:
         from google import genai
         from google.genai import types
@@ -183,7 +201,7 @@ def parse_gemini(text: str) -> list:
         return [{"type": "stop"}]
     client = genai.Client(api_key=key)
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL,
         contents=[types.Content(role="user", parts=[
             types.Part(text=SYSTEM_PROMPT_NAV + f'\n\nUser said: "{text}"')])],
         config=types.GenerateContentConfig(temperature=0.1,
@@ -215,7 +233,7 @@ def execute_commands(commands: list, controller: PositionController):
 #  Demos
 # ==========================================================================
 
-def run_demo_forward(controller):
+def run_demo_forward(controller, use_gemini=False):
     print("\n=== Demo: forward sequence ===")
     execute_commands([
         {"type": "forward", "distance": 5.0, "speed": None},
@@ -227,7 +245,7 @@ def run_demo_forward(controller):
     print("=== Done ===")
 
 
-def run_demo_waypoints(controller):
+def run_demo_waypoints(controller, use_gemini=False):
     print("\n=== Demo: square waypoints ===")
     for i, (x, y) in enumerate([(3.0, 0.0), (3.0, 3.0), (0.0, 3.0), (0.0, 0.0)]):
         if controller.ctrl.stopped:
@@ -258,25 +276,24 @@ def run_demo_interactive(controller, use_gemini=False):
     print("=== Done ===")
 
 
+DEMOS = {"forward": run_demo_forward,
+         "waypoints": run_demo_waypoints,
+         "interactive": run_demo_interactive}
+
+
 # ==========================================================================
 #  Wiring
 # ==========================================================================
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("checkpoint", type=str)
-    p.add_argument("--demo", type=str, default="waypoints",
-                   choices=["forward", "waypoints", "interactive"])
-    p.add_argument("--gemini", action="store_true")
-    p.add_argument("--headless", action="store_true", default=False)
-    args = p.parse_args()
-
-    device = pick_device("cuda")
-    policy_fn, _ = load_locomotion_policy(args.checkpoint, device)
-
-    env = Go2CPGWalkTask(Go2CPGWalkConfig(
-        n_envs=1, device=device, headless=args.headless,
+def build_env(device: str, headless: bool) -> Go2CPGWalkTask:
+    """Single-env walk task as a stepping harness: no episode end, no resampling."""
+    return Go2CPGWalkTask(Go2CPGWalkConfig(
+        n_envs=1, device=device, headless=headless,
         max_episode_steps=1_000_000, resampling_time_s=1e9))
+
+
+def make_step_and_pose(env, policy_fn):
+    """The two callables the engine-agnostic PositionController is driven through."""
     obs_holder = {"obs": env.reset()[0]}
 
     def step_fn(cmd: torch.Tensor):
@@ -284,7 +301,7 @@ def main():
         with torch.no_grad():
             act = policy_fn(obs_holder["obs"])
         obs_holder["obs"], _, _, reset_buf, _ = env.step(act)
-        if reset_buf[0]:
+        if reset_buf[0]:                     # fell: fresh episode, keep navigating
             obs_holder["obs"], _ = env.reset()
 
     def pose_fn():
@@ -292,17 +309,36 @@ def main():
         return (float(s.base_pos[0, 0]), float(s.base_pos[0, 1]),
                 float(s.base_euler[0, 2]))
 
+    return step_fn, pose_fn
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("checkpoint", type=str)
+    p.add_argument("--demo", type=str, default="waypoints",
+                   choices=["forward", "waypoints", "interactive"])
+    p.add_argument("--gemini", action="store_true")
+    p.add_argument("--headless", action="store_true", default=False)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # --- policy + sim harness (device auto-picked, as in the frozen script) --
+    device = pick_device("cuda")
+    policy_fn, _ = load_locomotion_policy(args.checkpoint, device)
+    env = build_env(device, args.headless)
+    step_fn, pose_fn = make_step_and_pose(env, policy_fn)
+
+    # --- controller with stdin intervention ---------------------------------
     ctrl = MissionControl()
     ctrl.start()
     controller = PositionController(step_fn, pose_fn,
                                     NavConfig(dt=env.dt), intervention=ctrl)
 
-    if args.demo == "forward":
-        run_demo_forward(controller)
-    elif args.demo == "waypoints":
-        run_demo_waypoints(controller)
-    else:
-        run_demo_interactive(controller, use_gemini=args.gemini)
+    # --- run the chosen demo ------------------------------------------------
+    DEMOS[args.demo](controller, use_gemini=args.gemini)
 
 
 if __name__ == "__main__":

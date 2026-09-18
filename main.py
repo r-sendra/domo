@@ -9,6 +9,16 @@ Usage:
     python main.py --n-envs 4096 --device cuda --headless
     python main.py --resume runs/go2_walk/checkpoint_step_xxx.pt
     python main.py --eval   runs/go2_walk/checkpoint_final.pt
+
+Flags: --n-envs, --total-steps, --rollout-steps, --device {cpu,cuda,mps},
+--run-dir, --headless, --resume <ckpt>, --eval <ckpt>, --terrain {flat,rough}.
+`--eval` evaluates and exits; `--resume` restores model/optimiser/step and
+rebuilds the task from the checkpoint's own config (only the device is
+overridden). Note `--headless` is always True (store_true with default
+True): it is kept for CLI compatibility.
+
+Other tasks (CPG walk, avoidance, get-up) have their own entry points under
+examples/, all built on the same PPOTrainer.
 """
 
 import argparse
@@ -25,6 +35,7 @@ from domo.tasks import Go2WalkConfig, Go2WalkTask
 # ==========================================================================
 
 def build_configs(args) -> tuple[Go2WalkConfig, PPOConfig]:
+    """Task + PPO configs from CLI args (minibatch = a quarter of the rollout)."""
     task_cfg = Go2WalkConfig(
         n_envs=args.n_envs,
         dt=0.02,
@@ -45,9 +56,25 @@ def build_configs(args) -> tuple[Go2WalkConfig, PPOConfig]:
     return task_cfg, ppo_cfg
 
 
-def load_checkpoint(path: str):
+def load_checkpoint(path: str) -> tuple[dict, str]:
+    """Load a trainer checkpoint onto cuda if available, else cpu. Returns (ckpt, device)."""
     map_location = "cuda" if torch.cuda.is_available() else "cpu"
     return torch.load(path, weights_only=False, map_location=map_location), map_location
+
+
+def build_policy(ckpt: dict, ppo_cfg: PPOConfig, num_obs: int,
+                 num_actions: int) -> ActorCritic:
+    """
+    Rebuild the trained ActorCritic for evaluation with the architecture
+    recorded in the checkpoint's `ppo_config` (hidden size, trunk depth and
+    head width) and load its weights (eval mode, still on CPU).
+    """
+    net = ActorCritic(num_obs, num_actions, ppo_cfg.hidden_size,
+                      trunk_layers=ppo_cfg.trunk_layers,
+                      head_hidden=ppo_cfg.head_hidden)
+    net.load_state_dict(clean_state_dict(ckpt["model_state"]))
+    net.eval()
+    return net
 
 
 # ==========================================================================
@@ -55,6 +82,10 @@ def load_checkpoint(path: str):
 # ==========================================================================
 
 def evaluate(checkpoint_path: str, n_episodes: int = 10, headless: bool = False):
+    """
+    Roll out the checkpoint's policy in a single env for `n_episodes`
+    (stochastic actions, as during training) and print return/length stats.
+    """
     ckpt, device = load_checkpoint(checkpoint_path)
     ppo_cfg = PPOConfig(**ckpt["ppo_config"])
     task_cfg = Go2WalkConfig(**ckpt["extra"]["task_config"])
@@ -63,10 +94,7 @@ def evaluate(checkpoint_path: str, n_episodes: int = 10, headless: bool = False)
     task_cfg.headless = headless
 
     env = Go2WalkTask(task_cfg)
-    net = ActorCritic(env.num_obs, env.num_actions, ppo_cfg.hidden_size)
-    net.load_state_dict(clean_state_dict(ckpt["model_state"]))
-    net.eval()
-    net = net.to(device)
+    net = build_policy(ckpt, ppo_cfg, env.num_obs, env.num_actions).to(device)
 
     returns, lengths = [], []
     for ep in range(n_episodes):
@@ -94,7 +122,7 @@ def evaluate(checkpoint_path: str, n_episodes: int = 10, headless: bool = False)
 # Entry point
 # ==========================================================================
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-envs", type=int, default=4096)
     parser.add_argument("--total-steps", type=int, default=100_000_000)
@@ -107,7 +135,11 @@ def main():
     parser.add_argument("--eval", type=str, default=None)
     parser.add_argument("--terrain", type=str, default="flat",
                         choices=["flat", "rough"])
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     if args.eval:
         evaluate(args.eval)

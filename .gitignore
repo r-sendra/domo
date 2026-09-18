@@ -96,3 +96,8 @@ htmlcov/
 
 # ── Local-only helper scripts (not tracked) ───────────────────────────
 /pull_eureka.sh
+
+# ── Rendered outputs dropped at the repo root by SLAM/twin demos ─────
+/*.png
+/*.gif
+/*.mp4

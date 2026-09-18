@@ -8,17 +8,25 @@ modifiers), a type-checking compiler, and executable CompositeSkills.
     prog = lib.compile("(avoid @ walk(vx=0.6)).until(moved(3)) >> stand.for(2)")
     prog.setup(robot)      # a CompositeSkill is an ordinary Skill
     print(lib.describe())  # the catalog block an LLM plans against
+
+Modules: card (SkillCard/ParamSpec), conditions (predicate registry),
+grammar (parser/AST), library (SkillLibrary + compiler), nodes (executable
+tree + CompositeSkill), planner (PlanningController: programs authored at
+runtime), builtin (the Go2 cards + make_go2_library).
+
+Depends on domo.control (skills are the primitives being composed); pure
+torch, engine-free.
 """
 
 from .builtin import (
-                     AVOID_CARD,
-                     BACKWARD_CARD,
-                     FORWARD_CARD,
-                     GOTO_CARD,
-                     SLAM_CARD,
-                     STAND_CARD,
-                     WALK_CARD,
-                     make_go2_library,
+    AVOID_CARD,
+    BACKWARD_CARD,
+    FORWARD_CARD,
+    GOTO_CARD,
+    SLAM_CARD,
+    STAND_CARD,
+    WALK_CARD,
+    make_go2_library,
 )
 from .card import CMD_VELOCITY, MOTOR, ParamSpec, SkillCard
 from .conditions import ConditionRegistry, standard_conditions
@@ -28,28 +36,28 @@ from .nodes import FAILURE, RUNNING, SUCCESS, CompositeSkill
 from .planner import PlanningController, PlanOutcome
 
 __all__ = [
-                     "AVOID_CARD",
-                     "BACKWARD_CARD",
-                     "CMD_VELOCITY",
-                     "FAILURE",
-                     "FORWARD_CARD",
-                     "GOTO_CARD",
-                     "MOTOR",
-                     "RUNNING",
-                     "SLAM_CARD",
-                     "STAND_CARD",
-                     "SUCCESS",
-                     "WALK_CARD",
-                     "CompileError",
-                     "CompositeSkill",
-                     "ConditionRegistry",
-                     "GrammarError",
-                     "ParamSpec",
-                     "PlanOutcome",
-                     "PlanningController",
-                     "SkillCard",
-                     "SkillLibrary",
-                     "make_go2_library",
-                     "parse",
-                     "standard_conditions",
+    "AVOID_CARD",
+    "BACKWARD_CARD",
+    "CMD_VELOCITY",
+    "FAILURE",
+    "FORWARD_CARD",
+    "GOTO_CARD",
+    "MOTOR",
+    "RUNNING",
+    "SLAM_CARD",
+    "STAND_CARD",
+    "SUCCESS",
+    "WALK_CARD",
+    "CompileError",
+    "CompositeSkill",
+    "ConditionRegistry",
+    "GrammarError",
+    "ParamSpec",
+    "PlanOutcome",
+    "PlanningController",
+    "SkillCard",
+    "SkillLibrary",
+    "make_go2_library",
+    "parse",
+    "standard_conditions",
 ]

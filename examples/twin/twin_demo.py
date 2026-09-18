@@ -8,22 +8,35 @@ outcomes. The ExploreMission below is placeholder intelligence for the M1
 LLM supervisor: same seat, same inputs (library catalog + outcome traces),
 same output (grammar programs).
 
+Library pieces exercised: domo.world (World/WorldConfig, scene_kind="arena"),
+domo.skills (make_go2_library, PlanningController), domo.checkpoints,
+domo.rl (ActorCritic for the avoid net). No frozen-script counterpart.
+
+    # GPU, viewer open
     python examples/twin/twin_demo.py \\
         --walk runs/go2_cpg/checkpoint_final.pt \\
         --avoid runs/go2_avoidance/checkpoint_final.pt
+    # CPU, headless, stable checkpoints
+    python examples/twin/twin_demo.py --walk policies/walk.pt --avoid policies/avoid.pt \\
+        --headless --device cpu --steps 1000
 
-    # print what the LLM planner would see
+    # print what the LLM planner would see (builds the world, then exits)
     python examples/twin/twin_demo.py --walk CKPT --catalog
+
+Prints each program outcome as the mission re-plans, a position line every
+250 steps, and the mission history at the end. Saves nothing.
 """
 
 import argparse
 
 import torch
 
-from domo.checkpoints import load_locomotion_policy, pick_device
+from domo.checkpoints import load_checkpoint, load_locomotion_policy, pick_device
 from domo.rl import ActorCritic, clean_state_dict
 from domo.skills import PlanningController, make_go2_library
 from domo.world import World, WorldConfig
+
+REPORT_EVERY = 250          # steps between position lines
 
 
 class ExploreMission(PlanningController):
@@ -79,7 +92,51 @@ class ExploreMission(PlanningController):
                 f">> stand.for(1)")
 
 
-def main():
+def load_avoid_policy(path: str, device: str):
+    """Callable obs → raw Δv from a trained avoidance checkpoint."""
+    ckpt = load_checkpoint(path, device)
+    net = ActorCritic.from_state_dict(clean_state_dict(ckpt["model_state"]))
+    net.eval().to(device)
+
+    def avoid_policy(obs):
+        return net.get_action(obs, deterministic=True)[0]
+    return avoid_policy
+
+
+def zero_avoid_policy(obs):
+    """No avoidance checkpoint: the avoid skill contributes zero corrections."""
+    return torch.zeros(obs.shape[0], 3, device=obs.device)
+
+
+def build_library(world, walk_ckpt: str, avoid_ckpt: str | None):
+    """The robot's current repertoire: walk + (trained or null) avoid."""
+    device = str(world.device)
+    walk_policy, _ = load_locomotion_policy(walk_ckpt, device)
+    avoid_policy = (load_avoid_policy(avoid_ckpt, device) if avoid_ckpt
+                    else zero_avoid_policy)
+    return make_go2_library(walk_policy, avoid_policy, world.lidar)
+
+
+def run_mission(mission, loop, steps: int) -> None:
+    for step in range(steps):
+        state = loop.step()
+        if (step + 1) % REPORT_EVERY == 0:
+            active = (mission.program.source if mission.program else "idle")
+            print(f"  step {step + 1:5d} | "
+                  f"pos=({state.base_pos[0, 0]:+.2f},{state.base_pos[0, 1]:+.2f})"
+                  f" | {active}")
+        if mission.idle and mission.done:
+            break
+
+
+def print_history(mission) -> None:
+    print(f"\n  mission history ({len(mission.history)} programs):")
+    for outcome in mission.history:
+        mark = "✓" if outcome.succeeded else "✗"
+        print(f"    {mark} {outcome.program}")
+
+
+def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--walk", type=str, required=True)
     p.add_argument("--avoid", type=str, default=None,
@@ -89,7 +146,11 @@ def main():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--catalog", action="store_true",
                    help="Print the planner-facing catalog and exit")
-    args = p.parse_args()
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
     device = pick_device(args.device)
 
     # --- spawn the twin: a world, a robot, its sensors — no goal ----------
@@ -97,17 +158,7 @@ def main():
         device=device, headless=args.headless, scene_kind="arena"))
 
     # --- its current repertoire --------------------------------------------
-    walk_policy, _ = load_locomotion_policy(args.walk, str(world.device))
-    if args.avoid:
-        ckpt = torch.load(args.avoid, weights_only=False,
-                          map_location=str(world.device))
-        net = ActorCritic.from_state_dict(clean_state_dict(ckpt["model_state"]))
-        net.eval().to(world.device)
-        avoid_policy = lambda obs: net.get_action(obs, deterministic=True)[0]
-    else:
-        avoid_policy = lambda obs: torch.zeros(obs.shape[0], 3)
-    library = make_go2_library(walk_policy, avoid_policy, world.lidar)
-
+    library = build_library(world, args.walk, args.avoid)
     if args.catalog:
         print(library.describe())
         return
@@ -117,21 +168,10 @@ def main():
     mission.setup(world.robot)
     loop = world.make_loop(mission)
     loop.reset()
+    run_mission(mission, loop, args.steps)
 
-    for step in range(args.steps):
-        state = loop.step()
-        if (step + 1) % 250 == 0:
-            active = (mission.program.source if mission.program else "idle")
-            print(f"  step {step + 1:5d} | "
-                  f"pos=({state.base_pos[0, 0]:+.2f},{state.base_pos[0, 1]:+.2f})"
-                  f" | {active}")
-        if mission.idle and mission.done:
-            break
-
-    print(f"\n  mission history ({len(mission.history)} programs):")
-    for outcome in mission.history:
-        mark = "✓" if outcome.succeeded else "✗"
-        print(f"    {mark} {outcome.program}")
+    # --- report -------------------------------------------------------------
+    print_history(mission)
 
 
 if __name__ == "__main__":

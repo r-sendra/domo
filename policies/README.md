@@ -8,6 +8,11 @@ through `domo.policies` (not by brittle `runs/.../checkpoint_final_*.pt` paths).
 | `walk`  | `walk.pt`  | `runs/go2_cpg/checkpoint_final_coupled.pt` | most stable CPG gait     |
 | `avoid` | `avoid.pt` | `runs/go2_cpg/checkpoint_final_avoid.pt`   | lidar-avoidance net (Δv) |
 
+Both current files are legacy script checkpoints (`{"config": <flat dict>,
+"model_state": ...}`); `domo.checkpoints` loads that format and the newer
+library format (`{"ppo_config": ..., "extra": {"task_config": ...}}`) alike,
+rebuilding the network from the weight shapes.
+
 ## Usage
 
 ```python
@@ -18,6 +23,9 @@ walk_fn, _  = load_stable_locomotion(device)    # ready-to-use policy callable
 library     = stable_go2_library(lidar, device) # walk (+avoid when lidar given)
 ```
 
+`stable_policy` raises `KeyError` for an unregistered name and
+`FileNotFoundError` when the registered file has not been copied here yet.
+
 ## Promoting a new checkpoint
 
 Copy it over the corresponding file here, e.g.:
@@ -26,7 +34,8 @@ Copy it over the corresponding file here, e.g.:
 cp runs/go2_cpg/checkpoint_final_newbest.pt policies/walk.pt
 ```
 
-Register additional skills by adding to `STABLE` in `domo/policies.py`.
+Register additional skills by adding to `STABLE` in `domo/policies.py`
+(and a loader if the skill needs one).
 
 > The `*.pt` files are git-ignored (like `runs/`); this is a curated local
 > cache. The registry (`domo/policies.py`) and this README are versioned.

@@ -24,26 +24,32 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+from .skill import all_envs
+
 __all__ = ["RealControlLoop", "SimControlLoop"]
 
+# command_filter(command [N, D], robot_state) → filtered command [N, D].
 CommandFilter = Callable[[torch.Tensor, object], torch.Tensor]
 
 
 class _ControlLoopBase:
+    """Shared half-cycles of every control loop; subclasses define `step()`.
+
+    Sensors are duck-typed: anything with `tick()` is refreshed after time
+    advances, anything with `reset_idx()` is reset with the robot.
+    """
 
     def __init__(self, robot, controller, dt: float,
                  sensors: Sequence = (),
                  command_filter: CommandFilter | None = None):
         """
-        Base class for control loops.
-
         Args:
-            robot: The robot instance to control.
-            controller: The controller that decides which actions to take.
+            robot: The robot facade to control (already bound).
+            controller: The Controller producing joint targets each cycle.
             dt: The time step for each control cycle in seconds.
-            sensors: A sequence of exteroceptive sensors (e.g., Lidar) to tick.
-            command_filter: An optional safety layer function that can modify
-                commands before they are sent to the actuators.
+            sensors: Exteroceptive sensors (e.g. lidar) to tick each cycle.
+            command_filter: Optional safety layer applied to every command
+                before it reaches the actuators (M7 seat).
         """
         self.robot = robot
         self.controller = controller
@@ -53,17 +59,21 @@ class _ControlLoopBase:
 
     def reset(self):
         """
-        Resets the robot, controller, and all sensors to their initial states.
-        This is called at the beginning of a new run or episode.
+        Reset robot, controller and sensors for all envs (start of a run or
+        episode) and return the fresh RobotState.
         """
-        all_envs = torch.arange(self.robot.n_envs, device=self.robot.device)
-        self.robot.reset_idx(all_envs)
-        self.controller.reset_idx(all_envs)
+        envs = all_envs(self.robot)
+        self.robot.reset_idx(envs)
+        self.controller.reset_idx(envs)
         for sensor in self.sensors:
             if hasattr(sensor, "reset_idx"):
-                sensor.reset_idx(all_envs)
+                sensor.reset_idx(envs)
         self.robot.refresh()
         return self.robot.state
+
+    def step(self):
+        """One full control cycle: pre-half, advance time, post-half."""
+        raise NotImplementedError
 
     def _cycle_pre(self):
         """
@@ -94,6 +104,9 @@ class _ControlLoopBase:
             n_steps: The number of control steps to execute.
             callback: An optional function `callback(step_index, robot_state)`
                 called after each step.
+
+        Returns:
+            The RobotState after the last cycle.
         """
         state = self.robot.state
         for i in range(n_steps):
@@ -110,10 +123,9 @@ class SimControlLoop(_ControlLoopBase):
                  sensors: Sequence = (),
                  command_filter: CommandFilter | None = None):
         """
-        Initialises the simulation control loop.
-
         Args:
-            scene: The physics scene to step.
+            scene: The physics scene handle (`scene.step()` advances time by
+                the scene's own dt — it must equal `dt`).
             robot: The robot instance in the simulation.
             controller: The controller orchestrating the robot's skills.
             dt: The control loop time step.
@@ -146,6 +158,8 @@ class RealControlLoop(_ControlLoopBase):
         if remaining > 0:
             time.sleep(remaining)
         else:
+            # Overruns are reported, not raised: on hardware a late cycle is
+            # better than a dead loop. The M7 layer decides what to do with them.
             print(f"  [loop] overrun: cycle took {self.dt - remaining:.4f}s "
                   f"(budget {self.dt:.4f}s)")
         return self._cycle_post()

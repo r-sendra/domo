@@ -46,7 +46,20 @@ def build_cpg_observation(state: RobotState, commands: torch.Tensor,
                           last_actions: torch.Tensor,
                           foot_contacts: torch.Tensor,
                           oscillators: CPGOscillators) -> torch.Tensor:
-    """The 76-dim observation every CPG locomotion checkpoint expects."""
+    """The 76-dim observation every CPG locomotion checkpoint expects.
+
+    Args:
+        state: RobotState with base velocities, gravity, dof_pos/vel [N, 12].
+        commands: body-frame (vx, vy, vyaw) [N, 3].
+        commands_scale: per-channel scale [3] (lin_vel, lin_vel, ang_vel).
+        default_dof_pos: stance joint angles [12].
+        last_actions: previous raw policy action [N, 12].
+        foot_contacts: [N, 4] float 0/1 (sensor or stance-phase proxy).
+        oscillators: the CPG bank supplying its 24 phase features.
+
+    Returns:
+        obs [N, 76].
+    """
     s = CPG_OBS_SCALES
     return torch.cat([
         state.base_lin_vel * s["lin_vel"],                       # 3
@@ -61,8 +74,11 @@ def build_cpg_observation(state: RobotState, commands: torch.Tensor,
     ], dim=-1)
 
 # Trot: diagonal pairs (FR+RL, FL+RR) in phase, opposite pairs π apart.
+# Leg order is the canonical [FR, FL, RR, RL].
 _TROT_PHASE = (0.0, math.pi, math.pi, 0.0)
 
+# Desired phase offsets phi*[i][j] = theta_j − theta_i for the Kuramoto
+# coupling term; row/col in the same leg order.
 _TROT_PHI_STAR = (
     (0.0, math.pi, math.pi, 0.0),
     (math.pi, 0.0, 0.0, math.pi),
@@ -70,9 +86,18 @@ _TROT_PHI_STAR = (
     (0.0, math.pi, math.pi, 0.0),
 )
 
+# Initial direction-phase offset relative to the leg phase on reset (as in
+# the reference script; small so the gait starts nearly straight).
+_RESET_PHI_SCALE = 0.1
+
 
 @dataclass
 class CPGConfig:
+    """Oscillator dynamics, policy action ranges and foot-trajectory shaping.
+
+    Defaults are the values the bundled CPG checkpoints were trained with;
+    change them only together with a retrained policy.
+    """
     # Oscillator dynamics
     a_conv: float = 150.0            # convergence factor (critically damped)
     integration_dt: float = 0.001    # internal step [s] (1 kHz, as the paper)
@@ -112,7 +137,11 @@ class CPGOscillators:
         self.omg_mid, self.omg_half = 0.5 * (omg_max + omg_min), 0.5 * (omg_max - omg_min)
 
     def map_action(self, raw: torch.Tensor):
-        """Squash a raw [N, 12] policy action into (mu, omega_hz, psi)."""
+        """Squash a raw [N, 12] policy action into (mu, omega_hz, psi), each [N, 4].
+
+        tanh maps each 4-block into its configured range: mu ∈ mu_range,
+        omega ∈ omega_range_hz, psi ∈ ±psi_max.
+        """
         t = torch.tanh(raw)
         mu = self.mu_mid + self.mu_half * t[:, 0:4]
         omega_hz = self.omg_mid + self.omg_half * t[:, 4:8]
@@ -121,7 +150,12 @@ class CPGOscillators:
 
     def step(self, mu: torch.Tensor, omega_hz: torch.Tensor, psi: torch.Tensor,
              control_dt: float) -> None:
-        """Integrate the oscillator ODEs over one control step."""
+        """Integrate the oscillator ODEs over one control step (Euler sub-steps).
+
+        Amplitude follows the critically damped second-order law of the paper,
+        r̈ = a (a/4 (μ − r) − ṙ); phase advances at ω plus the Kuramoto
+        coupling Σ_j sin(θ_j − θ_i − φ*_ij) pulling the legs into a trot.
+        """
         cfg = self.cfg
         n_sub = max(1, round(control_dt / cfg.integration_dt))
         dt_c = control_dt / n_sub
@@ -148,10 +182,11 @@ class CPGOscillators:
         return (torch.sin(self.theta) < 0).float()
 
     def reset_idx(self, envs_idx: torch.Tensor) -> None:
+        """Restart the given envs at unit amplitude in the trot phase pattern."""
         self.r[envs_idx] = 1.0
         self.rdot[envs_idx] = 0.0
         self.theta[envs_idx] = self._trot_phase
-        self.phi[envs_idx] = self._trot_phase * 0.1
+        self.phi[envs_idx] = self._trot_phase * _RESET_PHI_SCALE
 
     def observation(self) -> torch.Tensor:
         """[N, 24] oscillator features: r, rdot, cos/sin(theta), cos/sin(phi)."""
@@ -175,6 +210,15 @@ class CPGLegController:
         self.oscillators = CPGOscillators(cfg, n_envs, device)
 
     def joint_targets(self, raw_action: torch.Tensor, control_dt: float) -> torch.Tensor:
+        """Advance the oscillators one control step and return joint targets [N, 12].
+
+        Foot targets in each hip frame follow the paper's mapping: the step
+        amplitude d_step·(r − 1) swings the foot along the direction phase φ
+        (cos φ forward, sin φ sideways), and the vertical profile lifts by
+        g_clear during swing (sin θ > 0) and presses g_pen into the ground
+        during stance, around the nominal depth h_nom. The lateral offset
+        ±l_hip keeps the foot under the abduction joint.
+        """
         cfg, osc = self.cfg, self.oscillators
         mu, omega_hz, psi = osc.map_action(raw_action)
         osc.step(mu, omega_hz, psi, control_dt)
@@ -196,4 +240,5 @@ class CPGLegController:
         return targets
 
     def reset_idx(self, envs_idx: torch.Tensor) -> None:
+        """Reset the oscillator bank for the given envs."""
         self.oscillators.reset_idx(envs_idx)

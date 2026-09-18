@@ -1,5 +1,9 @@
 """
 Shared visualisation helpers for the SLAM examples:
+  * `slam_snapshot`     — a small JSON-serialisable telemetry dict for the
+                          live dashboard (pose, velocity, map, cloud, lidar).
+  * `go2_robot_manifest`— the 3D-viewer manifest entry + asset root for the
+                          Go2 URDF (served by the dashboard under /assets).
   * `save_point_cloud`  — a static 3D point-cloud scatter PNG.
   * `SlamLiveView`      — a LIVE matplotlib window that redraws the
                           reconstruction as the Genesis sim steps (run Genesis
@@ -8,15 +12,23 @@ Shared visualisation helpers for the SLAM examples:
 
 Backend note: the *examples* pick the matplotlib backend once at startup
 (Agg when only saving; a GUI backend when `--live`). These helpers never call
-`matplotlib.use()`, so both paths coexist.
+`matplotlib.use()`, so both paths coexist. matplotlib itself is imported
+lazily inside the plotting helpers.
 
 Kept out of the library (domo/) because it pulls in matplotlib — it is
-example-side tooling. Both slam_demo.py and slam_replica_house.py import it.
+example-side tooling. Both slam_demo.py and slam_replica_house.py import it
+(`from slam_viz import …` works because the script's directory is on
+sys.path). It holds no web code, so importing it never loads the dashboard.
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
+
 import torch
+
+MAP_ROWS = 60               # occupancy grid is max-pooled down to ~this many rows
 
 
 def slam_snapshot(step, state, slam, lidar=None, cloud_pts=500, status="running"):
@@ -25,6 +37,9 @@ def slam_snapshot(step, state, slam, lidar=None, cloud_pts=500, status="running"
     pose/velocity/height/coverage, lidar sectors, a downsampled occupancy map,
     and a subsampled top-down point cloud. Cheap (vectorised max-pool + a few
     `.tolist()`); safe to call from the sim loop at a few Hz.
+
+    Keys match the dashboard page's expectations (see domo/dashboard.py):
+    t, status, pose, base, dof, vel, height, coverage, lidar, map, cloud, bounds.
     """
     snap = {
         "t": int(step),
@@ -45,22 +60,13 @@ def slam_snapshot(step, state, slam, lidar=None, cloud_pts=500, status="running"
         "coverage": round(float(slam.coverage()[0]) * 100, 1),
     }
     if lidar is not None:
-        try:
+        # Before the first scan a backend may have no buffer to read; the
+        # exact exception is backend-specific, so any failure just omits the
+        # lidar panel for this snapshot.
+        with contextlib.suppress(Exception):
             snap["lidar"] = [round(float(v), 2) for v in lidar.read()[0].tolist()]
-        except Exception:
-            pass
 
-    # Downsampled occupancy → rows ('#' occupied, '.' free, ' ' unknown).
-    g = slam.grid[0]
-    n = slam.n_cells
-    st = max(1, n // 60)
-    H = (n // st) * st
-    gp = g[:H, :H].reshape(H // st, st, H // st, st).amax(dim=(1, 3))
-    occ = (torch.sigmoid(gp) > slam.cfg.occ_threshold).tolist()
-    free = (gp < 0.0).tolist()
-    snap["map"] = ["".join("#" if occ[r][c] else "." if free[r][c] else " "
-                           for c in range(len(occ[0])))
-                   for r in range(len(occ))]
+    snap["map"] = _occupancy_rows(slam)
 
     cloud = slam.point_cloud()
     if cloud.shape[0] > 0:
@@ -74,22 +80,42 @@ def slam_snapshot(step, state, slam, lidar=None, cloud_pts=500, status="running"
     return snap
 
 
+def _occupancy_rows(slam) -> list[str]:
+    """Max-pooled occupancy → rows of '#' (occupied), '.' (free), ' ' (unknown)."""
+    g = slam.grid[0]
+    n = slam.n_cells
+    st = max(1, n // MAP_ROWS)
+    H = (n // st) * st
+    gp = g[:H, :H].reshape(H // st, st, H // st, st).amax(dim=(1, 3))
+    occ = (torch.sigmoid(gp) > slam.cfg.occ_threshold).tolist()
+    free = (gp < 0.0).tolist()
+    return ["".join("#" if occ[r][c] else "." if free[r][c] else " "
+                    for c in range(len(occ[0])))
+            for r in range(len(occ))]
+
+
 def go2_robot_manifest(spec):
     """
     Scene-manifest entry + asset root for rendering a robot's URDF in the 3D
     dashboard viewer: served under /assets/robot/, joints in dof order.
     Returns (robot_dict, root_dir).
     """
-    import os
     urdf = spec.urdf_path
     if not os.path.isabs(urdf):
-        import genesis
+        import genesis  # heavy: only to locate its bundled asset dir
         urdf = os.path.join(os.path.dirname(genesis.__file__), "assets", urdf)
     urdf = os.path.abspath(urdf)
     root = os.path.dirname(os.path.dirname(urdf))       # <robot>/ (urdf/ + meshes/)
     rel = os.path.relpath(urdf, root).replace(os.sep, "/")
     return {"urdf": "/assets/robot/" + rel,
             "dof_names": list(spec.joint_names)}, root
+
+
+def _subsample(cloud: torch.Tensor, max_pts: int) -> torch.Tensor:
+    """Random subset of at most `max_pts` rows (plots stay responsive)."""
+    if cloud.shape[0] > max_pts:
+        return cloud[torch.randperm(cloud.shape[0])[:max_pts]]
+    return cloud
 
 
 def save_point_cloud(cloud, path, title="SLAM point cloud"):
@@ -104,12 +130,12 @@ def save_point_cloud(cloud, path, title="SLAM point cloud"):
     ax = fig.add_subplot(111, projection="3d")
     s = ax.scatter(c[:, 0], c[:, 1], c[:, 2], c=c[:, 2], cmap="viridis",
                    s=1.0, linewidths=0)
-    ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)"); ax.set_zlabel("z (m)")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_zlabel("z (m)")
     ax.set_title(f"{title} ({len(c):,} points)")
-    try:
+    with contextlib.suppress(AttributeError, ValueError):   # older matplotlib
         ax.set_box_aspect((1, 1, 0.35))
-    except Exception:
-        pass
     fig.colorbar(s, ax=ax, label="height z (m)", shrink=0.5, pad=0.1)
     ax.view_init(elev=38, azim=-60)
     plt.tight_layout()
@@ -155,7 +181,9 @@ class SlamLiveView:
             self.fig.show()
             self.plt.pause(0.001)
             self.ok = True
-        except Exception as e:                       # headless / no GUI backend
+        except Exception as e:
+            # Which exception a missing display raises depends on the GUI
+            # toolkit (Tk, Qt, macOS); all of them mean "no live window".
             print(f"  [viz] live view unavailable ({type(e).__name__}: {e}); "
                   f"continuing without it")
 
@@ -168,11 +196,10 @@ class SlamLiveView:
         cloud = slam.point_cloud()
         if cloud.shape[0] == 0:
             return
-        if cloud.shape[0] > self.max_pts:
-            cloud = cloud[torch.randperm(cloud.shape[0])[:self.max_pts]]
-        c = cloud.cpu().numpy()
+        c = _subsample(cloud, self.max_pts).cpu().numpy()
         rx, ry = float(state.base_pos[0, 0]), float(state.base_pos[0, 1])
-        self.trail_x.append(rx); self.trail_y.append(ry)
+        self.trail_x.append(rx)
+        self.trail_y.append(ry)
         self.ax.clear()
         self.ax.scatter(c[:, 0], c[:, 1], c=c[:, 2], cmap="viridis",
                         s=2, linewidths=0)
@@ -180,13 +207,14 @@ class SlamLiveView:
                      lw=1.0, alpha=0.6)
         self.ax.plot(rx, ry, "^", color="red", ms=10)
         self.ax.set_aspect("equal")
-        self.ax.set_xlabel("x (m)"); self.ax.set_ylabel("y (m)")
+        self.ax.set_xlabel("x (m)")
+        self.ax.set_ylabel("y (m)")
         self.ax.set_title(f"{self.title} — step {self._t}  ({len(c):,} pts)")
         try:
             self.fig.canvas.draw_idle()
             self.plt.pause(0.001)                    # pump the GUI event loop
         except Exception:
-            self.ok = False                          # window closed → stop
+            self.ok = False        # window closed by the user → stop drawing (toolkit-specific error)
 
     def keep_open(self) -> None:
         """Block at the end so the final reconstruction stays on screen."""
@@ -219,10 +247,7 @@ class SlamRecorder:
         cloud = slam.point_cloud()
         if cloud.shape[0] == 0:
             return
-        if cloud.shape[0] > self.max_pts:
-            idx = torch.randperm(cloud.shape[0])[:self.max_pts]
-            cloud = cloud[idx]
-        self.frames.append((cloud.cpu().numpy(),
+        self.frames.append((_subsample(cloud, self.max_pts).cpu().numpy(),
                             (float(state.base_pos[0, 0]),
                              float(state.base_pos[0, 1])),
                             self._t))
@@ -236,6 +261,7 @@ class SlamRecorder:
         import numpy as np
         from matplotlib.animation import FuncAnimation, PillowWriter
 
+        # Fixed axes/colour limits across frames so the animation doesn't jump.
         allpts = np.concatenate([f[0] for f in self.frames], axis=0)
         xlim = (allpts[:, 0].min(), allpts[:, 0].max())
         ylim = (allpts[:, 1].min(), allpts[:, 1].max())
@@ -247,14 +273,17 @@ class SlamRecorder:
         def draw(i):
             ax.clear()
             pts, (rx, ry), step = self.frames[i]
-            trail_x.append(rx); trail_y.append(ry)
+            trail_x.append(rx)
+            trail_y.append(ry)
             ax.scatter(pts[:, 0], pts[:, 1], c=pts[:, 2], cmap="viridis",
                        s=2, vmin=zlo, vmax=zhi, linewidths=0)
             ax.plot(trail_x, trail_y, "-", color="red", lw=1.0, alpha=0.6)
             ax.plot(rx, ry, "^", color="red", ms=10)
-            ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
             ax.set_aspect("equal")
-            ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+            ax.set_xlabel("x (m)")
+            ax.set_ylabel("y (m)")
             ax.set_title(f"{title} — step {step}  ({len(pts):,} pts)")
 
         anim = FuncAnimation(fig, draw, frames=len(self.frames),

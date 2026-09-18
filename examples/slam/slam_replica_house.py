@@ -13,16 +13,32 @@ The digital twin (goal-free World) builds the scene + robot + XT16 lidar; a
 PlanningController authors the wander program each cycle (`avoid @ walk`, then
 a turn); SLAM rides on top as a persistent observer, ticked every step.
 
+Library pieces exercised: domo.world (World/WorldConfig, scene_kind="replica",
+optional offscreen camera), domo.control (SlamSkill/SlamConfig),
+domo.skills (PlanningController, make_go2_library), domo.policies (stable
+'walk' + 'avoid'), domo.dashboard (only with --dashboard/--dashboard-url),
+plus the example-side slam_viz helpers. No frozen-script counterpart.
+
     # stable walk+avoid policies by default; save a cloud PNG
     python examples/slam/slam_replica_house.py --headless --device cpu --out house.png
+    # GPU with the Genesis viewer
+    python examples/slam/slam_replica_house.py
     # watch the house map build LIVE in a separate window (Genesis headless)
     python examples/slam/slam_replica_house.py --headless --device cpu --live
+    # live web dashboard (in-process, or decoupled via --dashboard-url)
+    python examples/slam/slam_replica_house.py --headless --device cpu --dashboard 8080
 
 Assets: scripts/house_scene/data/replica_cad/ (scene apt_0 by default).
+Building the house takes ~2 min on CPU. Prints a progress line every 500
+steps (position, wander leg, coverage), then the SLAM ASCII map, coverage
+and cloud size. Saves the 3D scatter PNG (--out) and optionally a GIF
+(--animate). With a dashboard the process stays alive after the run until
+Ctrl+C or the page's stop button.
 """
 
 import argparse
 import random
+import signal
 import time
 
 import torch
@@ -46,12 +62,28 @@ SPAWN = (3.0, -3.0, 0.44)          # house spawn from the avoidance experiments
 SPAWN_YAW_DEG = 180.0
 GROUND_H = 0.2                     # ReplicaCAD floor height
 
+CONTROL_DT = 0.02
+WANDER_VX = 0.4                    # forward speed of each wander leg (m/s)
+# Cap avoid's forward/back authority so it STEERS around furniture but can
+# never cancel the walk's forward progress (the conservative policy would
+# otherwise freeze the robot in a cluttered house). (Δvx, Δvy, Δvyaw)
+AVOID_DELTAS = (0.2, 0.5, 1.2)
+REPORT_EVERY = 500                 # progress line cadence (steps)
+PUBLISH_EVERY = 10                 # dashboard snapshot cadence (~5 Hz at 50 Hz)
+PAUSE_IDLE_S = 0.05                # sleep while the dashboard has us paused
+HOLD_POLL_S = 0.3                  # command poll cadence after the run
+CAMERA_RES = (360, 260)            # offscreen dashboard camera
+
 
 def load_avoid_policy(path, device):
+    """Callable obs → raw Δv from a trained avoidance checkpoint."""
     ckpt = load_checkpoint(path, device)
     net = ActorCritic.from_state_dict(clean_state_dict(ckpt["model_state"]))
     net.eval().to(device)
-    return lambda obs: net.get_action(obs, deterministic=True)[0]
+
+    def avoid_policy(obs):
+        return net.get_action(obs, deterministic=True)[0]
+    return avoid_policy
 
 
 class HouseWanderer(PlanningController):
@@ -83,12 +115,143 @@ class HouseWanderer(PlanningController):
             return f"(avoid @ walk(vx={self.vx})).for(6)"
         return f"walk(vyaw={random.choice([-0.8, 0.8]):.1f}).for(2)"
 
+    def restart(self) -> None:
+        """Back to leg 0 with no program (dashboard reset)."""
+        self.n_legs = 0
+        self.program = None
+        self.active = self.IDLE
 
-def main():
-    # Ctrl+C should kill immediately: Genesis build/step are long C calls that
-    # defer Python's KeyboardInterrupt, so use the OS default SIGINT (hard kill).
-    import signal
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+# ---------------------------------------------------------------------------
+# World / brain / dashboard
+# ---------------------------------------------------------------------------
+
+def build_world(args, device) -> World:
+    """The twin: goal-free World builds the house + robot + XT16 lidar (+ camera)."""
+    cam_res = CAMERA_RES if (args.dashboard and args.dashboard_camera) else None
+    return World(WorldConfig(
+        device=device, dt=CONTROL_DT, headless=args.headless,
+        scene_kind="replica", ground_height=GROUND_H,
+        replica_scene_json=args.scene_json, replica_asset_root=args.asset_root,
+        base_init_pos=SPAWN, base_init_yaw_deg=SPAWN_YAW_DEG,
+        lidar_model=hesai_xt16(n_horizontal=args.azimuth),
+        camera_res=cam_res, camera_pos=(SPAWN[0] + 5, SPAWN[1] - 5, 4.0),
+        camera_lookat=(SPAWN[0], SPAWN[1], 0.5)), n_envs=1)
+
+
+def build_brain(args, world):
+    """Walk + avoid library from the stable registry, the SLAM layer, the wanderer."""
+    device = str(world.device)
+    cpg_ckpt = args.cpg_checkpoint or stable_policy("walk")
+    avoid_ckpt = args.avoid_checkpoint or stable_policy("avoid")
+    walk_policy, _ = load_locomotion_policy(cpg_ckpt, device)
+    avoid_policy = load_avoid_policy(avoid_ckpt, device)
+    library = make_go2_library(walk_policy, avoid_policy, world.lidar,
+                               avoid_deltas=AVOID_DELTAS)
+
+    slam = SlamSkill(world.lidar, SlamConfig(
+        resolution=0.1, half_extent=10.0, origin=(SPAWN[0], SPAWN[1]),
+        z_band=(GROUND_H + 0.2, GROUND_H + 1.4), map_max_range=10.0))
+    controller = HouseWanderer(library, slam, vx=WANDER_VX)
+    controller.setup(world.robot)
+    slam.setup(world.robot)
+    return controller, slam
+
+
+def attach_dashboard(args):
+    """In-process or decoupled dashboard (or None); robot-only 3D scene for now."""
+    if not (args.dashboard_url or args.dashboard):
+        return None
+    from domo.dashboard import Dashboard, DashboardClient  # LAZY: web code only now
+    from domo.robot import GO2
+    dash = (DashboardClient(args.dashboard_url).start() if args.dashboard_url
+            else Dashboard(port=args.dashboard, title="DOMO SLAM — house").start())
+    robot_m, robot_root = go2_robot_manifest(GO2)   # robot renders; house meshes = Phase B
+    dash.set_scene({"boxes": [], "robot": robot_m, "up": "z"},
+                   roots={"robot": robot_root})
+    return dash
+
+
+def hold_dashboard(dash, args) -> None:
+    """Keep serving the final state until Ctrl+C or the page's stop button."""
+    where = args.dashboard_url or f"http://127.0.0.1:{args.dashboard}"
+    print(f"  [dashboard] still live at {where} — Ctrl+C to exit.")
+    try:
+        while dash.poll_command() != "stop":
+            time.sleep(HOLD_POLL_S)
+    except KeyboardInterrupt:
+        pass
+    dash.stop()
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+def run(args, world, loop, controller, slam, dash, recorder, live):
+    """
+    Wander + map. Dashboard commands: pause toggles (sim frozen, still
+    publishing), reset restarts the episode, map and wanderer, stop ends the
+    run. Returns (steps_done, final_state).
+    """
+    state = loop.reset()
+    slam.reset_idx(torch.arange(1))
+
+    def publish(i, status):
+        if dash and (i % PUBLISH_EVERY == 0 or status != "running"):
+            frame = world.camera.render() if world.camera is not None else None
+            dash.publish(slam_snapshot(i, state, slam, world.lidar, status=status),
+                         frame)
+
+    i, paused = 0, False
+    while i < args.steps:
+        if dash:                            # dashboard buttons → sim control
+            c = dash.poll_command()
+            if c == "stop":
+                print("  [dashboard] stop")
+                break
+            if c == "pause":
+                paused = not paused
+                print(f"  [dashboard] {'paused' if paused else 'resumed'}")
+            if c == "reset":
+                print("  [dashboard] reset")
+                state = loop.reset()
+                slam.reset_idx(torch.arange(1))
+                controller.restart()
+                i = 0
+        if paused:
+            publish(i, "paused")
+            time.sleep(PAUSE_IDLE_S)
+            continue
+
+        state = loop.step()                 # the wanderer ticks SLAM in update()
+        if recorder:
+            recorder.capture(slam, state)
+        if live:
+            live.update(slam, state)
+        publish(i, "running")
+        if (i + 1) % REPORT_EVERY == 0:
+            print(f"  step {i + 1:5d} | pos=("
+                  f"{state.base_pos[0, 0]:+.2f},{state.base_pos[0, 1]:+.2f}) | "
+                  f"leg {controller.n_legs}/{controller.max_legs} | "
+                  f"coverage={slam.coverage()[0].item() * 100:4.1f}%")
+        if controller.idle and controller.n_legs > controller.max_legs:
+            break
+        i += 1
+    return i, state
+
+
+def report(slam, out_path) -> None:
+    print("\nSLAM occupancy map (# occupied, . free, ' ' unknown):\n"
+          + slam.render_ascii(step=3))
+    print(f"\nCoverage: {slam.coverage()[0].item() * 100:.1f}% of the map is "
+          f"confidently known (blind wander → honest gaps).")
+    cloud = slam.point_cloud()
+    print(f"3D point cloud: {cloud.shape[0]:,} accumulated world points.")
+    save_point_cloud(cloud, out_path, title="SLAM point cloud — ReplicaCAD house")
+
+
+def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--cpg-checkpoint", default=None,
                    help="CPG walk checkpoint (default: stable 'walk')")
@@ -120,7 +283,14 @@ def main():
                         "sim-thread cost; off by default)")
     p.add_argument("--headless", action="store_true", default=False)
     p.add_argument("--device", default="cuda")
-    args = p.parse_args()
+    return p.parse_args()
+
+
+def main():
+    # Ctrl+C should kill immediately: Genesis build/step are long C calls that
+    # defer Python's KeyboardInterrupt, so use the OS default SIGINT (hard kill).
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    args = parse_args()
 
     # Backend before any pyplot use: Agg for files, GUI when --live.
     import matplotlib
@@ -129,118 +299,32 @@ def main():
     device = pick_device(args.device)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    dt = 0.02
 
     # --- the twin: goal-free World builds the house + robot + XT16 lidar ----
-    cam_res = (360, 260) if (args.dashboard and args.dashboard_camera) else None
-    world = World(WorldConfig(
-        device=device, dt=dt, headless=args.headless,
-        scene_kind="replica", ground_height=GROUND_H,
-        replica_scene_json=args.scene_json, replica_asset_root=args.asset_root,
-        base_init_pos=SPAWN, base_init_yaw_deg=SPAWN_YAW_DEG,
-        lidar_model=hesai_xt16(n_horizontal=args.azimuth),
-        camera_res=cam_res, camera_pos=(SPAWN[0] + 5, SPAWN[1] - 5, 4.0),
-        camera_lookat=(SPAWN[0], SPAWN[1], 0.5)), n_envs=1)
+    world = build_world(args, device)
 
-    # --- skills: walk + avoid from the stable registry, layered library ------
-    cpg_ckpt = args.cpg_checkpoint or stable_policy("walk")
-    avoid_ckpt = args.avoid_checkpoint or stable_policy("avoid")
-    walk_policy, _ = load_locomotion_policy(cpg_ckpt, str(device))
-    avoid_policy = load_avoid_policy(avoid_ckpt, str(device))
-    # Cap avoid's forward/back authority so it STEERS around furniture but can
-    # never cancel the walk's forward progress (the conservative policy would
-    # otherwise freeze the robot in a cluttered house).
-    library = make_go2_library(walk_policy, avoid_policy, world.lidar,
-                               avoid_deltas=(0.2, 0.5, 1.2))
+    # --- skills + SLAM layer + wanderer --------------------------------------
+    controller, slam = build_brain(args, world)
 
-    # --- SLAM perception layer over the house --------------------------------
-    slam = SlamSkill(world.lidar, SlamConfig(
-        resolution=0.1, half_extent=10.0, origin=(SPAWN[0], SPAWN[1]),
-        z_band=(GROUND_H + 0.2, GROUND_H + 1.4), map_max_range=10.0))
-    controller = HouseWanderer(library, slam, vx=0.4)
-    controller.setup(world.robot)
-    slam.setup(world.robot)
-
-    # --- run: wander + map ---------------------------------------------------
+    # --- observers: GIF recorder, live plot, dashboard -----------------------
     loop = world.make_loop(controller)
-    state = loop.reset()
-    slam.reset_idx(torch.arange(1))
     recorder = SlamRecorder(every=args.animate_every) if args.animate else None
     live = SlamLiveView(every=args.live_every) if args.live else None
-    dash = None
-    if args.dashboard_url or args.dashboard:     # LAZY: only now is web code loaded
-        from domo.dashboard import Dashboard, DashboardClient
-        from domo.robot import GO2
-        dash = (DashboardClient(args.dashboard_url).start() if args.dashboard_url
-                else Dashboard(port=args.dashboard,
-                               title="DOMO SLAM — house").start())
-        robot_m, robot_root = go2_robot_manifest(GO2)   # robot renders; meshes=Phase B
-        dash.set_scene({"boxes": [], "robot": robot_m, "up": "z"},
-                       roots={"robot": robot_root})
+    dash = attach_dashboard(args)
     print(f"Wandering the ReplicaCAD house (spawn {SPAWN[:2]}) ...")
 
-    def publish(i, status):
-        if dash and (i % 10 == 0 or status != "running"):
-            frame = world.camera.render() if world.camera is not None else None
-            dash.publish(slam_snapshot(i, state, slam, world.lidar, status=status),
-                         frame)
-
-    i, paused = 0, False
-    while i < args.steps:
-        if dash:                            # dashboard buttons → sim control
-            c = dash.poll_command()
-            if c == "stop":
-                print("  [dashboard] stop"); break
-            if c == "pause":
-                paused = not paused
-                print(f"  [dashboard] {'paused' if paused else 'resumed'}")
-            if c == "reset":
-                print("  [dashboard] reset")
-                state = loop.reset(); slam.reset_idx(torch.arange(1))
-                controller.n_legs = 0; controller.program = None
-                controller.active = controller.IDLE; i = 0
-        if paused:
-            publish(i, "paused"); time.sleep(0.05); continue
-
-        state = loop.step()
-        if recorder:
-            recorder.capture(slam, state)
-        if live:
-            live.update(slam, state)
-        publish(i, "running")
-        if (i + 1) % 500 == 0:
-            print(f"  step {i + 1:5d} | pos=("
-                  f"{state.base_pos[0, 0]:+.2f},{state.base_pos[0, 1]:+.2f}) | "
-                  f"leg {controller.n_legs}/{controller.max_legs} | "
-                  f"coverage={slam.coverage()[0].item() * 100:4.1f}%")
-        if controller.idle and controller.n_legs > controller.max_legs:
-            break
-        i += 1
+    # --- run: wander + map ---------------------------------------------------
+    i, state = run(args, world, loop, controller, slam, dash, recorder, live)
 
     # --- result --------------------------------------------------------------
-    print("\nSLAM occupancy map (# occupied, . free, ' ' unknown):\n"
-          + slam.render_ascii(step=3))
-    print(f"\nCoverage: {slam.coverage()[0].item() * 100:.1f}% of the map is "
-          f"confidently known (blind wander → honest gaps).")
-    cloud = slam.point_cloud()
-    print(f"3D point cloud: {cloud.shape[0]:,} accumulated world points.")
-    save_point_cloud(cloud, args.out, title="SLAM point cloud — ReplicaCAD house")
+    report(slam, args.out)
     if recorder:
         recorder.save_gif(args.animate, title="SLAM house map forming (top-down)")
     if live:
         live.keep_open()
     if dash:
         dash.publish(slam_snapshot(i, state, slam, world.lidar, status="stopped"))
-        print(f"  [dashboard] still live at http://127.0.0.1:{args.dashboard} "
-              f"— Ctrl+C to exit.")
-        try:
-            while True:
-                if dash.poll_command() == "stop":
-                    break
-                time.sleep(0.3)
-        except KeyboardInterrupt:
-            pass
-        dash.stop()
+        hold_dashboard(dash, args)
 
 
 if __name__ == "__main__":

@@ -18,14 +18,27 @@ from dataclasses import dataclass
 
 import torch
 
-from .skill import CommandSkill
+from .skill import CommandSkill, planar_pose
 
 __all__ = ["SlamConfig", "SlamSkill"]
+
+# Returns closer than this (m, planar) are the robot's own body/legs — never
+# mapped as obstacles.
+_MIN_HIT_DIST = 0.05
+# |log-odds| above which a cell counts as "known" for coverage().
+_KNOWN_LOG_ODDS = 0.5
+# Target width (columns) of the default render_ascii() downsample.
+_ASCII_COLS = 48
 
 
 @dataclass
 class SlamConfig:
-    """Occupancy-grid + localisation parameters for SlamSkill."""
+    """Occupancy-grid + localisation parameters for SlamSkill.
+
+    Log-odds model: each cell starts at 0 (P = 0.5, unknown); hits add
+    `l_occ`, free-space samples add `l_free`, and |value| is clamped to
+    `l_clamp`. P(occupied) = sigmoid(log-odds).
+    """
     resolution: float = 0.15             # metres per map cell
     half_extent: float = 8.0             # map spans origin ± this (m)
     origin: tuple[float, float] = (0.0, 0.0)   # world centre of the grid
@@ -37,7 +50,9 @@ class SlamConfig:
                                          # is NOT carved free — stops beams that
                                          # skim over short walls (in the 2D
                                          # projection) from erasing them
-    occ_first: bool = True               # apply hits before free within a scan
+    occ_first: bool = True               # hits are applied before free-carving
+                                         # (the only order implemented; kept
+                                         # for config compatibility)
     occ_threshold: float = 0.65          # P(occupied) above → "occupied"
     free_threshold: float = 0.35         # P(occupied) below → "free"
     # High-fidelity mode: consume the lidar's raw 3D world points (if exposed)
@@ -84,7 +99,13 @@ class SlamSkill(CommandSkill):
     additive = True                 # contributes zero, so it only observes
 
     def __init__(self, lidar, cfg: SlamConfig | None = None):
-        """lidar: sensor with read() → [N, n_sectors] and n_sectors/max_range."""
+        """
+        Args:
+            lidar: sensor with read() → [N, n_sectors] plus `n_sectors` and
+                `max_range` attributes; optionally read_points() →
+                ([N, P, 3] world points, [N, P] validity) for point mode.
+            cfg: grid / cloud parameters.
+        """
         self.lidar = lidar
         self.cfg = cfg or SlamConfig()
 
@@ -92,8 +113,8 @@ class SlamSkill(CommandSkill):
         super().setup(robot)
         c = self.cfg
         n, dev = robot.n_envs, robot.device
-        self.n_cells = int(round(2 * c.half_extent / c.resolution))
-        # Per-env log-odds occupancy grid; 0 = unknown (P = 0.5).
+        self.n_cells = round(2 * c.half_extent / c.resolution)
+        # Per-env log-odds occupancy grid [N, rows(y), cols(x)]; 0 = unknown.
         self.grid = torch.zeros(n, self.n_cells, self.n_cells, device=dev)
         self._zero = torch.zeros(n, 3, device=dev)
         k = self.lidar.n_sectors
@@ -102,6 +123,8 @@ class SlamSkill(CommandSkill):
         self._max_range = float(self.lidar.max_range)
         # High-fidelity 3D-points mode when the lidar exposes per-beam points.
         self._use_points = c.use_points and hasattr(self.lidar, "read_points")
+        # Distances sampled along every beam for free-space carving [S]; one
+        # sample per cell so no cell along a ray is skipped.
         ray_max = c.map_max_range if self._use_points else self._max_range
         self._n_samp = int(ray_max / c.resolution) + 1
         self._ray_d = torch.arange(self._n_samp, device=dev) * c.resolution
@@ -113,6 +136,9 @@ class SlamSkill(CommandSkill):
         self._need_init = torch.ones(n, dtype=torch.bool, device=dev)
 
     def reset_idx(self, envs_idx: torch.Tensor) -> None:
+        # NOTE: LayerNode.enter() calls this, so `slam @ leg @ walk` per leg
+        # wipes the map every leg. Host SLAM persistently (tick it from a
+        # Controller) when the map must survive a whole mission.
         self.grid[envs_idx] = 0.0
         self._need_init[envs_idx] = True
         if 0 in envs_idx.tolist():
@@ -121,6 +147,7 @@ class SlamSkill(CommandSkill):
     # -- the layer's control-side contribution: nothing --------------------
 
     def update_command(self, state, dt: float) -> torch.Tensor:
+        """Integrate the scan every `update_interval` ticks; return zeros [N, 3]."""
         self._track_odometry(state, dt)
         self._step += 1
         if self._step % self.cfg.update_interval == 0:
@@ -133,11 +160,12 @@ class SlamSkill(CommandSkill):
     # -- localisation seam (odometry dead-reckoning + drift readout) -------
 
     def _track_odometry(self, state, dt: float) -> None:
+        """Dead-reckon the planar pose from body-frame velocity (no correction)."""
+        xy, yaw = planar_pose(state)
         if bool(self._need_init.any()):
             m = self._need_init
-            self._odom[m] = state.base_pos[m, :2]
+            self._odom[m] = xy[m]
             self._need_init[m] = False
-        yaw = state.base_euler[:, 2]
         v = state.base_lin_vel[:, :2]                 # body-frame planar velocity
         cy, sy = torch.cos(yaw), torch.sin(yaw)
         vx_w = cy * v[:, 0] - sy * v[:, 1]
@@ -152,6 +180,11 @@ class SlamSkill(CommandSkill):
     # -- mapping -----------------------------------------------------------
 
     def _to_cell(self, x, y):
+        """World (x, y) → (col, row, in_bounds); x indexes columns, y rows.
+
+        Out-of-range points are clamped to the edge cell, so callers must
+        mask with `in_bounds` before writing.
+        """
         c = self.cfg
         x0 = c.origin[0] - c.half_extent
         y0 = c.origin[1] - c.half_extent
@@ -160,40 +193,57 @@ class SlamSkill(CommandSkill):
         inb = (ci >= 0) & (ci < self.n_cells) & (ri >= 0) & (ri < self.n_cells)
         return ci.clamp(0, self.n_cells - 1), ri.clamp(0, self.n_cells - 1), inb
 
+    def _mark_hits(self, grid: torch.Tensor, hx: torch.Tensor, hy: torch.Tensor,
+                   valid: torch.Tensor | None = None) -> None:
+        """Add l_occ to the cells under the hit points (hx, hy) [K].
+
+        `grid` is one env's flattened log-odds [H*W]; `valid` [K] restricts
+        to beams that actually returned.
+        """
+        ci, ri, inb = self._to_cell(hx, hy)
+        mask = inb if valid is None else (valid & inb)
+        idx = (ri * self.n_cells + ci)[mask]
+        grid.index_add_(0, idx,
+                        torch.full_like(idx, self.cfg.l_occ, dtype=grid.dtype))
+
+    def _carve_free(self, grid: torch.Tensor, x0, y0, cos_b: torch.Tensor,
+                    sin_b: torch.Tensor, ranges: torch.Tensor) -> None:
+        """Add l_free along each beam strictly before its hit.
+
+        Beams start at (x0, y0) with direction (cos_b, sin_b) [K] and length
+        `ranges` [K]; samples are taken every cell (`_ray_d`, [S]) up to one
+        resolution short of the hit. A cell already ≥ sticky_occ is never
+        carved: in the 2D projection a beam skimming OVER a short wall would
+        otherwise erase the wall's own cell. Call after `_mark_hits` so the
+        current scan's hits are protected too.
+        """
+        c = self.cfg
+        d = self._ray_d
+        xs = x0 + d.unsqueeze(0) * cos_b.unsqueeze(1)              # [K, S]
+        ys = y0 + d.unsqueeze(0) * sin_b.unsqueeze(1)
+        ci, ri, inb = self._to_cell(xs, ys)
+        free = (d.unsqueeze(0) < (ranges.unsqueeze(1) - c.resolution)) & inb
+        fidx = (ri * self.n_cells + ci)[free]
+        fidx = fidx[grid[fidx] < c.sticky_occ]
+        grid.index_add_(0, fidx,
+                        torch.full_like(fidx, c.l_free, dtype=grid.dtype))
+
     def _integrate_scan(self, state) -> None:
+        """2D update from sector minima: one beam per sector at its centre bearing."""
         c = self.cfg
         ranges = self.lidar.read().clamp(max=self._max_range)      # [N, K]
-        px, py = state.base_pos[:, 0], state.base_pos[:, 1]
-        yaw = state.base_euler[:, 2]
+        xy, yaw = planar_pose(state)
+        px, py = xy[:, 0], xy[:, 1]
         bear = yaw.unsqueeze(1) + self._bearings.unsqueeze(0)       # [N, K]
         cos_b, sin_b = torch.cos(bear), torch.sin(bear)
-        d = self._ray_d                                            # [S]
 
         for e in range(self.grid.shape[0]):
             r = ranges[e]                                          # [K]
-            # Sample points along every beam: [K, S].
-            xs = px[e] + d.unsqueeze(0) * cos_b[e].unsqueeze(1)
-            ys = py[e] + d.unsqueeze(0) * sin_b[e].unsqueeze(1)
-            ci, ri, inb = self._to_cell(xs, ys)
-            flat = ri * self.n_cells + ci
             grid = self.grid[e].view(-1)
-
             # Occupied FIRST: the hit cell, only for beams that returned.
-            hit = r < self._max_range
-            hci, hri, hinb = self._to_cell(px[e] + r * cos_b[e],
-                                           py[e] + r * sin_b[e])
-            omask = hit & hinb
-            oidx = (hri * self.n_cells + hci)[omask]
-            grid.index_add_(0, oidx,
-                            torch.full_like(oidx, c.l_occ, dtype=grid.dtype))
-
-            # Free: cells strictly before the hit, but never eroding a cell
-            # that is already confidently occupied.
-            free = (d.unsqueeze(0) < (r.unsqueeze(1) - c.resolution)) & inb
-            fidx = flat[free]
-            fidx = fidx[grid[fidx] < c.sticky_occ]
-            grid.index_add_(0, fidx,
-                            torch.full_like(fidx, c.l_free, dtype=grid.dtype))
+            self._mark_hits(grid, px[e] + r * cos_b[e], py[e] + r * sin_b[e],
+                            valid=r < self._max_range)
+            self._carve_free(grid, px[e], py[e], cos_b[e], sin_b[e], r)
 
         self.grid.clamp_(-c.l_clamp, c.l_clamp)
 
@@ -204,10 +254,12 @@ class SlamSkill(CommandSkill):
         try:
             pts, valid = self.lidar.read_points()          # [N,P,3], [N,P]
         except NotImplementedError:
+            # The handle advertised read_points but cannot serve it: drop to
+            # sector mode for good (no per-tick retry cost).
             self._use_points = False
             return self._integrate_scan(state)
-        px, py = state.base_pos[:, 0], state.base_pos[:, 1]
-        d = self._ray_d
+        xy, _ = planar_pose(state)
+        px, py = xy[:, 0], xy[:, 1]
         for e in range(self.grid.shape[0]):
             v = valid[e]
             if not bool(v.any()):
@@ -222,30 +274,17 @@ class SlamSkill(CommandSkill):
 
             # Robot-height slice: near-horizontal returns off walls/obstacles
             # (excludes the floor below and anything overhead).
-            band = (p[:, 2] > c.z_band[0]) & (p[:, 2] < c.z_band[1]) & (dxy > 0.05)
+            band = ((p[:, 2] > c.z_band[0]) & (p[:, 2] < c.z_band[1])
+                    & (dxy > _MIN_HIT_DIST))
             pb, db = p[band], dxy[band]
             if pb.numel() == 0:
                 continue
             grid = self.grid[e].view(-1)
 
             # Mark hits occupied FIRST, so the free-carve below sees them.
-            oc, orow, oinb = self._to_cell(pb[:, 0], pb[:, 1])
-            oidx = (orow * self.n_cells + oc)[oinb]
-            grid.index_add_(0, oidx,
-                            torch.full_like(oidx, c.l_occ, dtype=grid.dtype))
-
-            # Carve free space along each beam from the robot to its hit, but
-            # never through a cell that is already confidently occupied — a
-            # beam skimming over a short wall must not erase it.
+            self._mark_hits(grid, pb[:, 0], pb[:, 1])
             bear = torch.atan2(pb[:, 1] - py[e], pb[:, 0] - px[e])
-            xs = px[e] + d.unsqueeze(0) * torch.cos(bear).unsqueeze(1)
-            ys = py[e] + d.unsqueeze(0) * torch.sin(bear).unsqueeze(1)
-            ci, ri, inb = self._to_cell(xs, ys)
-            free = (d.unsqueeze(0) < (db.unsqueeze(1) - c.resolution)) & inb
-            fidx = (ri * self.n_cells + ci)[free]
-            fidx = fidx[grid[fidx] < c.sticky_occ]
-            grid.index_add_(0, fidx,
-                            torch.full_like(fidx, c.l_free, dtype=grid.dtype))
+            self._carve_free(grid, px[e], py[e], torch.cos(bear), torch.sin(bear), db)
 
         self.grid.clamp_(-c.l_clamp, c.l_clamp)
 
@@ -289,8 +328,8 @@ class SlamSkill(CommandSkill):
         return torch.sigmoid(self.grid)
 
     def coverage(self) -> torch.Tensor:
-        """Fraction of cells confidently known (free or occupied), per env."""
-        known = self.grid.abs() > 0.5
+        """Fraction of cells confidently known (free or occupied), per env [N]."""
+        known = self.grid.abs() > _KNOWN_LOG_ODDS
         return known.float().mean(dim=(1, 2))
 
     def render_ascii(self, env: int = 0, step: int | None = None) -> str:
@@ -298,10 +337,14 @@ class SlamSkill(CommandSkill):
         Coarse top-down view: '#' occupied, '.' free, ' ' unknown. Downsamples
         by MAX-pooling log-odds over each block (not point-sampling), so a
         one-cell-thin wall survives the downsample instead of aliasing away.
+
+        Args:
+            env: which env's grid to render.
+            step: cells per character; default fits ~48 columns.
         """
         c = self.cfg
         g = self.grid[env]
-        step = step or max(1, self.n_cells // 48)
+        step = step or max(1, self.n_cells // _ASCII_COLS)
         rows = []
         for ri in range(0, self.n_cells, step):
             line = []

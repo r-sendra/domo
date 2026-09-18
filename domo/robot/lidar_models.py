@@ -23,6 +23,9 @@ Presets:
   * `generic_sector_lidar()` — the idealised 36×5 sensor of the original
     avoidance scripts (50° vertical FOV, 4 m, noiseless), kept as default
     for faithful replication of those experiments.
+
+Randomness (noise, dropout) is drawn from torch's global RNG, so seed with
+`torch.manual_seed` for reproducible scans.
 """
 
 from __future__ import annotations
@@ -51,6 +54,13 @@ XT16_FULL_AZIMUTH = 1980
 
 @dataclass
 class LidarModelConfig:
+    """
+    Physical lidar description + sim-fidelity knob.
+
+    Ranges in metres, rate in Hz, FOV in degrees (horizontal, vertical).
+    `to_lidar_config()` is what the backend receives (geometry only);
+    the remaining fields are applied by `SimulatedLidar`.
+    """
     name: str = "generic"
     # Beam geometry (n_horizontal is the sim-fidelity knob)
     n_horizontal: int = 36
@@ -67,13 +77,14 @@ class LidarModelConfig:
     draw_debug: bool = False
 
     def to_lidar_config(self) -> LidarConfig:
+        """Geometry-only view handed to `Scene.add_lidar`."""
         return LidarConfig(
             n_horizontal=self.n_horizontal, n_vertical=self.n_vertical,
             fov_deg=self.fov_deg, max_range=self.max_range,
             pos_offset=self.pos_offset, draw_debug=self.draw_debug)
 
     def update_interval(self, control_dt: float) -> int:
-        """Control steps between scans for this device's frame rate."""
+        """Control steps between scans for this device's frame rate (>= 1, rounded)."""
         return max(1, round(1.0 / (self.rate_hz * control_dt)))
 
 
@@ -110,10 +121,23 @@ class SimulatedLidar(ExteroceptiveSensor):
     """
     Device-model lidar: raw beams + imperfections + sector pooling.
 
-    read()     → [N, n_sectors] azimuth-sector minima (policy-facing; this
-                 exact pooling runs on the real driver's point cloud too)
-    read_raw() → [N, n_vertical, n_horizontal] last processed scan
-    tick()     → advance one control step; rescan when the frame is due
+    read()        → [N, n_sectors] azimuth-sector minima (policy-facing; this
+                    exact pooling runs on the real driver's point cloud too)
+    read_raw()    → [N, n_vertical, n_horizontal] last processed scan
+    read_points() → world-frame hit points + validity mask (3D mapping)
+    tick()        → advance one control step; rescan when the frame is due
+    reset_idx()   → forget the scans of the given envs
+
+    Args:
+        handle: backend lidar handle (`Scene.add_lidar`).
+        model: device description; `model.n_horizontal` must be a multiple
+            of `n_sectors` so every sector pools the same number of rays.
+        n_envs / device: batch size and device of the cached tensors.
+        n_sectors: azimuth sectors exposed by `read()`.
+        control_dt: control step (s), sets the scan interval from `model.rate_hz`.
+
+    Raises:
+        ValueError: if `n_horizontal` is not a multiple of `n_sectors`.
     """
 
     def __init__(self, handle: LidarSensorHandle, model: LidarModelConfig,
@@ -141,57 +165,73 @@ class SimulatedLidar(ExteroceptiveSensor):
         self._points_valid = torch.zeros((n_envs, n_beams), dtype=torch.bool,
                                          device=device)
         # Only backends that implement ``read_points`` feed the cloud; fakes
-        # and ranges-only handles fall back to sector mode.
+        # without the method and ranges-only handles (which raise
+        # NotImplementedError on first use) fall back to sector mode.
         self._has_points = hasattr(handle, "read_points")
 
     @property
     def update_interval(self) -> int:
+        """Control steps between scans."""
         return self._interval
 
     @property
     def has_scan(self) -> bool:
+        """True once at least one scan has been taken."""
         return self._step_count >= self._interval
 
     def tick(self) -> None:
+        """Advance one control step; take a new scan when the frame is due."""
         self._step_count += 1
         if self._step_count % self._interval != 0:
             return
-        m = self.model
-        ranges = self._handle.read_ranges()
+        self._raw = self._apply_device_model(self._handle.read_ranges())
+        self._sectors = self._pool_sectors(self._raw)
+        if self._has_points:
+            self._update_points()
 
+    def _apply_device_model(self, ranges: torch.Tensor) -> torch.Tensor:
+        """Blind zone, Gaussian noise and dropout; no-returns become max_range."""
+        m = self.model
         invalid = ranges < m.min_range              # blind zone → no return
         if m.range_noise_std > 0.0:
             ranges = ranges + torch.randn_like(ranges) * m.range_noise_std
         if m.dropout_prob > 0.0:
             invalid = invalid | (torch.rand_like(ranges) < m.dropout_prob)
-        ranges = torch.where(invalid,
-                             torch.full_like(ranges, m.max_range),
-                             ranges.clamp(0.0, m.max_range))
-        self._raw = ranges
+        return torch.where(invalid,
+                           torch.full_like(ranges, m.max_range),
+                           ranges.clamp(0.0, m.max_range))
 
-        # Pool: min over channels, then min over azimuth groups per sector.
+    def _pool_sectors(self, ranges: torch.Tensor) -> torch.Tensor:
+        """[N, n_vertical, n_horizontal] → [N, n_sectors]: min over channels, then per azimuth group."""
         n_env = ranges.shape[0]
-        per_sector = m.n_horizontal // self.n_sectors
-        self._sectors = ranges.min(dim=1).values.view(
+        per_sector = self.model.n_horizontal // self.n_sectors
+        return ranges.min(dim=1).values.view(
             n_env, self.n_sectors, per_sector).min(dim=2).values
 
-        # World-frame points (for 3D reconstruction), with the same device
-        # imperfections applied to their validity as no-returns / dropout.
-        if self._has_points:
-            try:
-                pts, prng = self._handle.read_points()
-            except (NotImplementedError, AttributeError):
-                self._has_points = False
-            else:
-                valid = (prng > m.min_range) & (prng < m.max_range)
-                if m.dropout_prob > 0.0:
-                    valid = valid & (torch.rand_like(prng) >= m.dropout_prob)
-                self._points, self._points_valid = pts, valid
+    def _update_points(self) -> None:
+        """
+        Refresh the world-frame cloud, with the same device imperfections
+        applied to its validity as no-returns / dropout. Dropout is drawn
+        independently from the range dropout: the cloud is a separate
+        product, not a re-projection of `read_raw()`.
+        """
+        m = self.model
+        try:
+            pts, prng = self._handle.read_points()
+        except (NotImplementedError, AttributeError):
+            self._has_points = False
+            return
+        valid = (prng > m.min_range) & (prng < m.max_range)
+        if m.dropout_prob > 0.0:
+            valid = valid & (torch.rand_like(prng) >= m.dropout_prob)
+        self._points, self._points_valid = pts, valid
 
     def read(self) -> torch.Tensor:
+        """[N, n_sectors] sector minima of the last scan (max_range before the first)."""
         return self._sectors
 
     def read_raw(self) -> torch.Tensor:
+        """[N, n_vertical, n_horizontal] last processed scan."""
         return self._raw
 
     def read_points(self):

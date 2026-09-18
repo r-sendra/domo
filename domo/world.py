@@ -19,6 +19,10 @@ task (domo.tasks) — a temporary, reward-bearing lens over the same scene
 builders — trains, registers the new skill in the library, and control
 returns to the World. Tasks are subordinate procedures, not the entry
 point.
+
+Construction order matters and is fixed here: engine → scene → environment
+entities → robot articulation → lidar/camera (must precede build) →
+`scene.build(n_envs)` → `robot.bind(n_envs)` → device-model sensors.
 """
 
 from __future__ import annotations
@@ -26,16 +30,33 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+import torch
+
 from domo.robot import GO2, Robot, RobotSpec, SimulatedLidar
 from domo.robot.lidar_models import LidarModelConfig, generic_sector_lidar
 from domo.scenes import ObstacleArena, ObstacleArenaConfig
-from domo.sim import SimConfig, TerrainConfig, ViewerConfig, create_engine
+from domo.sim import (
+    CameraHandle,
+    LidarSensorHandle,
+    Scene,
+    SimConfig,
+    TerrainConfig,
+    ViewerConfig,
+    create_engine,
+)
 
 __all__ = ["World", "WorldConfig"]
+
+SCENE_KINDS = ("flat", "rough", "arena", "replica")
 
 
 @dataclass
 class WorldConfig:
+    """
+    Everything needed to stand up a twin. Defaults are the twin/eval
+    settings (viewer on, stiff 100/2 gains); training tasks build their own
+    WorldConfig from their task config.
+    """
     # Simulation
     engine: str = "genesis"
     device: str = "cuda"
@@ -47,7 +68,7 @@ class WorldConfig:
         camera_pos=(3.0, -3.0, 2.5), camera_lookat=(0.0, 0.0, 0.3),
         camera_fov=50.0))
 
-    # Environment: "flat" | "rough" | "arena" | "replica"
+    # Environment: one of SCENE_KINDS ("flat" | "rough" | "arena" | "replica")
     scene_kind: str = "flat"
     ground_height: float = 0.0
     arena: ObstacleArenaConfig = field(default_factory=ObstacleArenaConfig)
@@ -73,8 +94,27 @@ class WorldConfig:
     camera_lookat: tuple[float, float, float] = (0.0, 0.0, 0.3)
 
 
+def _yaw_quat_wxyz(yaw_rad: float) -> tuple[float, float, float, float]:
+    """wxyz quaternion for a pure rotation about z."""
+    return (math.cos(yaw_rad / 2), 0.0, 0.0, math.sin(yaw_rad / 2))
+
+
 class World:
-    """Engine + scene + robot + sensors, built and bound. Goal-free."""
+    """
+    Engine + scene + robot + sensors, built and bound. Goal-free.
+
+    Args:
+        cfg: world configuration.
+        n_envs: parallel copies (1 for the twin; tasks use thousands).
+        spec: robot description (Go2 by default).
+
+    Attributes:
+        engine, scene, device, dt: the sim layer objects.
+        robot: bound `Robot`; `robot.state` is refreshed by the control loop.
+        arena: the `ObstacleArena` when scene_kind == "arena", else None.
+        lidar: `SimulatedLidar` when a lidar model is configured, else None.
+        camera: offscreen `CameraHandle` when `camera_res` is set, else None.
+    """
 
     def __init__(self, cfg: WorldConfig, n_envs: int = 1,
                  spec: RobotSpec = GO2):
@@ -86,43 +126,25 @@ class World:
         self.device = self.engine.device
         self.dt = cfg.dt
 
-        self.scene = self.engine.create_scene(SimConfig(
+        self.scene: Scene = self.engine.create_scene(SimConfig(
             dt=cfg.dt, substeps=cfg.substeps, device=cfg.device,
             headless=cfg.headless, solver_iterations=cfg.solver_iterations,
             viewer=cfg.viewer))
 
-        # ---- environment ---------------------------------------------------
-        self.arena: ObstacleArena | None = None
-        if cfg.scene_kind == "flat":
-            self.scene.add_ground(cfg.ground_height)
-        elif cfg.scene_kind == "rough":
-            self.scene.add_terrain(cfg.rough_terrain)
-        elif cfg.scene_kind == "arena":
-            self.scene.add_ground(cfg.ground_height)
-            self.arena = ObstacleArena(self.scene, cfg.arena,
-                                       spawn_xy=cfg.base_init_pos[:2])
-        elif cfg.scene_kind == "replica":
-            from domo.scenes import load_replica_scene
-            load_replica_scene(self.scene, cfg.replica_scene_json,
-                               cfg.replica_asset_root)
-            self.scene.add_ground(cfg.ground_height)
-        else:
-            raise ValueError(f"unknown scene_kind '{cfg.scene_kind}'")
+        self.arena: ObstacleArena | None = self._build_environment(cfg)
 
-        # ---- robot + sensors -----------------------------------------------
-        yaw = math.radians(cfg.base_init_yaw_deg)
+        # ---- robot + sensors (all added before build) -----------------------
         self.robot = Robot(
             spec, self.scene, self.device, kp=cfg.kp, kd=cfg.kd,
             base_init_pos=cfg.base_init_pos,
-            base_init_quat=(math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)))
+            base_init_quat=_yaw_quat_wxyz(math.radians(cfg.base_init_yaw_deg)))
 
-        lidar_handle = None
+        lidar_handle: LidarSensorHandle | None = None
         if cfg.lidar_model is not None:
             lidar_handle = self.scene.add_lidar(
                 self.robot.articulation, cfg.lidar_model.to_lidar_config())
 
-        # Optional dashboard camera (must be added before build).
-        self.camera = None
+        self.camera: CameraHandle | None = None
         if cfg.camera_res is not None:
             self.camera = self.scene.add_camera(
                 res=cfg.camera_res, pos=cfg.camera_pos,
@@ -138,10 +160,31 @@ class World:
                 n_sectors=cfg.lidar_sectors, device=self.device,
                 control_dt=cfg.dt)
 
+    def _build_environment(self, cfg: WorldConfig) -> ObstacleArena | None:
+        """Add ground/terrain/props for `cfg.scene_kind`; returns the arena if any."""
+        if cfg.scene_kind == "flat":
+            self.scene.add_ground(cfg.ground_height)
+        elif cfg.scene_kind == "rough":
+            self.scene.add_terrain(cfg.rough_terrain)
+        elif cfg.scene_kind == "arena":
+            self.scene.add_ground(cfg.ground_height)
+            return ObstacleArena(self.scene, cfg.arena,
+                                 spawn_xy=cfg.base_init_pos[:2])
+        elif cfg.scene_kind == "replica":
+            from domo.scenes import load_replica_scene
+            load_replica_scene(self.scene, cfg.replica_scene_json,
+                               cfg.replica_asset_root)
+            self.scene.add_ground(cfg.ground_height)
+        else:
+            raise ValueError(
+                f"unknown scene_kind '{cfg.scene_kind}' (expected one of {SCENE_KINDS})")
+        return None
+
     # ------------------------------------------------------------------
 
     @property
-    def sensors(self):
+    def sensors(self) -> list[SimulatedLidar]:
+        """Exteroceptive sensors the control loop must tick each step."""
         return [self.lidar] if self.lidar is not None else []
 
     def make_loop(self, controller, command_filter=None):
@@ -151,22 +194,24 @@ class World:
                               dt=self.dt, sensors=self.sensors,
                               command_filter=command_filter)
 
-    def randomise_obstacles(self, envs_idx=None):
+    def _all_envs(self) -> torch.Tensor:
+        return torch.arange(self.n_envs, device=self.device)
+
+    def randomise_obstacles(self, envs_idx: torch.Tensor | None = None) -> None:
+        """Re-scatter the arena obstacles (no-op for other scene kinds); None → all envs."""
         if self.arena is None:
             return
-        import torch
         if envs_idx is None:
-            envs_idx = torch.arange(self.n_envs, device=self.device)
+            envs_idx = self._all_envs()
         self.arena.randomise(envs_idx, self.device)
 
-    def reset_robot(self):
+    def reset_robot(self) -> None:
         """
         Teleport the robot back to its spawn pose (sim-only convenience for
         independent evaluation trials; a deployed robot recovers, it does
         not teleport).
         """
-        import torch
-        envs = torch.arange(self.n_envs, device=self.device)
+        envs = self._all_envs()
         self.robot.reset_idx(envs)
         if self.lidar is not None:
             self.lidar.reset_idx(envs)

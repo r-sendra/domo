@@ -25,8 +25,14 @@ Examples:
     (avoid @ walk(vx=0.6)).until(moved(3.0)) >> stand.for(2)
     climb | (avoid @ walk(vx=0.3)).for(10) | stand
 
+Numbers are floats (a leading '-' is allowed); names are identifiers.
+`x.for(2).repeat(3)` nests as Modified(repeat=3, Modified(for=2, x)): the
+repeat loops the timed inner node.
+
 The parser produces a plain AST (dataclasses below); typing and
-instantiation against a SkillLibrary happen in library.compile().
+instantiation against a SkillLibrary happen in library.compile(). Every
+node has `to_text()`, which prints the canonical form (minimal
+parentheses) — `parse(node.to_text())` round-trips.
 """
 
 from __future__ import annotations
@@ -43,11 +49,12 @@ __all__ = [
     "Sequence",
     "SkillRef",
     "parse",
+    "parse_condition",
 ]
 
 
 class GrammarError(ValueError):
-    pass
+    """Malformed program text (tokenizer or parser failure)."""
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +63,7 @@ class GrammarError(ValueError):
 
 @dataclass
 class CondRef:
+    """A condition call `name(arg, ...)` with numeric literal args."""
     name: str
     args: tuple[float, ...] = ()
 
@@ -66,6 +74,7 @@ class CondRef:
 
 @dataclass
 class SkillRef:
+    """A skill reference `name(key=value, ...)`."""
     name: str
     params: dict = field(default_factory=dict)
 
@@ -77,6 +86,7 @@ class SkillRef:
 
 @dataclass
 class Layer:
+    """`top @ base`: a command skill executed on top of a motor stack."""
     top: object                 # CommandSkill-typed node
     base: object                # motor-typed node
 
@@ -86,6 +96,7 @@ class Layer:
 
 @dataclass
 class Sequence:
+    """`a >> b >> ...`: run in order, each after the previous succeeds."""
     children: list[object]
 
     def to_text(self):
@@ -94,6 +105,7 @@ class Sequence:
 
 @dataclass
 class Fallback:
+    """`a | b | ...`: try in order, each after the previous fails."""
     children: list[object]
 
     def to_text(self):
@@ -102,6 +114,7 @@ class Fallback:
 
 @dataclass
 class Modified:
+    """`.for(T)` / `.until(cond)` / `.repeat(n)` applied to `child`."""
     child: object
     for_s: float | None = None
     until: CondRef | None = None
@@ -119,10 +132,12 @@ class Modified:
 
 
 def _num(x):
+    """Print a grammar number: integral floats without the trailing '.0'."""
     return str(int(x)) if float(x) == int(x) else str(x)
 
 
 def _paren(node, wrap_types):
+    """Print `node`, parenthesised if it binds looser than its parent."""
     text = node.to_text()
     return f"({text})" if isinstance(node, wrap_types) else text
 
@@ -166,15 +181,19 @@ def _tokenize(text: str):
 # ---------------------------------------------------------------------------
 
 class _Parser:
+    """One method per grammar rule; `text` is kept only for error messages."""
+
     def __init__(self, tokens, text):
         self.toks = tokens
         self.i = 0
         self.text = text
 
     def peek(self):
+        """Kind of the next token without consuming it."""
         return self.toks[self.i][0]
 
     def next(self, expect=None):
+        """Consume the next token (optionally asserting its kind); return its text."""
         kind, val = self.toks[self.i]
         if expect and kind != expect:
             raise GrammarError(
@@ -275,12 +294,16 @@ class _Parser:
 
 
 def parse(text: str):
-    """Parse a composition program into an AST. Raises GrammarError."""
+    """Parse a composition program into an AST root node.
+
+    Raises:
+        GrammarError: unexpected character, token, or trailing input.
+    """
     return _Parser(_tokenize(text), text).parse()
 
 
 def parse_condition(text: str) -> CondRef:
-    """Parse a lone condition expression, e.g. 'tipped(0.9)'."""
+    """Parse a lone condition expression, e.g. 'tipped(0.9)' (card fields)."""
     parser = _Parser(_tokenize(text), text)
     ref = parser.cond()
     if parser.peek() != "EOF":

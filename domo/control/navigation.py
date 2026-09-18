@@ -13,6 +13,11 @@ robot —
 
 An optional `intervention` object (see examples) can pause/abort/stop and
 adjust speed; pass None to run uninterrupted.
+
+This is the blocking, single-env predecessor of TrajectoryTrackingSkill
+(skill.py): it owns the loop while driving. It is kept for
+examples/navigation/evaluate_nav.py and its tests; new code should compose
+`goto(...) @ walk` through the skill library instead.
 """
 
 from __future__ import annotations
@@ -29,9 +34,16 @@ __all__ = ["NavConfig", "PositionController"]
 StepFn = Callable[[torch.Tensor], None]
 PoseFn = Callable[[], tuple[float, float, float]]
 
+# Bounds on the interactively adjusted cruise speed (m/s).
+_SPEED_ADJUST_MIN = 0.1
+_SPEED_ADJUST_MAX = 3.0
+# Progress printout cadence while driving (control steps).
+_LOG_EVERY_STEPS = 100
+
 
 @dataclass
 class NavConfig:
+    """Gains, limits and timeouts of PositionController."""
     dt: float = 0.02
     max_vx: float = 0.8         # m/s
     max_vyaw: float = 0.8       # rad/s
@@ -46,6 +58,8 @@ class NavConfig:
 
 
 class _NullIntervention:
+    """The intervention protocol with nothing ever intervening."""
+
     paused = False
     stopped = False
 
@@ -54,17 +68,27 @@ class _NullIntervention:
         return False
 
     def poll(self):
-        pass
+        """Refresh flags from the outside world (no-op here)."""
 
     def pop_speed_delta(self):
+        """Consume a pending cruise-speed change (m/s); 0.0 = none."""
         return 0.0
 
 
 class PositionController:
-    """P-controller producing velocity commands toward planar goals."""
+    """P-controller producing velocity commands toward planar goals.
+
+    Args:
+        step_fn: advances one control step tracking the given [1, 3] command.
+        pose_fn: returns the current (x, y, yaw) estimate.
+        cfg: gains/limits/timeouts.
+        intervention: object exposing paused/stopped/aborted flags, poll()
+            and pop_speed_delta(); None runs uninterrupted.
+        device: device of the command tensor handed to step_fn.
+    """
 
     def __init__(self, step_fn: StepFn, pose_fn: PoseFn,
-                 cfg: NavConfig = None, intervention=None,
+                 cfg: NavConfig | None = None, intervention=None,
                  device: str = "cpu"):
         self.step_fn = step_fn
         self.pose_fn = pose_fn
@@ -77,6 +101,7 @@ class PositionController:
     # ------------------------------------------------------------------
 
     def go_forward(self, distance: float, speed: float | None = None) -> str:
+        """Drive `distance` m along the current heading."""
         x, y, yaw = self.pose_fn()
         tx = x + distance * math.cos(yaw)
         ty = y + distance * math.sin(yaw)
@@ -86,6 +111,7 @@ class PositionController:
         return self._drive_to(tx, ty, override_vx=spd)
 
     def go_backward(self, distance: float, speed: float | None = None) -> str:
+        """Reverse `distance` m against the current heading (no turning)."""
         x, y, yaw = self.pose_fn()
         tx = x - distance * math.cos(yaw)
         ty = y - distance * math.sin(yaw)
@@ -102,6 +128,7 @@ class PositionController:
 
     def go_to(self, x: float, y: float, speed: float | None = None,
               final_yaw_deg: float | None = None) -> str:
+        """Drive to world (x, y), then optionally rotate to `final_yaw_deg`."""
         self._say(f"→ go_to({x:.2f},{y:.2f})")
         result = self._drive_to(x, y, override_vx=speed)
         if result == "done" and final_yaw_deg is not None:
@@ -109,6 +136,7 @@ class PositionController:
         return result
 
     def stop(self, settle_steps: int = 20):
+        """Zero the command and step a few cycles so the gait settles."""
         self._cmd[:] = 0.0
         for _ in range(settle_steps):
             self._step()
@@ -120,6 +148,8 @@ class PositionController:
 
     def _drive_to(self, tx: float, ty: float, reverse: bool = False,
                   override_vx: float | None = None) -> str:
+        """Blocking P-drive to (tx, ty); speed scales with alignment so the
+        robot turns before it advances. Returns the outcome string."""
         cfg = self.cfg
         max_steps = int(cfg.drive_timeout_s / cfg.dt)
         vx_limit = override_vx or cfg.max_vx
@@ -131,7 +161,8 @@ class PositionController:
 
             delta = self.ctrl.pop_speed_delta()
             if delta != 0.0:
-                vx_limit = float(np.clip(vx_limit + delta, 0.1, 3.0))
+                vx_limit = float(np.clip(vx_limit + delta,
+                                         _SPEED_ADJUST_MIN, _SPEED_ADJUST_MAX))
                 self._say(f"  speed adjusted to {vx_limit:.1f} m/s")
 
             x, y, yaw = self.pose_fn()
@@ -155,12 +186,13 @@ class PositionController:
             self._cmd[0, 0], self._cmd[0, 1], self._cmd[0, 2] = vx, 0.0, vyaw
             self._step()
 
-            if cfg.verbose and step % 100 == 0:
+            if cfg.verbose and step % _LOG_EVERY_STEPS == 0:
                 self._say(f"  dist={dist:.2f}m vx={vx:.2f} vyaw={vyaw:.2f} "
                           f"pos=({x:.2f},{y:.2f}) yaw={math.degrees(yaw):.1f}°")
         return "timeout"
 
     def _rotate_to(self, target_yaw: float) -> str:
+        """Blocking turn in place to `target_yaw` (rad). Returns the outcome."""
         cfg = self.cfg
         max_steps = int(cfg.turn_timeout_s / cfg.dt)
         for _ in range(max_steps):
@@ -181,6 +213,7 @@ class PositionController:
         return "timeout"
 
     def _check_intervention(self) -> str | None:
+        """Honour stop/abort; while paused keep stepping with a zero command."""
         if self.ctrl.stopped:
             self.stop()
             return "stopped"
@@ -206,6 +239,7 @@ class PositionController:
 
     @staticmethod
     def _wrap(a: float) -> float:
+        """Wrap an angle to (−π, π]."""
         while a > math.pi:
             a -= 2 * math.pi
         while a < -math.pi:

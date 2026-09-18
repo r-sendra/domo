@@ -10,6 +10,14 @@ Note: Genesis also uses the wxyz convention, so the Genesis backend can pass
 quaternions through without conversion. Any future backend that uses xyzw
 (e.g. MuJoCo bindings via some wrappers, Isaac Gym) must convert inside the
 backend — the rest of the library never sees a non-wxyz quaternion.
+
+Two Euler conventions are provided on purpose; do not mix them:
+  * `quat_to_euler_xyz` — intrinsic X-Y-Z, matches Genesis
+    `quat_to_xyz(..., rpy=False)` (its default), used by the locomotion
+    tasks and `RobotState.base_euler`.
+  * `quat_to_rpy` — aerospace roll-pitch-yaw (intrinsic Z-Y-X).
+Both agree for pure single-axis rotations and differ in the cross terms.
+All of these are verified against `genesis.utils.geom` in tests/test_rotations.py.
 """
 
 from __future__ import annotations
@@ -29,7 +37,8 @@ __all__ = [
 ]
 
 
-def identity_quat(n: int, device=None, dtype=torch.float32) -> torch.Tensor:
+def identity_quat(n: int, device: torch.device | str | None = None,
+                  dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Return [n, 4] identity quaternions (w=1)."""
     q = torch.zeros((n, 4), device=device, dtype=dtype)
     q[:, 0] = 1.0
@@ -37,6 +46,7 @@ def identity_quat(n: int, device=None, dtype=torch.float32) -> torch.Tensor:
 
 
 def normalize_quat(q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Unit-normalise along the last dim; `eps` guards against zero vectors."""
     return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
 
 
@@ -75,6 +85,7 @@ def quat_apply(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     Rotate vector(s) v by quaternion(s) q: v' = R(q) v.
     q: [..., 4] wxyz, v: [..., 3]. Broadcasts on leading dims.
     """
+    # Rodrigues-style form: v + 2w (qv × v) + 2 qv × (qv × v), no matrix built.
     qw = q[..., 0:1]
     qv = q[..., 1:]
     t = 2.0 * torch.cross(qv, v, dim=-1)
@@ -100,6 +111,7 @@ def quat_to_euler_xyz(q: torch.Tensor) -> torch.Tensor:
     sinp = 2.0 * (w * y + x * z)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     siny_cosp = 2.0 * (w * z - x * y)
+    # atan2 form (instead of asin) stays well-conditioned near ±90° pitch.
     pitch = torch.atan2(sinp, torch.sqrt(cosy_cosp**2 + siny_cosp**2))
     yaw = torch.atan2(siny_cosp, cosy_cosp)
     return torch.stack((roll, pitch, yaw), dim=-1)

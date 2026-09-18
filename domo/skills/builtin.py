@@ -2,13 +2,21 @@
 Cards + library assembly for the skills that exist today.
 
 `make_go2_library(walk_policy, avoid_policy, lidar)` returns a SkillLibrary
-with stand / walk / avoid registered — the current DOMO repertoire. As new
-skills are trained (M3) they are appended with `library.register(card,
-factory)`; the LLM reads `library.describe()` and writes programs against
-whatever the robot knows at that moment in its development.
+with the current DOMO repertoire: stand / walk (motor), forward / backward /
+goto (pose-feedback navigation, always available), and — when a lidar is
+given — the `blocked`/`clear` conditions, `slam`, and `avoid` (with a
+policy). As new skills are trained (M3) they are appended with
+`library.register(card, factory)`; the LLM reads `library.describe()` and
+writes programs against whatever the robot knows at that moment in its
+development.
+
+Adding a skill = one SkillCard here + one factory line in make_go2_library
+(or `library.register` from user code); nothing else in the stack changes.
 """
 
 from __future__ import annotations
+
+import torch
 
 from domo.control.skill import (
     CPGLocomotionSkill,
@@ -31,6 +39,10 @@ __all__ = [
     "WALK_CARD",
     "make_go2_library",
 ]
+
+# Default thresholds (m) of the lidar-bound conditions `blocked(d)`/`clear(d)`.
+BLOCKED_DEFAULT_M = 0.25
+CLEAR_DEFAULT_M = 1.4
 
 
 STAND_CARD = SkillCard(
@@ -172,17 +184,24 @@ SLAM_CARD = SkillCard(
 )
 
 
+def _min_lidar_distance(lidar) -> torch.Tensor:
+    """Closest return per env [N] from a sector lidar's read()."""
+    return lidar.read().min(dim=1).values
+
+
 def make_go2_library(walk_policy, avoid_policy=None, lidar=None,
                      cpg=None, avoid_deltas=(0.8, 0.5, 1.5),
                      obs_max_range: float = 4.0) -> SkillLibrary:
     """
     Assemble the current Go2 repertoire.
-    walk_policy / avoid_policy: policy callables (see
-    examples/house_scene/common.load_locomotion_policy).
-    lidar: sensor with read() → [N, n_sectors]; required for 'avoid' and
-    the 'blocked'/'clear' conditions.
-    cpg / avoid_deltas / obs_max_range: match the values the policies were
-    trained with (defaults = the experiment-script values).
+
+    Args:
+        walk_policy / avoid_policy: policy callables (see
+            domo.checkpoints.load_locomotion_policy); avoid is optional.
+        lidar: sensor with read() → [N, n_sectors]; required for 'avoid',
+            'slam' and the 'blocked'/'clear' conditions.
+        cpg / avoid_deltas / obs_max_range: match the values the policies were
+            trained with (defaults = the experiment-script values).
     """
     library = SkillLibrary()
     library.register(STAND_CARD, StandSkill)
@@ -195,14 +214,16 @@ def make_go2_library(walk_policy, avoid_policy=None, lidar=None,
     library.register(GOTO_CARD, lambda: TrajectoryTrackingSkill("goto"))
 
     if lidar is not None:
-        def blocked(d: float = 0.25):
+        # Sensor-bound conditions are closures over the lidar object: the
+        # registry only knows state-based ones.
+        def blocked(d: float = BLOCKED_DEFAULT_M):
             def cond(state, t_s):
-                return lidar.read().min(dim=1).values < d
+                return _min_lidar_distance(lidar) < d
             return cond
 
-        def clear(d: float = 1.4):
+        def clear(d: float = CLEAR_DEFAULT_M):
             def cond(state, t_s):
-                return lidar.read().min(dim=1).values > d
+                return _min_lidar_distance(lidar) > d
             return cond
 
         library.register_condition("blocked", blocked)

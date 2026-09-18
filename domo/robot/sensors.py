@@ -8,14 +8,23 @@ Two families:
   `RobotState`. `Robot.refresh()` calls them in a fixed order (IMU first,
   since body-frame quantities need the base quaternion).
 * `ExteroceptiveSensor.read()` — returns its own tensor (lidar, cameras...).
+  Exteroceptive sensors that run slower than the control loop also expose
+  `tick()` (advance one control step) and `reset_idx(envs_idx)`; the control
+  loop calls these on every sensor it is given.
 
 Sim implementations query a `domo.sim.Articulation` handle. Real-robot
 implementations of the same interfaces will read DDS/ROS topics instead;
 tasks and controllers cannot tell them apart.
+
+Adding a sensor: subclass one of the two ABCs, take the handle it needs in
+`__init__`, and either write into `RobotState` (state sensor — then append
+it to `Robot._state_sensors` in `Robot.bind`) or return your own tensor
+(exteroceptive — then pass it to the control loop / task explicitly).
 """
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
@@ -36,13 +45,22 @@ __all__ = [
     "StateSensor",
 ]
 
+_log = logging.getLogger(__name__)
+
+# Unit gravity direction in the world frame (z-up).
+_GRAVITY_DIR_WORLD = (0.0, 0.0, -1.0)
+
 
 class StateSensor(ABC):
+    """Writes its measurements into the shared `RobotState` in place."""
+
     @abstractmethod
     def update(self, state: RobotState) -> None: ...
 
 
 class ExteroceptiveSensor(ABC):
+    """Owns its own measurement tensor (lidar, camera, ...)."""
+
     @abstractmethod
     def read(self) -> torch.Tensor: ...
 
@@ -59,7 +77,7 @@ class SimIMU(StateSensor):
 
     def __init__(self, articulation: Articulation, device: torch.device):
         self._art = articulation
-        self._gravity_dir = torch.tensor([0.0, 0.0, -1.0], device=device)
+        self._gravity_dir = torch.tensor(_GRAVITY_DIR_WORLD, device=device)
 
     def update(self, state: RobotState) -> None:
         quat = self._art.get_base_quaternion()
@@ -106,6 +124,11 @@ class SimContactSensor(StateSensor):
     Force-based foot contact flags. If the backend does not expose contact
     forces, `available` is False and the sensor writes nothing — a task may
     then substitute a proxy (e.g. CPG stance phase).
+
+    Args:
+        foot_link_idx: engine-local link indices of the feet, in the order
+            of `RobotSpec.foot_link_names`.
+        force_threshold: contact if the net contact force norm exceeds it (N).
     """
 
     def __init__(self, articulation: Articulation, foot_link_idx: Sequence[int],
@@ -113,10 +136,14 @@ class SimContactSensor(StateSensor):
         self._art = articulation
         self._foot_link_idx = list(foot_link_idx)
         self._threshold = force_threshold
+        # Capability probe. The contract raises NotImplementedError, but an
+        # engine may fail with its own exception type (which this module must
+        # not import), so anything raised here is treated as "unavailable".
         try:
             self._art.get_link_contact_forces()
             self.available = True
-        except Exception:
+        except Exception as exc:  # engine-specific error types
+            _log.debug("contact forces unavailable (%s: %s)", type(exc).__name__, exc)
             self.available = False
 
     def update(self, state: RobotState) -> None:
@@ -132,7 +159,9 @@ class SimContactSensor(StateSensor):
 
 class SectorLidar(ExteroceptiveSensor):
     """
-    2D sector lidar: [N, n_sectors] min distances around the base.
+    2D sector lidar: [N, n_sectors] min distances around the base, straight
+    from the backend handle (no device model — see
+    `domo.robot.lidar_models.SimulatedLidar` for noise/dropout/blind zone).
     `update_interval` emulates a sensor slower than the control loop —
     reads between refreshes return the cached scan (as on real hardware).
     """
@@ -154,10 +183,12 @@ class SectorLidar(ExteroceptiveSensor):
 
     @property
     def has_scan(self) -> bool:
+        """True once at least one scan has been taken (reads are not just the fill value)."""
         return self._step_count >= self._interval
 
     def read(self) -> torch.Tensor:
         return self._cache
 
     def reset_idx(self, envs_idx: torch.Tensor) -> None:
+        """Forget the cached scan of the given envs (reads max_range until the next scan)."""
         self._cache[envs_idx] = self.max_range

@@ -3,9 +3,15 @@ RobotState: the per-step snapshot of robot kinematic state.
 
 Filled in by the robot's sensors on `Robot.refresh()` and read by
 controllers, observation builders, and reward functions. All tensors are
-[n_envs, ...] on the sim device. On the real robot the same structure is
-filled from the state-estimation stack instead of the simulator — consumers
-never know the difference.
+[n_envs, ...] on the sim device and are updated IN PLACE (`tensor[:] = ...`),
+so a consumer may keep a reference to a field across steps. On the real
+robot the same structure is filled from the state-estimation stack instead
+of the simulator — consumers never know the difference.
+
+Frames: `base_*_world` fields are world frame; the others are body frame.
+`base_euler` uses the intrinsic x-y-z convention of
+`domo.utils.rotations.quat_to_euler_xyz` (matches Genesis' default), NOT
+aerospace roll-pitch-yaw.
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ class RobotState:
     projected_gravity: torch.Tensor  # [N, 3] unit gravity in body frame
     base_euler: torch.Tensor        # [N, 3] roll/pitch/yaw (intrinsic xyz)
 
-    # Joints (from encoders).
+    # Joints (from encoders), canonical joint order.
     dof_pos: torch.Tensor           # [N, D]
     dof_vel: torch.Tensor           # [N, D]
 
@@ -40,6 +46,7 @@ class RobotState:
     @classmethod
     def zeros(cls, n_envs: int, n_dofs: int, n_feet: int,
               device: torch.device, dtype=torch.float32) -> RobotState:
+        """Allocate an all-zero state with identity quaternions."""
         def z(*shape):
             return torch.zeros((n_envs, *shape), device=device, dtype=dtype)
         state = cls(

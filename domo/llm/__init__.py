@@ -10,8 +10,8 @@ Clients speak one interface — `generate(prompt, temperature) -> str`:
     llm = make_llm("vllm", model="Qwen/Qwen2.5-Coder-7B-Instruct")
     llm = make_llm("gemini")                       # free-tier default
 
-LangChain constructors are imported lazily so the core library needs no
-LLM dependencies.
+LangChain constructors are imported lazily (module ``__getattr__``) so the
+core library needs no LLM dependencies.
 """
 
 from .client import (
@@ -36,12 +36,15 @@ __all__ = [
     "vllm_client",
 ]
 
+# Names served lazily from langchain_client (see __getattr__).
+_LAZY_LANGCHAIN_NAMES = frozenset(
+    {"vllm_client", "openai_client", "gemini_langchain_client", "LangChainClient"})
+
 
 def __getattr__(name):
     # Lazy access to the LangChain-backed helpers without importing langchain
     # at package import time.
-    if name in ("vllm_client", "openai_client", "gemini_langchain_client",
-                "LangChainClient"):
+    if name in _LAZY_LANGCHAIN_NAMES:
         from . import langchain_client
         return getattr(langchain_client, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

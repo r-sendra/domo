@@ -23,12 +23,23 @@ often does not finish — it is here to show the composition, and its limits. A
 stronger avoid policy would weave through. The default scripted route and the
 goto-only strategy are reliable.)
 
+Library pieces exercised: domo.llm (make_llm, extract_code_block — scripted /
+gemini / vllm / openai providers), domo.skills (library.describe(), compile,
+CompileError/GrammarError repair loop), domo.control (SimControlLoop,
+SingleSkillController), domo.robot (Go2 + SimulatedLidar), domo.sim.
+No frozen-script counterpart.
+
     # offline / CPU — canned safe route, no API key needed
-    python examples/navigation/gemini_design_nav.py CKPT --llm scripted --headless
+    python examples/navigation/gemini_design_nav.py CKPT --llm scripted --headless --device cpu
     # offline — show reactive 'avoid @ goto @ walk' (may not reach the goal)
     python examples/navigation/gemini_design_nav.py CKPT --llm scripted --scripted-avoid --headless
-    # let Gemini design it (needs GEMINI_API_KEY)
+    # let Gemini design it (needs GEMINI_API_KEY; GPU viewer by default)
     python examples/navigation/gemini_design_nav.py CKPT --llm gemini
+
+Prints the arena, each design attempt, a position line every 250 steps, the
+verdict (reached / crashed / ran out), the path overlaid on the map, and the
+program trace. Needs the avoid checkpoint (--avoid-checkpoint, or --no-avoid
+to drop the skill). Saves nothing.
 """
 
 import argparse
@@ -88,6 +99,9 @@ OBSTACLE_H = 0.5           # obstacle box height
 HIT_RADIUS = 0.6           # robot-centre distance to an obstacle centre = hit
 GOAL_TOL = 0.6             # reached the goal within this many metres
 WALL_MARGIN = 2.0          # cells of clear floor between the grid and the walls
+CONTROL_DT = 0.02          # control step (s)
+LIDAR_SECTORS = 36         # azimuth pooling of the lidar (the avoid net's obs)
+REPORT_EVERY = 250         # progress line cadence (control steps)
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +234,14 @@ def load_avoid_policy(path, device):
     ckpt = load_checkpoint(path, device)
     net = ActorCritic.from_state_dict(clean_state_dict(ckpt["model_state"]))
     net.eval().to(device)
-    return lambda obs: net.get_action(obs, deterministic=True)[0]
+
+    def avoid_policy(obs):
+        return net.get_action(obs, deterministic=True)[0]
+    return avoid_policy
 
 
 def design_program(llm, arena, library, device, max_repairs=2):
+    """Ask the LLM for a program; feed compile errors back up to `max_repairs` times."""
     prompt = build_prompt(arena, library)
     feedback = ""
     for attempt in range(max_repairs + 1):
@@ -241,11 +259,91 @@ def design_program(llm, arena, library, device, max_repairs=2):
     raise SystemExit("LLM could not produce a compilable program.")
 
 
+def make_designer(args, use_avoid: bool):
+    """The LLM client: a ScriptedClient replaying a canned route, or a real provider."""
+    if args.llm == "scripted":
+        route = (SCRIPTED_ROUTE_AVOID if (args.scripted_avoid and use_avoid)
+                 else SCRIPTED_ROUTE)
+        return make_llm("scripted", responses=[f"```\n{route}\n```"])
+    return make_llm(args.llm)
+
+
 # ---------------------------------------------------------------------------
 # Mission
 # ---------------------------------------------------------------------------
 
-def main():
+def build_world(arena, device: str, headless: bool, use_avoid: bool):
+    """Arena scene + Go2 (+ sector lidar when avoidance is in the library)."""
+    engine = create_engine("genesis", device=device)
+    scene = engine.create_scene(SimConfig(
+        dt=CONTROL_DT, device=device, headless=headless, solver_iterations=100,
+        viewer=ViewerConfig(camera_pos=(arena.w * 0.6, -3.0, arena.h * 0.9))))
+    scene.add_ground()
+    arena.build(scene)
+    sx, sy = arena.start
+    robot = Robot(GO2, scene, engine.device, kp=100.0, kd=2.0,
+                  base_init_pos=(sx * CELL, sy * CELL, 0.35))
+
+    # Lidar for reactive avoidance: rays against the real arena geometry,
+    # pooled into 36 azimuth sectors (the avoid net's observation). The
+    # handle must be attached before build(); the sensor wraps it after.
+    lidar = None
+    if use_avoid:
+        lidar_model = generic_sector_lidar()
+        lidar_handle = scene.add_lidar(robot.articulation,
+                                       lidar_model.to_lidar_config())
+
+    scene.build(n_envs=1)
+    robot.bind(n_envs=1)
+    if use_avoid:
+        lidar = SimulatedLidar(lidar_handle, lidar_model, 1, n_sectors=LIDAR_SECTORS,
+                               device=engine.device, control_dt=CONTROL_DT)
+    return engine, scene, robot, lidar
+
+
+def build_library(args, lidar, device: str, use_avoid: bool):
+    policy_fn, _ = load_locomotion_policy(args.checkpoint, device)
+    if not use_avoid:
+        return make_go2_library(policy_fn)
+    avoid_policy = load_avoid_policy(args.avoid_checkpoint, device)
+    return make_go2_library(policy_fn, avoid_policy, lidar,
+                            avoid_deltas=AVOID_DELTAS)
+
+
+def run_blind(loop, program, arena, steps: int):
+    """Execute the program with no further LLM input; returns (path, collided, reached)."""
+    gx, gy = arena.goal
+    path, collided, reached = set(), False, False
+    for i in range(steps):
+        state = loop.step()
+        x, y = float(state.base_pos[0, 0]), float(state.base_pos[0, 1])
+        path.add((round(x / CELL), round(y / CELL)))
+        if arena.hit(x, y):
+            collided = True
+            break
+        if math.hypot(x - gx * CELL, y - gy * CELL) < GOAL_TOL:
+            reached = True
+            break
+        if program.finished:
+            break
+        if (i + 1) % REPORT_EVERY == 0:
+            print(f"  step {i + 1:5d} | pos=({x:+.2f},{y:+.2f}) | "
+                  f"skill={program.root.label()[:40]}")
+    return path, collided, reached
+
+
+def print_verdict(arena, program, path, collided: bool, reached: bool) -> None:
+    verdict = ("REACHED THE GOAL 🎉" if reached else
+               "CRASHED into an obstacle 💥" if collided else
+               "ran out of steps / gave up 🥱")
+    print(f"\n=== {verdict} ===")
+    print("Actual path taken (robot cells = '*'):\n" + arena.render(path))
+    print("\nProgram trace:")
+    for line in program.trace:
+        print("   ", line)
+
+
+def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("checkpoint", type=str, help="CPG locomotion checkpoint")
     p.add_argument("--llm", default="scripted",
@@ -261,90 +359,37 @@ def main():
     p.add_argument("--steps", type=int, default=6000)
     p.add_argument("--headless", action="store_true", default=False)
     p.add_argument("--device", type=str, default="cuda")
-    args = p.parse_args()
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
     device = pick_device(args.device)
-    dt = 0.02
     use_avoid = not args.no_avoid
 
     arena = Arena(ARENA)
     print("Arena:\n" + arena.render())
 
     # --- world ------------------------------------------------------------
-    engine = create_engine("genesis", device=device)
-    scene = engine.create_scene(SimConfig(
-        dt=dt, device=device, headless=args.headless, solver_iterations=100,
-        viewer=ViewerConfig(camera_pos=(arena.w * 0.6, -3.0, arena.h * 0.9))))
-    scene.add_ground()
-    arena.build(scene)
-    sx, sy = arena.start
-    robot = Robot(GO2, scene, engine.device, kp=100.0, kd=2.0,
-                  base_init_pos=(sx * CELL, sy * CELL, 0.35))
-
-    # Lidar for reactive avoidance: rays against the real arena geometry,
-    # pooled into 36 azimuth sectors (the avoid net's observation).
-    lidar = None
-    if use_avoid:
-        lidar_model = generic_sector_lidar()
-        lidar_handle = scene.add_lidar(robot.articulation,
-                                       lidar_model.to_lidar_config())
-
-    scene.build(n_envs=1)
-    robot.bind(n_envs=1)
-    if use_avoid:
-        lidar = SimulatedLidar(lidar_handle, lidar_model, 1, n_sectors=36,
-                               device=engine.device, control_dt=dt)
+    engine, scene, robot, lidar = build_world(arena, device, args.headless, use_avoid)
+    device = str(engine.device)
 
     # --- design ------------------------------------------------------------
-    policy_fn, _ = load_locomotion_policy(args.checkpoint, str(engine.device))
-    if use_avoid:
-        avoid_policy = load_avoid_policy(args.avoid_checkpoint,
-                                         str(engine.device))
-        library = make_go2_library(policy_fn, avoid_policy, lidar,
-                                   avoid_deltas=AVOID_DELTAS)
-    else:
-        library = make_go2_library(policy_fn)
-    if args.llm == "scripted":
-        route = (SCRIPTED_ROUTE_AVOID if (args.scripted_avoid and use_avoid)
-                 else SCRIPTED_ROUTE)
-        llm = make_llm("scripted", responses=[f"```\n{route}\n```"])
-    else:
-        llm = make_llm(args.llm)
-    program = design_program(llm, arena, library, str(engine.device))
+    library = build_library(args, lidar, device, use_avoid)
+    llm = make_designer(args, use_avoid)
+    program = design_program(llm, arena, library, device)
     controller = SingleSkillController(program)
     controller.setup(robot)
     print(f"Compiled program:\n  {program.source}\n")
 
     # --- run blind ---------------------------------------------------------
-    loop = SimControlLoop(scene, robot, controller, dt=dt,
+    loop = SimControlLoop(scene, robot, controller, dt=CONTROL_DT,
                           sensors=[lidar] if lidar is not None else ())
     loop.reset()
-    gx, gy = arena.goal
-    path, collided, reached = set(), False, False
-    for i in range(args.steps):
-        state = loop.step()
-        x, y = float(state.base_pos[0, 0]), float(state.base_pos[0, 1])
-        path.add((round(x / CELL), round(y / CELL)))
-        if arena.hit(x, y):
-            collided = True
-            break
-        if math.hypot(x - gx * CELL, y - gy * CELL) < GOAL_TOL:
-            reached = True
-            break
-        if program.finished:
-            break
-        if (i + 1) % 250 == 0:
-            print(f"  step {i + 1:5d} | pos=({x:+.2f},{y:+.2f}) | "
-                  f"skill={program.root.label()[:40]}")
+    path, collided, reached = run_blind(loop, program, arena, args.steps)
 
     # --- verdict -----------------------------------------------------------
-    verdict = ("REACHED THE GOAL 🎉" if reached else
-               "CRASHED into an obstacle 💥" if collided else
-               "ran out of steps / gave up 🥱")
-    print(f"\n=== {verdict} ===")
-    print("Actual path taken (robot cells = '*'):\n" + arena.render(path))
-    print("\nProgram trace:")
-    for line in program.trace:
-        print("   ", line)
+    print_verdict(arena, program, path, collided, reached)
 
 
 if __name__ == "__main__":

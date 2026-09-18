@@ -16,6 +16,15 @@ attributes such as `command`) is what makes skills composable: a Controller
 can start, stop, parameterise and monitor any skill without knowing what is
 inside it. Skills are pure torch — the same object runs in any simulator
 and on the real robot.
+
+Two kinds of skill live here:
+
+* **motor skills** (`Skill` subclasses) emit joint targets — StandSkill,
+  CPGLocomotionSkill, LearnedJointSkill;
+* **command skills** (`CommandSkill` subclasses) emit a *command* for a
+  motor skill instead (e.g. a body-frame velocity) and only make sense
+  layered on top of one via the M5 grammar (`avoid @ walk`) —
+  LidarAvoidanceSkill, TrajectoryTrackingSkill, and SlamSkill (slam.py).
 """
 
 from __future__ import annotations
@@ -38,11 +47,38 @@ __all__ = [
     "Skill",
     "StandSkill",
     "TrajectoryTrackingSkill",
+    "all_envs",
+    "planar_pose",
 ]
+
+# Navigation modes understood by TrajectoryTrackingSkill.
+NAV_MODES = ("forward", "backward", "goto")
+
+# Shortest path a goto target may define; avoids a 0/0 unit direction when the
+# robot is already standing on the target.
+_MIN_PATH_LENGTH = 1e-6
+
+
+def all_envs(robot) -> torch.Tensor:
+    """Index tensor [n_envs] selecting every env — the usual `reset_idx` argument."""
+    return torch.arange(robot.n_envs, device=robot.device)
+
+
+def planar_pose(state) -> tuple[torch.Tensor, torch.Tensor]:
+    """World-frame planar base pose from a RobotState: (xy [N, 2], yaw [N]).
+
+    Views into the state's tensors (no copy). Yaw is `base_euler[:, 2]`.
+    """
+    return state.base_pos[:, :2], state.base_euler[:, 2]
 
 
 class Skill(ABC):
-    """One motor primitive. Vectorised: all tensors are [n_envs, ...]."""
+    """One motor primitive. Vectorised: all tensors are [n_envs, ...].
+
+    Lifecycle: `setup(robot)` once after `robot.bind()`, then `reset_idx` for
+    the envs being (re)started, then `update` every control cycle. Attributes
+    written by Controllers (e.g. `command`) are the skill's parameters.
+    """
 
     name: str = "skill"
 
@@ -50,7 +86,7 @@ class Skill(ABC):
         """Bind to a robot (after robot.bind()); allocate per-env state."""
         self.robot = robot
 
-    def reset_idx(self, envs_idx: torch.Tensor) -> None:
+    def reset_idx(self, envs_idx: torch.Tensor) -> None:  # noqa: B027 — stateless skills need no reset
         """Reset internal state for the given envs (also used on activation)."""
 
     @abstractmethod
@@ -83,8 +119,8 @@ class CPGLocomotionSkill(Skill):
 
     policy_fn: callable(obs [N, 76]) → raw CPG action [N, 12], evaluated
     under no_grad. Inject a trained ActorCritic wrapper (see
-    examples/house_scene/common.load_locomotion_policy) — or a zero lambda
-    for a standing robot.
+    domo.checkpoints.load_locomotion_policy) — or a zero lambda for a
+    standing robot.
     """
 
     name = "cpg_locomotion"
@@ -120,6 +156,7 @@ class CPGLocomotionSkill(Skill):
         self.command[envs_idx] = 0.0
 
     def update(self, state, dt: float) -> torch.Tensor:
+        """RobotState → joint targets [N, 12] via policy → CPG → IK."""
         obs = build_cpg_observation(
             state, self.command, self._commands_scale,
             self.robot.default_dof_pos, self._last_action,
@@ -137,6 +174,13 @@ class LearnedJointSkill(Skill):
     library skill: obs_builder(state, default_dof_pos, last_action) → obs,
     policy → action, targets = default + action_scale × action.
     This is how M3 outputs (e.g. the get-up policy) enter the M5 library.
+
+    Args:
+        policy_fn: callable(obs) → action [N, D], evaluated under no_grad.
+        obs_builder: callable(state, default_dof_pos [D], last_action [N, D])
+            → obs; must match the layout the policy was trained on.
+        action_scale: radians per unit action (the task's training value).
+        name: library name of this skill instance.
     """
 
     def __init__(self, policy_fn: Callable[[torch.Tensor], torch.Tensor],
@@ -172,7 +216,13 @@ class CommandSkill(Skill):
     """
     A skill that emits COMMANDS for another skill instead of joint targets:
     the upper half of a layered composition (`avoid @ walk`). Its output is
-    added to (additive=True) or replaces the base skill's command channel.
+    added to (additive=True) or replaces (additive=False) the base skill's
+    command channel; the base motor skill's card constraints clamp the
+    combined command either way, so no layer can exceed them.
+
+    Subclasses implement `update_command` and may override `configure`
+    (grammar parameters) and `success_flags` (goal completion). Calling
+    `update` on a command skill is a type error: it has no joint targets.
     """
 
     channel: str = "velocity"     # must match the base skill's accepted channel
@@ -219,11 +269,17 @@ class LidarAvoidanceSkill(CommandSkill):
     additive = True
 
     def __init__(self, policy_fn: Callable[[torch.Tensor], torch.Tensor],
-                 lidar, deltas=(0.8, 0.5, 1.5), obs_max_range: float = 4.0):
+                 lidar, deltas: tuple[float, float, float] = (0.8, 0.5, 1.5),
+                 obs_max_range: float = 4.0):
         """
-        lidar: object with read() → [N, n_sectors] distances (SimulatedLidar
-        in sim, the driver-fed equivalent on the real robot).
-        deltas: max |Δvx|, |Δvy|, |Δvyaw| the skill may command.
+        Args:
+            policy_fn: callable(obs [N, n_sectors] in [0, 1]) → raw [N, 3].
+            lidar: object with read() → [N, n_sectors] distances (SimulatedLidar
+                in sim, the driver-fed equivalent on the real robot).
+            deltas: max |Δvx|, |Δvy|, |Δvyaw| the skill may command
+                (the policy's tanh output is scaled by these).
+            obs_max_range: distance that normalises the observation to 1.0;
+                keeps the obs distribution independent of the device's range.
         """
         self.policy_fn = policy_fn
         self.lidar = lidar
@@ -235,9 +291,11 @@ class LidarAvoidanceSkill(CommandSkill):
         self._delta = torch.tensor(self.deltas, device=robot.device)
 
     def min_distance(self) -> torch.Tensor:
+        """Closest lidar return per env [N] (m)."""
         return self.lidar.read().min(dim=1).values
 
     def update_command(self, state, dt: float) -> torch.Tensor:
+        """Lidar sectors → bounded velocity correction [N, 3]."""
         obs = torch.clamp(self.lidar.read() / self.obs_max_range, 0.0, 1.0)
         with torch.no_grad():
             raw = self.policy_fn(obs)
@@ -246,7 +304,11 @@ class LidarAvoidanceSkill(CommandSkill):
 
 @dataclass
 class NavGains:
-    """P gains + limits for TrajectoryTrackingSkill (merged from NavConfig)."""
+    """P gains + limits for TrajectoryTrackingSkill (merged from NavConfig).
+
+    Units: gains map metres → m/s (kp_par, kp_perp) and radians → rad/s
+    (kp_ang); floors/caps are in m/s, rad/s and metres.
+    """
     kp_par: float = 1.0       # along-track: remaining distance → forward speed
     kp_perp: float = 1.2      # cross-track: lateral deviation → sideways speed
     kp_ang: float = 1.5       # heading error → yaw rate
@@ -287,9 +349,20 @@ class TrajectoryTrackingSkill(CommandSkill):
     additive = False
 
     def __init__(self, mode: str = "forward", distance: float = 1.0,
-                 target=(0.0, 0.0), speed: float = 0.5,
+                 target: tuple[float, float] = (0.0, 0.0), speed: float = 0.5,
                  cfg: NavGains | None = None):
-        if mode not in ("forward", "backward", "goto"):
+        """
+        Args:
+            mode: one of NAV_MODES ("forward" | "backward" | "goto").
+            distance: metres to travel (forward/backward modes).
+            target: world-frame (x, y) goal (goto mode).
+            speed: cruise speed cap along the path (m/s).
+            cfg: P gains, floors and tolerances.
+
+        Raises:
+            ValueError: unknown mode.
+        """
+        if mode not in NAV_MODES:
             raise ValueError(f"unknown nav mode '{mode}'")
         self.mode = mode
         self.distance = float(distance)
@@ -298,6 +371,7 @@ class TrajectoryTrackingSkill(CommandSkill):
         self.cfg = cfg or NavGains()
 
     def configure(self, **params) -> None:
+        """Grammar params: distance, speed, x, y (validated by the card)."""
         if "distance" in params:
             self.distance = float(params["distance"])
         if "speed" in params:
@@ -318,21 +392,25 @@ class TrajectoryTrackingSkill(CommandSkill):
 
     def reset_idx(self, envs_idx: torch.Tensor) -> None:
         # Re-latch the trajectory from wherever the robot is on (re)activation.
+        # reset_idx receives no state, so the latch happens lazily on the
+        # first update_command (see _init_envs).
         self._need_init[envs_idx] = True
         self._arrived[envs_idx] = False
 
     def success_flags(self, state) -> torch.Tensor:
+        """[N] bool — True once an env is within tol_pos of its goal."""
         return self._arrived
 
     def _init_envs(self, state, mask: torch.Tensor) -> None:
-        pos = state.base_pos[mask, :2]
-        yaw = state.base_euler[mask, 2]
+        """Latch start pose, path direction, length and heading for `mask` envs."""
+        xy, yaw_all = planar_pose(state)
+        pos, yaw = xy[mask], yaw_all[mask]
         heading = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)
         if self.mode == "goto":
             tgt = torch.tensor(self.target, device=pos.device,
                                dtype=pos.dtype).expand_as(pos)
             d = tgt - pos
-            length = torch.linalg.norm(d, dim=1).clamp_min(1e-6)
+            length = torch.linalg.norm(d, dim=1).clamp_min(_MIN_PATH_LENGTH)
             u = d / length.unsqueeze(1)
             face = torch.atan2(u[:, 1], u[:, 0])       # face toward the target
         else:
@@ -349,11 +427,11 @@ class TrajectoryTrackingSkill(CommandSkill):
         self._arrived[mask] = False
 
     def update_command(self, state, dt: float) -> torch.Tensor:
+        """Pose feedback → body-frame (vx, vy, vyaw) [N, 3]; zero once arrived."""
         if bool(self._need_init.any()):
             self._init_envs(state, self._need_init)
 
-        pos = state.base_pos[:, :2]
-        yaw = state.base_euler[:, 2]
+        pos, yaw = planar_pose(state)
         rel = pos - self._start                         # [N, 2]
         perp = torch.stack([-self._u[:, 1], self._u[:, 0]], dim=1)
         along = (rel * self._u).sum(dim=1)              # progress along path

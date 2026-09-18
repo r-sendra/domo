@@ -30,12 +30,23 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from .skill import Skill
+from .skill import Skill, all_envs
 
 __all__ = ["Controller", "SingleSkillController"]
 
 
 class Controller(ABC):
+    """Programmable skill orchestrator: owns a named set of skills, one active.
+
+    Args:
+        skills: name → Skill (or CompositeSkill) instances this controller
+            may activate; all are set up and reset together.
+        initial: name of the skill active after construction.
+        decision_interval: control steps between `decide()` calls (≥ 1).
+
+    Raises:
+        ValueError: `initial` is not one of `skills`.
+    """
 
     def __init__(self, skills: dict[str, Skill], initial: str,
                  decision_interval: int = 5):
@@ -52,11 +63,13 @@ class Controller(ABC):
     # ------------------------------------------------------------------
 
     def setup(self, robot) -> None:
+        """Bind every skill to `robot` (after robot.bind())."""
         self.robot = robot
         for skill in self.skills.values():
             skill.setup(robot)
 
     def reset_idx(self, envs_idx: torch.Tensor) -> None:
+        """Reset every skill for `envs_idx` and restart the decision clock."""
         for skill in self.skills.values():
             skill.reset_idx(envs_idx)
         self._tick = 0
@@ -71,8 +84,7 @@ class Controller(ABC):
             return
         if name not in self.skills:
             raise KeyError(f"unknown skill '{name}' (have {list(self.skills)})")
-        all_envs = torch.arange(self.robot.n_envs, device=self.robot.device)
-        self.skills[name].reset_idx(all_envs)
+        self.skills[name].reset_idx(all_envs(self.robot))
         self.active = name
 
     @abstractmethod
@@ -84,7 +96,11 @@ class Controller(ABC):
         """
 
     def update(self, state, dt: float) -> torch.Tensor:
-        """One control cycle: (maybe) decide, then delegate to the active skill."""
+        """One control cycle: (maybe) decide, then delegate to the active skill.
+
+        Returns:
+            Joint position targets [N, D] from the active skill.
+        """
         if self._tick % self.decision_interval == 0:
             self.decide(state)
         self._tick += 1
@@ -97,11 +113,11 @@ class Controller(ABC):
 
 
 class SingleSkillController(Controller):
-    """Run exactly one skill forever. """
+    """Run exactly one skill forever (e.g. a compiled CompositeSkill)."""
 
-    def __init__(self, skill: Skill, name: str = None):
+    def __init__(self, skill: Skill, name: str | None = None):
         name = name or skill.name
         super().__init__({name: skill}, initial=name, decision_interval=1)
 
     def decide(self, state) -> None:
-        pass
+        """Nothing to decide: the single skill stays active."""

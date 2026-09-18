@@ -1,4 +1,22 @@
-from .base import VecTask, rand_uniform
+"""
+Tasks: reward-bearing, vectorised environments over `domo.sim` / `domo.robot`.
+
+Every task subclasses `VecTask` (see base.py for the step contract) and is
+built from a dataclass config whose fields are the checkpoint / spec
+contract. Tasks never import a physics engine directly.
+
+Available tasks:
+    Go2WalkTask     velocity tracking, joint-position actions (main.py)
+    Go2CPGWalkTask  velocity tracking, CPG-modulating actions (76-dim obs)
+    Go2AvoidTask    lidar obstacle avoidance over a frozen CPG policy
+    Go2GetUpTask    recovery from a fallen pose; Eureka reward-injection target
+
+To add a task: subclass VecTask, define OBS_DIM/ACT_DIM, a config dataclass,
+`_reward_<name>` methods for every key of `reward_scales`, and implement
+step/reset/reset_idx; then re-export it here.
+"""
+
+from .base import RewardFn, VecTask, rand_uniform
 from .go2_avoid import (
     AVOID_ACT_DIM,
     AVOID_OBS_DIM,
@@ -38,6 +56,7 @@ __all__ = [
     "Go2WalkConfig",
     "Go2WalkTask",
     "ObstacleArenaConfig",
+    "RewardFn",
     "VecTask",
     "build_cpg_observation",
     "build_getup_observation",

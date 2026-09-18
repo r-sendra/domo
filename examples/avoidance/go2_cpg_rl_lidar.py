@@ -3,17 +3,31 @@ Obstacle avoidance in a walled arena — library replica of
 scripts/house_scene/go2_cpg_rl_lidar.py.
 
 A small avoidance network (LiDAR sectors → velocity correction) is trained
-on top of a FROZEN CPG locomotion policy.
+on top of a FROZEN CPG locomotion policy. Evaluation is twin-style: the same
+goal-free World the checkpoint trained in, governed by an `AvoidanceMission`
+PlanningController that authors `(avoid @ walk).for(20)` programs.
 
-    # Train
+Library pieces exercised: domo.tasks (Go2AvoidTask/Config, scene_kind="arena"),
+domo.rl (PPOTrainer, ActorCritic), domo.checkpoints (configs + World from a
+checkpoint), domo.skills (make_go2_library, PlanningController), domo.robot
+lidar models (generic sector lidar / Hesai XT16).
+
+    # Train (GPU)
     python examples/avoidance/go2_cpg_rl_lidar.py \\
         --cpg-checkpoint runs/go2_cpg/checkpoint_final.pt \\
         --n-envs 4096 --device cuda --headless
 
-    # Evaluate
+    # Evaluate (viewer; add --headless on CPU / no display)
     python examples/avoidance/go2_cpg_rl_lidar.py \\
         --eval runs/go2_avoidance/checkpoint_final.pt \\
         --cpg-checkpoint runs/go2_cpg/checkpoint_final.pt --vx 0.6
+
+Training writes checkpoints under --run-dir (runs/go2_avoidance). Evaluation
+prints a status line every 50 steps, each episode's SUCCESS/FAILURE with its
+program trace, and the final success count; it saves nothing.
+
+go2_cpg_rl_avoid_house.py imports `evaluate`, `lidar_model_from_args` and
+`make_trainer` from this file (same architecture, different scene).
 """
 
 import argparse
@@ -30,6 +44,8 @@ from domo.rl import ActorCritic, PPOConfig, PPOTrainer, clean_state_dict
 from domo.skills import PlanningController, make_go2_library
 from domo.tasks import Go2AvoidConfig, Go2AvoidTask
 
+EVAL_REPORT_EVERY = 50      # steps between status lines during --eval
+
 
 def lidar_model_from_args(args, default_none=False):
     """--lidar simple → idealised script sensor; --lidar xt16 → Hesai XT16.
@@ -43,6 +59,7 @@ def lidar_model_from_args(args, default_none=False):
 
 
 def build_configs(args):
+    """Fresh task + PPO configs for the arena (the frozen script's hyper-parameters)."""
     task_cfg = Go2AvoidConfig(
         n_envs=args.n_envs, dt=0.02, max_episode_steps=1000,
         device=args.device, headless=args.headless,
@@ -59,6 +76,28 @@ def build_configs(args):
         lr_schedule="linear", lr_floor_frac=0.05,
         run_dir=args.run_dir, ep_stat_window=50)
     return task_cfg, ppo_cfg
+
+
+def make_trainer(args, policy_fn, build_configs_fn=build_configs) -> PPOTrainer:
+    """
+    A PPOTrainer over the avoidance task: resumed from --resume, or fresh from
+    `build_configs_fn(args)` (the house example passes its own). The frozen
+    walk policy path rides along in the checkpoint so eval can find it.
+    """
+    if args.resume:
+        ckpt = load_checkpoint(args.resume, args.device)
+        task_cfg, ppo_cfg = configs_from_checkpoint(ckpt, "avoid")
+        task_cfg.device = args.device
+    else:
+        task_cfg, ppo_cfg = build_configs_fn(args)
+        ckpt = None
+    env = Go2AvoidTask(task_cfg, locomotion_policy=policy_fn)
+    trainer = PPOTrainer(env, ppo_cfg, extra_checkpoint_data={
+        "task_config": asdict(task_cfg),
+        "cpg_checkpoint": args.cpg_checkpoint})
+    if ckpt is not None:
+        trainer.load_state(ckpt)
+    return trainer
 
 
 class AvoidanceMission(PlanningController):
@@ -92,6 +131,46 @@ class AvoidanceMission(PlanningController):
         return f"(avoid @ walk(vx={self.vx})).for(20)"
 
 
+def load_avoid_policy(ckpt, device):
+    """Callable obs → raw Δv from the avoidance ActorCritic in `ckpt`."""
+    net = ActorCritic.from_state_dict(clean_state_dict(ckpt["model_state"]))
+    net.eval().to(device)
+
+    def avoid_policy(obs):
+        return net.get_action(obs, deterministic=True)[0]
+    return avoid_policy
+
+
+def build_eval_library(ckpt, task_cfg, cpg_checkpoint, world, device):
+    """Skill library from the two checkpoints, with the trained avoid limits."""
+    cpg_path = cpg_checkpoint or ckpt.get("extra", {}).get("cpg_checkpoint")
+    walk_policy, _ = load_locomotion_policy(cpg_path, device)
+    return make_go2_library(
+        walk_policy, load_avoid_policy(ckpt, device), world.lidar,
+        cpg=task_cfg.cpg,
+        avoid_deltas=(task_cfg.delta_vx_max, task_cfg.delta_vy_max,
+                      task_cfg.delta_vyaw_max),
+        obs_max_range=task_cfg.obs_max_range)
+
+
+def run_mission(mission, loop, world, n_episodes: int, max_steps: int) -> None:
+    """Step until the mission idles with all episodes done (or the budget runs out)."""
+    step = 0
+    while not (mission.idle and len(mission.history) >= n_episodes):
+        state = loop.step()
+        step += 1
+        if step % EVAL_REPORT_EVERY == 0 and mission.program is not None:
+            walk = mission.program.instances.get("walk")
+            cmd = walk.command[0].cpu().numpy() if walk else (0, 0, 0)
+            print(f"    step {step:5d}  "
+                  f"min_lidar={world.lidar.read().min().item():.2f}m  "
+                  f"vx={state.base_lin_vel[0, 0].item():+.2f}  "
+                  f"cmd=({cmd[0]:.2f},{cmd[1]:.2f},{cmd[2]:.2f})")
+        if step >= max_steps:
+            print("  [eval] step budget exhausted")
+            break
+
+
 def evaluate(checkpoint_path, cpg_checkpoint, n_episodes=5, command_vx=0.6,
              headless=False, lidar_model=None, draw_lidar=False):
     """
@@ -104,6 +183,7 @@ def evaluate(checkpoint_path, cpg_checkpoint, n_episodes=5, command_vx=0.6,
     lidar_model: optional override of the trained sensor (e.g. XT16 preview).
     draw_lidar: visualise rays in the viewer (slow on macOS with XT16).
     """
+    # Device is picked independently of --device (as in the frozen script).
     device = pick_device("cuda")
     ckpt = load_checkpoint(checkpoint_path, device)
 
@@ -119,54 +199,22 @@ def evaluate(checkpoint_path, cpg_checkpoint, n_episodes=5, command_vx=0.6,
     world = world_from_avoid_config(task_cfg, headless=headless)
 
     # --- skill library from the two checkpoints ---------------------------
-    cpg_path = cpg_checkpoint or ckpt.get("extra", {}).get("cpg_checkpoint")
-    walk_policy, _ = load_locomotion_policy(cpg_path, device)
-    avoid_net = ActorCritic.from_state_dict(clean_state_dict(ckpt["model_state"]))
-    avoid_net.eval().to(device)
-    avoid_policy = lambda obs: avoid_net.get_action(obs, deterministic=True)[0]
+    library = build_eval_library(ckpt, task_cfg, cpg_checkpoint, world, device)
 
-    library = make_go2_library(
-        walk_policy, avoid_policy, world.lidar,
-        cpg=task_cfg.cpg,
-        avoid_deltas=(task_cfg.delta_vx_max, task_cfg.delta_vy_max,
-                      task_cfg.delta_vyaw_max),
-        obs_max_range=task_cfg.obs_max_range)
-
+    # --- mission --------------------------------------------------------------
     mission = AvoidanceMission(library, world, command_vx, n_episodes)
     mission.setup(world.robot)
     loop = world.make_loop(mission)
     loop.reset()
-
-    step, max_steps = 0, (n_episodes + 1) * task_cfg.max_episode_steps
-    while not (mission.idle and len(mission.history) >= n_episodes):
-        state = loop.step()
-        step += 1
-        if step % 50 == 0 and mission.program is not None:
-            walk = mission.program.instances.get("walk")
-            cmd = walk.command[0].cpu().numpy() if walk else (0, 0, 0)
-            print(f"    step {step:5d}  "
-                  f"min_lidar={world.lidar.read().min().item():.2f}m  "
-                  f"vx={state.base_lin_vel[0, 0].item():+.2f}  "
-                  f"cmd=({cmd[0]:.2f},{cmd[1]:.2f},{cmd[2]:.2f})")
-        if step >= max_steps:
-            print("  [eval] step budget exhausted")
-            break
+    run_mission(mission, loop, world, n_episodes,
+                max_steps=(n_episodes + 1) * task_cfg.max_episode_steps)
 
     wins = sum(o.succeeded for o in mission.history)
     print(f"  {wins}/{n_episodes} successful runs")
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--cpg-checkpoint", type=str, default=None,
-                   help="Path to trained CPG locomotion checkpoint")
-    p.add_argument("--n-envs", type=int, default=4096)
-    p.add_argument("--total-steps", type=int, default=100_000_000)
-    p.add_argument("--rollout-steps", type=int, default=24)
-    p.add_argument("--device", type=str, default="cuda",
-                   choices=["cpu", "cuda", "mps"])
-    p.add_argument("--run-dir", type=str, default="runs/go2_avoidance")
-    p.add_argument("--headless", action="store_true", default=False)
+def add_common_args(p: argparse.ArgumentParser) -> None:
+    """Flags shared with the house variant (identical names/defaults/help)."""
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--eval", type=str, default=None)
     p.add_argument("--vx", type=float, default=0.6)
@@ -180,7 +228,25 @@ def main():
                         "1980 = full device fidelity)")
     p.add_argument("--draw-lidar", action="store_true", default=False,
                    help="Visualise lidar rays in the eval viewer (slow on macOS)")
-    args = p.parse_args()
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--cpg-checkpoint", type=str, default=None,
+                   help="Path to trained CPG locomotion checkpoint")
+    p.add_argument("--n-envs", type=int, default=4096)
+    p.add_argument("--total-steps", type=int, default=100_000_000)
+    p.add_argument("--rollout-steps", type=int, default=24)
+    p.add_argument("--device", type=str, default="cuda",
+                   choices=["cpu", "cuda", "mps"])
+    p.add_argument("--run-dir", type=str, default="runs/go2_avoidance")
+    p.add_argument("--headless", action="store_true", default=False)
+    add_common_args(p)
+    return p, p.parse_args()
+
+
+def main():
+    p, args = parse_args()
     args.device = pick_device(args.device)
 
     if args.eval:
@@ -194,24 +260,7 @@ def main():
         p.error("--cpg-checkpoint is required for training")
 
     policy_fn, _ = load_locomotion_policy(args.cpg_checkpoint, args.device)
-
-    if args.resume:
-        ckpt = load_checkpoint(args.resume, args.device)
-        task_cfg, ppo_cfg = configs_from_checkpoint(ckpt, "avoid")
-        task_cfg.device = args.device
-        env = Go2AvoidTask(task_cfg, locomotion_policy=policy_fn)
-        trainer = PPOTrainer(env, ppo_cfg, extra_checkpoint_data={
-            "task_config": asdict(task_cfg),
-            "cpg_checkpoint": args.cpg_checkpoint})
-        trainer.load_state(ckpt)
-    else:
-        task_cfg, ppo_cfg = build_configs(args)
-        env = Go2AvoidTask(task_cfg, locomotion_policy=policy_fn)
-        trainer = PPOTrainer(env, ppo_cfg, extra_checkpoint_data={
-            "task_config": asdict(task_cfg),
-            "cpg_checkpoint": args.cpg_checkpoint})
-
-    trainer.train()
+    make_trainer(args, policy_fn).train()
 
 
 if __name__ == "__main__":

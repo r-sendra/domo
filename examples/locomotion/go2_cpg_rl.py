@@ -1,13 +1,26 @@
 """
 CPG-RL locomotion for Go2 — library replica of scripts/house_scene/go2_cpg_rl.py.
 
+A PPO policy modulates a central-pattern-generator gait so the Go2 tracks a
+commanded body velocity (vx, vy, vyaw). This is the motor skill every other
+example builds on ("walk" in the stable-policy registry).
+
+Library pieces exercised: domo.tasks (Go2CPGWalkTask/Config), domo.rl
+(PPOTrainer/PPOConfig), domo.checkpoints (load/resume in both the new and
+the legacy script checkpoint formats).
+
 Same CLI as the original:
-    # Train
+    # Train (GPU; CPU works with e.g. --n-envs 16 --device cpu but is slow)
     python examples/locomotion/go2_cpg_rl.py --n-envs 4096 --device cuda --headless
-    # Evaluate (watch the gait)
+    # Evaluate (watch the gait; add --headless on a display-less machine)
     python examples/locomotion/go2_cpg_rl.py --eval runs/go2_cpg/checkpoint_final.pt --vx 0.5
     # Resume (accepts new-format and legacy script checkpoints)
     python examples/locomotion/go2_cpg_rl.py --resume runs/go2_cpg/checkpoint_step_xxx.pt
+
+Training writes checkpoints + stats under --run-dir (runs/go2_cpg by
+default). Evaluation prints a tracking line every 50 steps and a per-episode
+summary (return, length, mean |vx error|, estimated gait period); it saves
+nothing.
 """
 
 import argparse
@@ -26,8 +39,11 @@ from domo.checkpoints import (
 from domo.rl import PPOConfig, PPOTrainer
 from domo.tasks import Go2CPGWalkConfig, Go2CPGWalkTask
 
+EVAL_REPORT_EVERY = 50      # steps between tracking lines during --eval
+
 
 def build_configs(args):
+    """Fresh task + PPO configs mirroring the frozen script's hyper-parameters."""
     task_cfg = Go2CPGWalkConfig(
         n_envs=args.n_envs, dt=0.02, max_episode_steps=1000,
         device=args.device, headless=args.headless)
@@ -42,8 +58,63 @@ def build_configs(args):
     return task_cfg, ppo_cfg
 
 
+def make_trainer(args) -> PPOTrainer:
+    """A PPOTrainer, either resumed from --resume or fresh from build_configs."""
+    if args.resume:
+        ckpt = load_checkpoint(args.resume, args.device)
+        task_cfg, ppo_cfg = configs_from_checkpoint(ckpt, "cpg_walk")
+        task_cfg.device = args.device     # the checkpoint may come from another machine
+    else:
+        task_cfg, ppo_cfg = build_configs(args)
+        ckpt = None
+    env = Go2CPGWalkTask(task_cfg)
+    trainer = PPOTrainer(env, ppo_cfg,
+                         extra_checkpoint_data={"task_config": asdict(task_cfg)})
+    if ckpt is not None:
+        trainer.load_state(ckpt)
+    return trainer
+
+
+def run_episode(env, policy_fn, cmd: torch.Tensor, command) -> tuple[float, int, list, list]:
+    """One episode holding `cmd`; returns (return, length, |vx err| history, theta history)."""
+    obs, _ = env.reset()
+    env.commands[:] = cmd
+    done = torch.zeros(1, dtype=torch.bool)
+    ep_ret, ep_len, vx_err, theta_hist = 0.0, 0, [], []
+    while not done[0]:
+        env.commands[:] = cmd             # re-pin every step: the task may resample
+        with torch.no_grad():
+            act = policy_fn(obs)
+        obs, _, reward, reset_buf, _ = env.step(act)
+        ep_ret += reward[0].item()
+        ep_len += 1
+        done = reset_buf.bool()
+        state = env.robot.state
+        vx_err.append(abs(command[0] - state.base_lin_vel[0, 0].item()))
+        theta_hist.append(
+            env.controller.oscillators.theta[0].cpu().numpy().copy())
+        if ep_len % EVAL_REPORT_EVERY == 0:
+            r = env.controller.oscillators.r[0].cpu().numpy()
+            print(f"    step {ep_len:4d}  "
+                  f"vx={state.base_lin_vel[0, 0].item():+.2f}/{command[0]:.2f}  "
+                  f"vy={state.base_lin_vel[0, 1].item():+.2f}  "
+                  f"wz={state.base_ang_vel[0, 2].item():+.2f}  "
+                  f"h={state.base_pos[0, 2].item():.2f}  "
+                  f"r=[{r[0]:.2f} {r[1]:.2f} {r[2]:.2f} {r[3]:.2f}]")
+    return ep_ret, ep_len, vx_err, theta_hist
+
+
+def gait_period(theta_hist, ep_len: int, dt: float) -> float:
+    """Mean stride period from the phase wraps of oscillator 0 (nan if none)."""
+    th = np.array(theta_hist)[:, 0]
+    wraps = int(np.sum(np.diff(th) < -math.pi))
+    return (ep_len * dt / wraps) if wraps > 0 else float("nan")
+
+
 def evaluate(checkpoint_path, command=(0.5, 0.0, 0.0), n_episodes=3,
              headless=False):
+    # Device is picked independently of --device (as in the frozen script):
+    # cuda when available, else cpu.
     device = pick_device("cuda")
     policy_fn, _ = load_locomotion_policy(checkpoint_path, device)
 
@@ -53,38 +124,13 @@ def evaluate(checkpoint_path, command=(0.5, 0.0, 0.0), n_episodes=3,
     cmd = torch.tensor([command], device=env.device)
 
     for ep in range(n_episodes):
-        obs, _ = env.reset()
-        env.commands[:] = cmd
-        done = torch.zeros(1, dtype=torch.bool)
-        ep_ret, ep_len, vx_err, theta_hist = 0.0, 0, [], []
-        while not done[0]:
-            env.commands[:] = cmd
-            with torch.no_grad():
-                act = policy_fn(obs)
-            obs, _, reward, reset_buf, _ = env.step(act)
-            ep_ret += reward[0].item()
-            ep_len += 1
-            done = reset_buf.bool()
-            state = env.robot.state
-            vx_err.append(abs(command[0] - state.base_lin_vel[0, 0].item()))
-            theta_hist.append(
-                env.controller.oscillators.theta[0].cpu().numpy().copy())
-            if ep_len % 50 == 0:
-                r = env.controller.oscillators.r[0].cpu().numpy()
-                print(f"    step {ep_len:4d}  "
-                      f"vx={state.base_lin_vel[0, 0].item():+.2f}/{command[0]:.2f}  "
-                      f"vy={state.base_lin_vel[0, 1].item():+.2f}  "
-                      f"wz={state.base_ang_vel[0, 2].item():+.2f}  "
-                      f"h={state.base_pos[0, 2].item():.2f}  "
-                      f"r=[{r[0]:.2f} {r[1]:.2f} {r[2]:.2f} {r[3]:.2f}]")
-        th = np.array(theta_hist)[:, 0]
-        wraps = int(np.sum(np.diff(th) < -math.pi))
-        period = (ep_len * env.dt / wraps) if wraps > 0 else float("nan")
+        ep_ret, ep_len, vx_err, theta_hist = run_episode(env, policy_fn, cmd, command)
+        period = gait_period(theta_hist, ep_len, env.dt)
         print(f"  Episode {ep + 1} | return={ep_ret:7.2f} | length={ep_len:4d} | "
               f"mean |vx err|={np.mean(vx_err):.3f} m/s | gait period~{period:.2f}s\n")
 
 
-def main():
+def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n-envs", type=int, default=4096)
     p.add_argument("--total-steps", type=int, default=80_000_000)
@@ -92,34 +138,25 @@ def main():
     p.add_argument("--device", type=str, default="cuda",
                    choices=["cpu", "cuda", "mps"])
     p.add_argument("--run-dir", type=str, default="runs/go2_cpg")
+    # Mirrors the frozen script: training is headless regardless of the flag.
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--eval", type=str, default=None)
     p.add_argument("--vx", type=float, default=0.5)
     p.add_argument("--vy", type=float, default=0.0)
     p.add_argument("--vyaw", type=float, default=0.0)
-    args = p.parse_args()
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
     args.device = pick_device(args.device)
 
     if args.eval:
         evaluate(args.eval, command=(args.vx, args.vy, args.vyaw))
         return
 
-    if args.resume:
-        ckpt = load_checkpoint(args.resume, args.device)
-        task_cfg, ppo_cfg = configs_from_checkpoint(ckpt, "cpg_walk")
-        task_cfg.device = args.device
-        env = Go2CPGWalkTask(task_cfg)
-        trainer = PPOTrainer(env, ppo_cfg,
-                             extra_checkpoint_data={"task_config": asdict(task_cfg)})
-        trainer.load_state(ckpt)
-    else:
-        task_cfg, ppo_cfg = build_configs(args)
-        env = Go2CPGWalkTask(task_cfg)
-        trainer = PPOTrainer(env, ppo_cfg,
-                             extra_checkpoint_data={"task_config": asdict(task_cfg)})
-
-    trainer.train()
+    make_trainer(args).train()
 
 
 if __name__ == "__main__":

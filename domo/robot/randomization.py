@@ -10,18 +10,27 @@ through the Articulation DR capabilities (Genesis-backed today); observation
 noise and action latency are task-level and consumed by tasks that support
 them. Unsupported capabilities are skipped with a one-time warning, so the
 same config runs on any backend.
+
+`from_dict` / `to_dict` are the JSON seam used by the LLM loop and by
+checkpoints; `to_dict` omits inactive parameters so a config prints as the
+minimal set of knobs that are actually on.
 """
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 
 import torch
 
 __all__ = ["DomainRandomization"]
 
+_log = logging.getLogger(__name__)
 
-def _u(lo, hi, n, device):
+
+def _u(lo: float, hi: float, n, device) -> torch.Tensor:
+    """Uniform draw in [lo, hi) of shape `n` (int or tuple)."""
     return lo + (hi - lo) * torch.rand(n, device=device)
 
 
@@ -38,10 +47,12 @@ class DomainRandomization:
     obs_noise_std: float = 0.0
     action_latency_steps: int = 0
 
-    _warned: set = field(default_factory=set, repr=False, compare=False)
+    # Capabilities already reported as unsupported (warn once per instance).
+    _warned: set[str] = field(default_factory=set, repr=False, compare=False)
 
     @classmethod
     def from_dict(cls, d: dict) -> DomainRandomization:
+        """Build from a JSON-like dict; unknown keys are ignored, lists become tuples."""
         known = {f.name for f in fields(cls) if not f.name.startswith("_")}
         clean = {}
         for k, v in d.items():
@@ -51,6 +62,7 @@ class DomainRandomization:
         return cls(**clean)
 
     def to_dict(self) -> dict:
+        """JSON-ready dict of the ACTIVE parameters only (None / 0 omitted)."""
         out = {}
         for f in fields(self):
             if f.name.startswith("_"):
@@ -63,7 +75,14 @@ class DomainRandomization:
     # ------------------------------------------------------------------
 
     def apply(self, robot, envs_idx: torch.Tensor) -> None:
-        """Resample physics parameters for the given envs."""
+        """
+        Resample physics parameters for the given envs.
+
+        Args:
+            robot: a bound `domo.robot.Robot` (uses its articulation, dof_idx
+                and actuator gains).
+            envs_idx: env indices being reset (empty → no-op).
+        """
         if len(envs_idx) == 0:
             return
         n, device = len(envs_idx), robot.device
@@ -95,10 +114,11 @@ class DomainRandomization:
             self._try("pd_gains", art.set_pd_gains_scaled,
                       kp, kd, robot.dof_idx, envs_idx)
 
-    def _try(self, name, fn, *args):
+    def _try(self, name: str, fn: Callable[..., None], *args) -> None:
+        """Call a DR capability; skip (warning once) if the backend lacks it."""
         try:
             fn(*args)
         except NotImplementedError:
             if name not in self._warned:
                 self._warned.add(name)
-                print(f"  [dr] backend does not support '{name}' — skipped")
+                _log.warning("[dr] backend does not support '%s' — skipped", name)

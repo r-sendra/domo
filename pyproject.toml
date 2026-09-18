@@ -52,3 +52,4 @@ known-first-party = ["domo"]
 [tool.ruff.lint.per-file-ignores]
 "examples/*" = ["E402"]   # sys.path tweaks before imports in standalone scripts
 "__init__.py" = ["F401"]  # re-exports
+"tests/*" = ["E731", "E741", "B011", "RUF059"]  # terse fixtures and throwaway unpacks

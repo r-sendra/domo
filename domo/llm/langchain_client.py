@@ -19,10 +19,15 @@ Then:
     from domo.llm import vllm_client
     llm = vllm_client("Qwen/Qwen2.5-Coder-7B-Instruct")
     # or via the factory:  make_llm("vllm", model="...", base_url="...")
+
+Adding a provider: write a ``*_client(...)`` constructor below that builds
+the LangChain chat model and returns ``LangChainClient(chat)``, then route a
+provider name to it in ``client.make_llm``.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 
 from .client import LLMClient
@@ -34,9 +39,25 @@ __all__ = [
     "vllm_client",
 ]
 
+logger = logging.getLogger(__name__)
+
+# Seconds before a single chat completion is abandoned. Reward generation
+# with a thinking model or a small local GPU can legitimately take minutes.
+_REQUEST_TIMEOUT_S = 600
+
+# Output budget; matches GeminiClient so thinking models are not truncated.
+_DEFAULT_MAX_TOKENS = 16384
+
 
 class LangChainClient(LLMClient):
-    """Adapt a LangChain BaseChatModel to the DOMO LLMClient interface."""
+    """Adapt a LangChain BaseChatModel to the DOMO LLMClient interface.
+
+    Args:
+        chat_model: any ``langchain_core`` chat model (``invoke`` + ``bind``).
+        supports_temperature: bind the per-call temperature; set False for
+            endpoints that reject the parameter.
+        verbose: print the exception class/message before re-raising.
+    """
 
     def __init__(self, chat_model, supports_temperature: bool = True,
                  verbose: bool = True):
@@ -46,6 +67,7 @@ class LangChainClient(LLMClient):
 
     @property
     def model(self):
+        """The wrapped LangChain chat model."""
         return self._model
 
     def generate(self, prompt: str, temperature: float = 1.0) -> str:
@@ -54,7 +76,11 @@ class LangChainClient(LLMClient):
         if self._supports_temperature:
             try:
                 model = self._model.bind(temperature=temperature)
-            except Exception:
+            except Exception as e:
+                # Some integrations reject unknown bind kwargs; the call is
+                # still valid at the model's default temperature.
+                logger.debug("bind(temperature=%s) failed (%s); using default",
+                             temperature, e)
                 model = self._model
         try:
             resp = model.invoke([HumanMessage(content=prompt)])
@@ -87,7 +113,7 @@ def _content_to_text(content) -> str:
 def vllm_client(model: str,
                 base_url: str | None = None,
                 api_key: str = "EMPTY",
-                max_tokens: int = 16384,
+                max_tokens: int = _DEFAULT_MAX_TOKENS,
                 verbose: bool = True) -> LangChainClient:
     """
     Client for a local model served by vLLM's OpenAI-compatible server.
@@ -98,26 +124,27 @@ def vllm_client(model: str,
     base_url = base_url or os.environ.get("VLLM_BASE_URL",
                                           "http://localhost:8000/v1")
     chat = ChatOpenAI(model=model, base_url=base_url, api_key=api_key,
-                      max_tokens=max_tokens, timeout=600)
+                      max_tokens=max_tokens, timeout=_REQUEST_TIMEOUT_S)
     return LangChainClient(chat, verbose=verbose)
 
 
 def openai_client(model: str = "gpt-4o-mini",
                   api_key: str | None = None,
                   base_url: str | None = None,
-                  max_tokens: int = 16384,
+                  max_tokens: int = _DEFAULT_MAX_TOKENS,
                   verbose: bool = True) -> LangChainClient:
-    """OpenAI (or any OpenAI-compatible gateway via base_url)."""
+    """OpenAI (or any OpenAI-compatible gateway via base_url); key from $OPENAI_API_KEY."""
     from langchain_openai import ChatOpenAI
     chat = ChatOpenAI(model=model,
                       api_key=api_key or os.environ.get("OPENAI_API_KEY"),
-                      base_url=base_url, max_tokens=max_tokens, timeout=600)
+                      base_url=base_url, max_tokens=max_tokens,
+                      timeout=_REQUEST_TIMEOUT_S)
     return LangChainClient(chat, verbose=verbose)
 
 
 def gemini_langchain_client(model: str = "gemini-2.5-flash",
                             api_key: str | None = None,
-                            max_tokens: int = 16384,
+                            max_tokens: int = _DEFAULT_MAX_TOKENS,
                             verbose: bool = True) -> LangChainClient:
     """Gemini through langchain-google-genai (vs. the direct GeminiClient)."""
     from langchain_google_genai import ChatGoogleGenerativeAI

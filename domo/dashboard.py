@@ -23,6 +23,41 @@ is down, posts fail silently; the sim is unaffected.
 
 `Dashboard` (server hosted inside the sim process) is kept for convenience and
 shares the same publish/poll_command/set_scene interface.
+
+HTTP API (all bound to 127.0.0.1; every response carries `Cache-Control:
+no-store` and `Access-Control-Allow-Origin: *`):
+
+    GET  /, /index.html   the self-contained dashboard page (`_DASHBOARD_HTML`)
+    GET  /state           latest telemetry dict as JSON, plus `_uptime` (s),
+                          `_frame_id` (bumps per camera frame) and `_has_scene`
+    GET  /scene           3D scene manifest as JSON, or 204 when none was set
+    GET  /frame.jpg       latest camera JPEG, or 204 when none was pushed
+    GET  /cmd?c=CMD       browser → sim control; CMD in {pause, reset, stop}
+    GET  /cmd-poll        sim ← pending command: {"cmd": CMD | null}, read-and-clear
+    GET  /assets/<name>/<rel>   static files under the asset root registered
+                          as <name> (URDF + meshes for the 3D viewer)
+    POST /ingest          telemetry dict (JSON) → replaces the latest snapshot
+    POST /scene           {"scene": manifest, "roots": {name: abs_dir}}
+    POST /frame           raw JPEG bytes → latest camera frame
+
+Telemetry payload (what the page reads; all keys optional except `t`):
+    t         int    control step
+    status    str    "running" | "paused" | "stopped"  (badge + button label)
+    pose      [x, y, yaw]                 header badge
+    base      [x, y, z, qw, qx, qy, qz]   3D viewer: base pose (wxyz quaternion)
+    dof       [q_0 … q_n]                 3D viewer: joint angles in `dof_names` order
+    vel       [vx, vy, vyaw]              velocity chart
+    height    float                       height chart
+    coverage  float (percent)             header badge + chart
+    lidar     [range per azimuth sector]  top-down lidar panel
+    map       [row strings of '#', '.', ' ']   occupancy panel
+    cloud     [[x, y, z], …]              top-down point-cloud panel
+    bounds    [x_min, x_max, y_min, y_max]     cloud panel extent
+
+Scene manifest (POST /scene → GET /scene):
+    boxes   [{size: [sx, sy, sz], pos: [x, y, z], quat?: [w, x, y, z], color?: css}]
+    robot   {urdf: "/assets/<name>/<rel>.urdf", dof_names: [...]}
+    up      "z"
 """
 
 from __future__ import annotations
@@ -30,6 +65,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
 import os
 import threading
 import time
@@ -46,18 +82,49 @@ __all__ = [
     "serve",
 ]
 
+_log = logging.getLogger(__name__)
+
+# Loopback only: the dashboard is a local viewer, never exposed on the network.
+BIND_HOST = "127.0.0.1"
+# Control commands the page may send; anything else is a 400.
+COMMANDS = ("pause", "reset", "stop")
+# Network calls from the client's background thread are short so a hung server
+# cannot stall command polling for long.
+REQUEST_TIMEOUT_S = 1.0
+JPEG_QUALITY = 80
+
+# Content types for the static asset route (three.js loaders sniff these).
+_CONTENT_TYPES = {
+    ".urdf": "application/xml", ".xml": "application/xml",
+    ".dae": "model/vnd.collada+xml", ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json", ".obj": "text/plain", ".mtl": "text/plain",
+    ".stl": "model/stl", ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+# ---------------------------------------------------------------------------
+# Shared state
+# ---------------------------------------------------------------------------
 
 class TelemetryHub:
-    """Thread-safe latest-value store shared by the server threads."""
+    """
+    Thread-safe latest-value store shared by the server's handler threads.
+
+    Only the LATEST snapshot is kept — the dashboard is a live view, not a
+    log — so every setter is an O(1) reference swap under a short lock.
+    Handler threads (one per request under `ThreadingHTTPServer`) and the
+    publishing thread all go through this lock; nothing else is shared.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._state: dict = {"t": 0}
-        self._frame = None                 # latest camera frame, JPEG bytes
-        self._frame_id = 0
-        self._cmd = None                   # pending control command (str)
-        self._scene = None                 # 3D scene manifest (dict) or None
-        self._roots: dict = {}             # asset-name → absolute dir (for /assets)
+        self._frame: bytes | None = None   # latest camera frame, JPEG bytes
+        self._frame_id = 0                 # bumps per frame so the page can skip repeats
+        self._cmd: str | None = None       # pending control command
+        self._scene: dict | None = None    # 3D scene manifest
+        self._roots: dict[str, str] = {}   # asset name → absolute dir (for /assets)
         self._t0 = time.time()
 
     def publish(self, state: dict, frame: bytes | None = None) -> None:
@@ -73,6 +140,7 @@ class TelemetryHub:
             self._frame_id += 1
 
     def get_state(self) -> dict:
+        """Latest snapshot plus server-side bookkeeping keys (`_uptime`, ...)."""
         with self._lock:
             s = dict(self._state)
             s["_uptime"] = round(time.time() - self._t0, 1)
@@ -80,7 +148,7 @@ class TelemetryHub:
             s["_has_scene"] = self._scene is not None
             return s
 
-    def get_frame(self):
+    def get_frame(self) -> tuple[bytes | None, int]:
         with self._lock:
             return self._frame, self._frame_id
 
@@ -88,22 +156,23 @@ class TelemetryHub:
         with self._lock:
             self._cmd = cmd
 
-    def pop_command(self):
+    def pop_command(self) -> str | None:
+        """Read-and-clear, so a command is delivered to the sim exactly once."""
         with self._lock:
             c, self._cmd = self._cmd, None
             return c
 
-    def set_scene(self, scene, roots=None) -> None:
+    def set_scene(self, scene: dict | None, roots: dict[str, str] | None = None) -> None:
         with self._lock:
             self._scene = scene
             if roots:
                 self._roots = dict(roots)
 
-    def get_scene(self):
+    def get_scene(self) -> dict | None:
         with self._lock:
             return self._scene
 
-    def resolve_asset(self, name: str, rel: str):
+    def resolve_asset(self, name: str, rel: str) -> str | None:
         """Absolute path for /assets/<name>/<rel>, or None (with traversal guard)."""
         with self._lock:
             root = self._roots.get(name)
@@ -111,23 +180,28 @@ class TelemetryHub:
             return None
         base = os.path.normpath(root)
         p = os.path.normpath(os.path.join(base, rel))
+        # Anything that normalises outside the registered root is refused —
+        # the route serves whole mesh directories, so `..` must not escape.
         if p != base and not p.startswith(base + os.sep):
             return None
         return p if os.path.isfile(p) else None
 
 
-_CT = {".urdf": "application/xml", ".xml": "application/xml",
-       ".dae": "model/vnd.collada+xml", ".glb": "model/gltf-binary",
-       ".gltf": "model/gltf+json", ".obj": "text/plain", ".mtl": "text/plain",
-       ".stl": "model/stl", ".png": "image/png", ".jpg": "image/jpeg",
-       ".jpeg": "image/jpeg"}
-
+# ---------------------------------------------------------------------------
+# HTTP handler + server
+# ---------------------------------------------------------------------------
 
 class _Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass
+    """Routes documented in the module docstring. One instance per request."""
 
-    def _send(self, code, body: bytes, ctype: str):
+    def log_message(self, *args):
+        pass                    # the page polls at ~7 Hz; stdlib access logs would drown stdout
+
+    @property
+    def hub(self) -> TelemetryHub:
+        return self.server.hub          # type: ignore[attr-defined]
+
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -138,99 +212,140 @@ class _Handler(BaseHTTPRequestHandler):
             if body:
                 self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            pass                # browser navigated away mid-response; nothing to do
+
+    def _send_json(self, obj, code: int = 200) -> None:
+        self._send(code, json.dumps(obj).encode(), "application/json")
+
+    def _send_text(self, code: int, text: bytes) -> None:
+        self._send(code, text, "text/plain")
+
+    # --- GET ---------------------------------------------------------------
 
     def do_GET(self):
-        hub: TelemetryHub = self.server.hub          # type: ignore[attr-defined]
         u = urllib.parse.urlparse(self.path)
-        path, q = u.path, urllib.parse.parse_qs(u.query)
+        path, query = u.path, urllib.parse.parse_qs(u.query)
         if path in ("/", "/index.html"):
-            self._send(200, self.server.html, "text/html; charset=utf-8")
+            self._send(200, self.server.html, "text/html; charset=utf-8")  # type: ignore[attr-defined]
         elif path == "/state":
-            self._send(200, json.dumps(hub.get_state()).encode(), "application/json")
+            self._send_json(self.hub.get_state())
         elif path == "/scene":
-            sc = hub.get_scene()
-            self._send(200 if sc else 204,
-                       json.dumps(sc).encode() if sc else b"", "application/json")
+            self._get_scene()
         elif path == "/frame.jpg":
-            frame, _ = hub.get_frame()
-            self._send(204 if frame is None else 200, frame or b"", "image/jpeg")
+            self._get_frame()
         elif path == "/cmd":
-            c = (q.get("c") or [""])[0]
-            if c in ("pause", "reset", "stop"):
-                hub.set_command(c)
-                self._send(200, b"ok", "text/plain")
-            else:
-                self._send(400, b"bad command", "text/plain")
+            self._get_cmd(query)
         elif path == "/cmd-poll":
-            self._send(200, json.dumps({"cmd": hub.pop_command()}).encode(),
-                       "application/json")
+            self._send_json({"cmd": self.hub.pop_command()})
         elif path.startswith("/assets/"):
-            rest = path[len("/assets/"):].split("/", 1)
-            fp = hub.resolve_asset(rest[0], rest[1] if len(rest) > 1 else "")
-            if fp:
-                with open(fp, "rb") as f:
-                    body = f.read()
-                self._send(200, body, _CT.get(os.path.splitext(fp)[1].lower(),
-                                              "application/octet-stream"))
-            else:
-                self._send(404, b"not found", "text/plain")
+            self._get_asset(path[len("/assets/"):])
         else:
-            self._send(404, b"not found", "text/plain")
+            self._send_text(404, b"not found")
+
+    def _get_scene(self) -> None:
+        scene = self.hub.get_scene()
+        if scene:
+            self._send_json(scene)
+        else:
+            self._send(204, b"", "application/json")
+
+    def _get_frame(self) -> None:
+        frame, _ = self.hub.get_frame()
+        self._send(204 if frame is None else 200, frame or b"", "image/jpeg")
+
+    def _get_cmd(self, query: dict) -> None:
+        cmd = (query.get("c") or [""])[0]
+        if cmd in COMMANDS:
+            self.hub.set_command(cmd)
+            self._send_text(200, b"ok")
+        else:
+            self._send_text(400, b"bad command")
+
+    def _get_asset(self, rest: str) -> None:
+        name, _, rel = rest.partition("/")
+        fp = self.hub.resolve_asset(name, rel)
+        if not fp:
+            self._send_text(404, b"not found")
+            return
+        with open(fp, "rb") as f:
+            body = f.read()
+        ctype = _CONTENT_TYPES.get(os.path.splitext(fp)[1].lower(),
+                                   "application/octet-stream")
+        self._send(200, body, ctype)
+
+    # --- POST --------------------------------------------------------------
 
     def do_POST(self):
-        hub: TelemetryHub = self.server.hub          # type: ignore[attr-defined]
         path = urllib.parse.urlparse(self.path).path
         n = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(n) if n else b""
         if path == "/ingest":
-            try:
-                hub.publish(json.loads(body))
-            except Exception:
-                pass
-            self._send(200, b"ok", "text/plain")
+            self._post_ingest(body)
         elif path == "/scene":
-            try:
-                d = json.loads(body)
-                hub.set_scene(d.get("scene"), d.get("roots"))
-            except Exception:
-                pass
-            self._send(200, b"ok", "text/plain")
+            self._post_scene(body)
         elif path == "/frame":
-            hub.set_frame(body)
-            self._send(200, b"ok", "text/plain")
+            self.hub.set_frame(body)
+            self._send_text(200, b"ok")
         else:
-            self._send(404, b"not found", "text/plain")
+            self._send_text(404, b"not found")
+
+    def _post_ingest(self, body: bytes) -> None:
+        # A malformed snapshot is dropped, never surfaced: the sim's publisher
+        # thread fires and forgets, so the only useful reaction is to keep the
+        # previous snapshot and wait for the next one.
+        try:
+            state = json.loads(body)
+        except ValueError:
+            _log.debug("dropped /ingest body that is not JSON")
+        else:
+            if isinstance(state, dict):
+                self.hub.publish(state)
+            else:
+                _log.debug("dropped /ingest payload that is not a dict")
+        self._send_text(200, b"ok")
+
+    def _post_scene(self, body: bytes) -> None:
+        try:
+            d = json.loads(body)
+            self.hub.set_scene(d.get("scene"), d.get("roots"))
+        except (ValueError, AttributeError):    # not JSON / not an object
+            _log.debug("dropped malformed /scene body")
+        self._send_text(200, b"ok")
 
 
 def _encode_jpeg(frame) -> bytes:
+    """uint8 [H, W, 3+] array → JPEG bytes (PIL imported lazily: optional path)."""
     import numpy as np
     from PIL import Image
     arr = np.asarray(frame)
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
     buf = io.BytesIO()
-    Image.fromarray(arr[..., :3]).save(buf, format="JPEG", quality=80)
+    Image.fromarray(arr[..., :3]).save(buf, format="JPEG", quality=JPEG_QUALITY)
     return buf.getvalue()
 
 
 class DashboardServer(ThreadingHTTPServer):
+    """One handler thread per request; daemon so the sim process can exit freely."""
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, address, handler, hub: TelemetryHub, html: bytes):
+        super().__init__(address, handler)
+        self.hub = hub
+        self.html = html
+
 
 def make_server(port: int, hub: TelemetryHub, title: str) -> DashboardServer:
-    srv = DashboardServer(("127.0.0.1", port), _Handler)
-    srv.hub = hub                                    # type: ignore[attr-defined]
-    srv.html = _DASHBOARD_HTML.replace("__TITLE__", title).encode()  # type: ignore
-    return srv
+    html = _DASHBOARD_HTML.replace("__TITLE__", title).encode()
+    return DashboardServer((BIND_HOST, port), _Handler, hub, html)
 
 
 def serve(port: int = 8080, title: str = "DOMO twin") -> None:
     """Run the standalone dashboard server (blocking). `python -m domo.dashboard`."""
     hub = TelemetryHub()
     srv = make_server(port, hub, title)
-    print(f"  [dashboard] serving http://127.0.0.1:{port}  "
+    print(f"  [dashboard] serving http://{BIND_HOST}:{port}  "
           f"(open it; waiting for a sim to push telemetry) — Ctrl+C to stop")
     try:
         srv.serve_forever()
@@ -249,18 +364,22 @@ class DashboardClient:
     What the simulation uses to feed a standalone dashboard server. `publish()`
     and `poll_command()` never touch the network on the sim thread — a daemon
     thread POSTs the latest snapshot (dropping stale ones) and polls commands.
+
+    Thread-safety: the sim thread and the background thread only meet through
+    `_lock`-guarded slots (`_state`, `_frame`, `_scene`, `_cmd`); each is a
+    plain reference swap, so the sim never waits on I/O.
     """
 
     def __init__(self, base_url: str, post_hz: float = 20.0):
         self.base = base_url.rstrip("/")
         self.period = 1.0 / max(post_hz, 1.0)
         self._lock = threading.Lock()
-        self._state = None
+        self._state: dict | None = None
         self._frame = None
-        self._cmd = None
-        self._scene = None
+        self._cmd: str | None = None
+        self._scene: dict | None = None
         self._stop = threading.Event()
-        self._thread = None
+        self._thread: threading.Thread | None = None
 
     def start(self) -> DashboardClient:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -280,14 +399,19 @@ class DashboardClient:
             if frame is not None:
                 self._frame = frame
 
-    def poll_command(self):
+    def poll_command(self) -> str | None:
         with self._lock:
             c, self._cmd = self._cmd, None
             return c
 
-    def _run(self):
+    def stop(self) -> None:
+        self._stop.set()
+
+    # --- background thread ---------------------------------------------------
+
+    def _run(self) -> None:
         while not self._stop.is_set():
-            with self._lock:
+            with self._lock:      # take everything pending in one swap
                 st, self._state = self._state, None
                 fr, self._frame = self._frame, None
                 sc, self._scene = self._scene, None
@@ -297,34 +421,40 @@ class DashboardClient:
                 self._post("/ingest", json.dumps(st).encode())
             if fr is not None:
                 self._post("/frame", _encode_jpeg(fr), "image/jpeg")
-            got = self._get("/cmd-poll")
-            if got:
-                try:
-                    cmd = json.loads(got).get("cmd")
-                except Exception:
-                    cmd = None
-                if cmd:
-                    with self._lock:
-                        self._cmd = cmd
+            self._poll_command()
             time.sleep(self.period)
 
-    def _post(self, path, body, ctype="application/json"):
+    def _poll_command(self) -> None:
+        got = self._get("/cmd-poll")
+        if not got:
+            return
+        try:
+            cmd = json.loads(got).get("cmd")
+        except (ValueError, AttributeError):    # garbage reply → no command
+            cmd = None
+        if cmd:
+            with self._lock:
+                self._cmd = cmd
+
+    def _post(self, path: str, body: bytes, ctype: str = "application/json") -> None:
         try:
             req = urllib.request.Request(self.base + path, data=body,
                                          headers={"Content-Type": ctype},
                                          method="POST")
-            urllib.request.urlopen(req, timeout=1.0).read()
-        except Exception:
-            pass                            # server down → drop, never crash sim
+            urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S).read()
+        except Exception as e:
+            # Deliberately broad: this daemon thread must survive ANY transport
+            # error (server down, timeout, half-closed socket) — dropping a
+            # snapshot is the intended behaviour, crashing the sim is not.
+            _log.debug("POST %s dropped: %s", path, e)
 
-    def _get(self, path):
+    def _get(self, path: str) -> bytes | None:
         try:
-            return urllib.request.urlopen(self.base + path, timeout=1.0).read()
-        except Exception:
+            return urllib.request.urlopen(self.base + path,
+                                          timeout=REQUEST_TIMEOUT_S).read()
+        except Exception as e:      # same rationale as _post
+            _log.debug("GET %s failed: %s", path, e)
             return None
-
-    def stop(self):
-        self._stop.set()
 
 
 # ---------------------------------------------------------------------------
@@ -332,32 +462,36 @@ class DashboardClient:
 # ---------------------------------------------------------------------------
 
 class Dashboard:
+    """Server in a daemon thread of the sim process; publish() goes straight to the hub."""
+
     def __init__(self, port: int = 8080, title: str = "DOMO twin"):
         self.port = port
         self.title = title
         self.hub = TelemetryHub()
-        self._server = None
-        self._thread = None
+        self._server: DashboardServer | None = None
+        self._thread: threading.Thread | None = None
 
     def start(self) -> Dashboard:
         self._server = make_server(self.port, self.hub, self.title)
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         daemon=True)
         self._thread.start()
-        print(f"  [dashboard] live at http://127.0.0.1:{self.port}  "
+        print(f"  [dashboard] live at http://{BIND_HOST}:{self.port}  "
               f"(open it in a browser; the sim runs independently)")
         return self
 
-    def set_scene(self, scene, roots=None):
+    def set_scene(self, scene: dict, roots: dict | None = None) -> None:
         self.hub.set_scene(scene, roots)
 
-    def publish(self, state, frame=None):
+    def publish(self, state: dict, frame=None) -> None:
+        # JPEG encoding runs here on the sim thread — the one cost of the
+        # in-process variant, which is why the camera panel is opt-in.
         self.hub.publish(state, _encode_jpeg(frame) if frame is not None else None)
 
-    def poll_command(self):
+    def poll_command(self) -> str | None:
         return self.hub.pop_command()
 
-    def stop(self):
+    def stop(self) -> None:
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -375,6 +509,14 @@ def main():
 # ---------------------------------------------------------------------------
 # The dashboard page — 3D (three.js) sim viewer + sensor/SLAM panels, toggles,
 # and pause/reset/stop controls. three.js loaded from a CDN (browser needs net).
+#
+# Placement matters: this constant is defined AFTER the functions that use it
+# and BEFORE the `__main__` guard — `python -m domo.dashboard` executes the
+# module top to bottom, so the guard must stay the LAST statement or
+# `make_server` would hit a NameError.
+# Two script blocks on purpose: telemetry/2D panels/controls live in a plain
+# <script> that always runs; the three.js viewer is a separate module with a
+# guarded dynamic import, so a CDN failure only blanks the 3D panel.
 # ---------------------------------------------------------------------------
 _DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <title>__TITLE__</title>

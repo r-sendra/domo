@@ -8,23 +8,48 @@ Lifecycle (mirrors engine build semantics):
     robot.bind(n_envs)                     # resolve DOFs, create sensors/actuators
     ...
     robot.refresh()                        # once per control step, then read robot.state
+
+Everything above this class (controllers, tasks, skills) talks to the robot
+through `state`, `set_joint_targets` and `reset_idx` only, which is what a
+real-robot implementation of the same facade must provide.
 """
 
 from __future__ import annotations
+
+import logging
 
 import torch
 
 from domo.sim.base import Scene
 
 from .actuators import PDJointPositionActuator
-from .sensors import SimBaseStateSensor, SimContactSensor, SimIMU, SimJointEncoders
+from .sensors import SimBaseStateSensor, SimContactSensor, SimIMU, SimJointEncoders, StateSensor
 from .spec import RobotSpec
 from .state import RobotState
 
 __all__ = ["Robot"]
 
+_log = logging.getLogger(__name__)
+
 
 class Robot:
+    """
+    Simulated robot facade.
+
+    Args:
+        spec: static robot description.
+        scene: un-built scene the articulation is added to.
+        device: torch device of the simulation state.
+        kp / kd: joint PD gains; None → the spec's nominal values.
+        base_init_pos / base_init_quat: spawn pose overriding the spec
+            (metres, wxyz). Also used by `reset_idx`.
+
+    Attributes populated by `bind()`: `n_envs`, `dof_idx` (engine-local DOF
+    indices in canonical joint order), `default_dof_pos` ([D] nominal pose),
+    `state`, `actuator`, `contact_sensor` (None when the asset has no foot
+    links or the backend exposes no contact forces).
+    """
+
     def __init__(self, spec: RobotSpec, scene: Scene, device: torch.device,
                  kp: float | None = None, kd: float | None = None,
                  base_init_pos: tuple | None = None,
@@ -45,11 +70,12 @@ class Robot:
 
         # Populated by bind():
         self.n_envs = 0
-        self.dof_idx = None
-        self.default_dof_pos = None
+        self.dof_idx: list[int] | None = None
+        self.default_dof_pos: torch.Tensor | None = None
         self.state: RobotState | None = None
         self.actuator: PDJointPositionActuator | None = None
-        self._state_sensors = []
+        self.contact_sensor: SimContactSensor | None = None
+        self._state_sensors: list[StateSensor] = []
 
     # ------------------------------------------------------------------
 
@@ -57,13 +83,15 @@ class Robot:
         """Resolve structure and allocate state. Call after scene.build()."""
         spec = self.spec
         self.n_envs = n_envs
-        self.dof_idx = self.articulation.dof_indices(spec.joint_names)
+        self.dof_idx = list(self.articulation.dof_indices(spec.joint_names))
         self.default_dof_pos = torch.tensor(
             spec.default_dof_angles, device=self.device, dtype=torch.float32)
 
         self.actuator = PDJointPositionActuator(
             self.articulation, self.dof_idx, self._kp, self._kd)
 
+        # At least one contact column so `foot_contacts` always has a
+        # well-formed [N, n_feet] shape, even for feet-less specs.
         n_feet = len(spec.foot_link_names)
         self.state = RobotState.zeros(n_envs, spec.num_dofs, max(n_feet, 1), self.device)
 
@@ -73,18 +101,28 @@ class Robot:
         # Order matters: IMU first (others use state.base_quat).
         self._state_sensors = [imu, encoders, base_state]
 
-        # Foot links may not exist (URDF importers often merge fixed links)
-        # and the backend may not expose contact forces — both optional.
-        self.contact_sensor = None
-        if n_feet > 0:
-            try:
-                foot_idx = self.articulation.link_indices(spec.foot_link_names)
-                contact = SimContactSensor(self.articulation, foot_idx)
-            except Exception:
-                contact = None
-            if contact is not None and contact.available:
-                self.contact_sensor = contact
-                self._state_sensors.append(contact)
+        self.contact_sensor = self._make_contact_sensor()
+        if self.contact_sensor is not None:
+            self._state_sensors.append(self.contact_sensor)
+
+    def _make_contact_sensor(self) -> SimContactSensor | None:
+        """
+        Force-based foot contacts when the asset AND the backend allow it.
+
+        Foot links may not exist (URDF importers often merge fixed links —
+        Genesis' bundled go2 does) and the backend may not expose contact
+        forces; both are optional, so failure just means "no contact sensor".
+        """
+        if not self.spec.foot_link_names:
+            return None
+        try:
+            foot_idx = self.articulation.link_indices(self.spec.foot_link_names)
+        except Exception as exc:  # engine-specific "link not found" types
+            _log.info("no foot links for contact sensing (%s: %s)",
+                      type(exc).__name__, str(exc).splitlines()[0])
+            return None
+        contact = SimContactSensor(self.articulation, foot_idx)
+        return contact if contact.available else None
 
     # ------------------------------------------------------------------
 
@@ -95,6 +133,7 @@ class Robot:
         return self.state
 
     def set_joint_targets(self, targets: torch.Tensor) -> None:
+        """targets: [N, D] desired joint angles in canonical order."""
         self.actuator.apply(targets)
 
     # ------------------------------------------------------------------
@@ -103,8 +142,15 @@ class Robot:
                   base_pos: torch.Tensor | None = None) -> None:
         """
         Reset selected envs to the default configuration.
-        base_pos: optional [len(envs_idx), 3] spawn positions (e.g. terrain
-        grid); defaults to the spec's init position.
+
+        Args:
+            envs_idx: env indices to reset (empty → no-op).
+            base_pos: optional [len(envs_idx), 3] spawn positions (e.g.
+                terrain grid); defaults to the spec's init position.
+
+        The state snapshot is written alongside the engine so that a
+        controller reading `state` before the next `refresh()` already sees
+        the reset pose.
         """
         if len(envs_idx) == 0:
             return

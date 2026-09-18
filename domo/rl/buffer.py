@@ -1,4 +1,4 @@
-"""Rollout storage with GAE-λ advantage computation."""
+"""Rollout storage with GAE-λ advantage computation (torch only)."""
 
 from __future__ import annotations
 
@@ -10,11 +10,16 @@ __all__ = ["RolloutBuffer"]
 class RolloutBuffer:
     """
     Stores one rollout (T steps × N envs) and computes GAE advantages.
-    All tensors are pre-allocated on device.
+    All tensors are pre-allocated on device as float32.
 
     Storage is split into two calls per timestep:
       store_step()    — BEFORE env.step(), with obs/action/logp/value
       store_outcome() — AFTER  env.step(), with reward/done
+
+    Attributes (shapes):
+        obs [T, N, obs_dim], actions [T, N, act_dim], log_probs / values /
+        rewards / dones / advantages / returns [T, N]. `ptr` is the next
+        timestep to write; `compute_gae` resets it to 0.
     """
 
     def __init__(self, rollout_steps: int, n_envs: int, obs_dim: int,
@@ -37,6 +42,7 @@ class RolloutBuffer:
         self.returns = buf(self.T, n_envs)
 
     def store_step(self, obs, actions, log_probs, values):
+        """Record the policy's view of timestep `ptr` (detached copies)."""
         t = self.ptr
         self.obs[t] = obs.detach()
         self.actions[t] = actions.detach()
@@ -44,12 +50,20 @@ class RolloutBuffer:
         self.values[t] = values.detach()
 
     def store_outcome(self, rewards, dones):
+        """Record the env's response for timestep `ptr` and advance it."""
         t = self.ptr
         self.rewards[t] = rewards.detach().float()
         self.dones[t] = dones.detach().float()
         self.ptr += 1
 
     def compute_gae(self, last_value, gamma: float = 0.99, lam: float = 0.95):
+        """
+        Fill `advantages` and `returns` by backward GAE-λ recursion.
+
+        `last_value` [N] bootstraps the final step. Dones cut the recursion
+        (no bootstrap through a reset); time-outs are treated as terminal
+        too, matching the original trainer. Resets `ptr` to 0.
+        """
         gae = torch.zeros(self.N, device=self.device)
         for t in reversed(range(self.T)):
             next_val = last_value if t == self.T - 1 else self.values[t + 1]
@@ -61,7 +75,12 @@ class RolloutBuffer:
         self.ptr = 0
 
     def get_flat(self):
-        """Flatten (T, N, ...) → (T*N, ...) for minibatch sampling."""
+        """
+        Flatten (T, N, ...) → (T*N, ...) for minibatch sampling.
+
+        Returns:
+            (obs, actions, log_probs, advantages, returns, values) views.
+        """
         T, N = self.T, self.N
         return (
             self.obs.view(T * N, -1),

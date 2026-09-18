@@ -1,26 +1,40 @@
 """
 Go2 get-up / recovery task — the reward-injection target for Eureka (M2/M3).
 
-The robot spawns FALLEN (random roll near ±π/2..π, random yaw, on the
-ground) and must right itself and hold a standing pose. The task ships with
-NO reward: it is designed to receive an LLM-generated reward via
-`set_reward_override()`. What it does fix — deliberately outside the
-generated code's reach — is the SUCCESS METRIC:
+The robot spawns FALLEN (random roll in `spawn_roll_range` on either side,
+random yaw, on the ground, scrambled joints) and must right itself and hold
+a standing pose. The task ships with NO reward: it is designed to receive
+an LLM-generated reward via `set_reward_override()`. What it does fix —
+deliberately outside the generated code's reach — is the SUCCESS METRIC::
 
-    success  =  base height > 0.26 m
-              ∧ |roll| < 0.4 ∧ |pitch| < 0.4
-              held for `success_hold_steps` consecutive steps
+    success  =  base height > success_height (0.26 m)
+              ∧ |roll| < success_tilt ∧ |pitch| < success_tilt (0.4 rad)
+              held for `success_hold_steps` (25 = 0.5 s) consecutive steps
 
 Candidates are ranked by episode success rate, never by their own reward.
+Because success is binary and sparse, the task also exposes a DENSE,
+reward-independent `compute_fitness()` (uprightness × height fraction) that
+Eureka uses as a tie-breaker; per-episode records average it over the
+episode (dwell), so a ballistic lunge through the pose scores lower than
+standing and holding. See `episode_outcomes` for the record layout.
 
-Observation (42):
-  [0:3]   base angular velocity (body, ×0.25)
-  [3:6]   projected gravity (body)
-  [6:18]  joint pos − default
-  [18:30] joint velocities (×0.05)
-  [30:42] previous action
+Observation (42, float32) — built by `build_getup_observation`::
 
-Action (12): joint-position offsets from the default stance × action_scale.
+    [0:3]   base angular velocity (body, ×0.25)
+    [3:6]   projected gravity (body; [0,0,-1] when upright)
+    [6:18]  joint pos − default (×1.0)
+    [18:30] joint velocities (×0.05)
+    [30:42] previous action (the one applied at the last step)
+
+Optional zero-mean Gaussian noise (DR `obs_noise_std`) is added in `step`
+but NOT in `reset` (the first observation is clean).
+
+Action (12): joint-position offsets from the default stance; target =
+clip(action, ±clip_actions) × action_scale + default. No latency.
+
+Termination: success (hold reached) or the episode budget. There is NO
+fall termination — the robot starts fallen; thrashing simply wastes its
+budget.
 
 Supports DomainRandomization (physics resampled per reset + optional obs
 noise) — the surface DrEureka optimises over.
@@ -55,7 +69,20 @@ _OBS_SCALES = {"ang_vel": 0.25, "dof_vel": 0.05}
 
 def build_getup_observation(state: RobotState, default_dof_pos: torch.Tensor,
                             last_actions: torch.Tensor) -> torch.Tensor:
-    """Shared by the task and the deployed LearnedJointSkill."""
+    """
+    The 42-dim get-up observation (layout in the module docstring).
+
+    Shared by the task and the deployed LearnedJointSkill so a trained
+    get-up policy sees exactly the training layout at run time.
+
+    Args:
+        state: robot state snapshot (N envs).
+        default_dof_pos: [12] nominal standing joint angles.
+        last_actions: [N, 12] previous action.
+
+    Returns:
+        [N, 42] float32.
+    """
     return torch.cat([
         state.base_ang_vel * _OBS_SCALES["ang_vel"],     # 3
         state.projected_gravity,                          # 3
@@ -67,8 +94,14 @@ def build_getup_observation(state: RobotState, default_dof_pos: torch.Tensor,
 
 @dataclass
 class Go2GetUpConfig:
+    """
+    Go2GetUpTask parameters. Eureka workers rebuild the task from
+    `task_overrides` dicts keyed by these field names, so names and
+    defaults are part of the skill-learning contract.
+    """
+
     n_envs: int = 4096
-    dt: float = 0.02
+    dt: float = 0.02                      # control period [s] (50 Hz)
     max_episode_steps: int = 400          # 8 s to get up (was 5 s — too tight)
     device: str = "cuda"
     headless: bool = True
@@ -83,7 +116,7 @@ class Go2GetUpConfig:
     # Fallen spawn. |roll| range excludes the near-inverted (belly-up) poses
     # that are nearly impossible to bootstrap from scratch; a real curriculum
     # can widen this once a base policy exists.
-    spawn_height: float = 0.18
+    spawn_height: float = 0.18            # [m]
     spawn_roll_range: tuple[float, float] = (math.pi / 3, 5 * math.pi / 6)  # 60°–150°
     spawn_joint_noise: float = 0.3        # rad, around default angles
 
@@ -92,20 +125,43 @@ class Go2GetUpConfig:
     # can rarely hold a full second, and "stood up and stayed up half a
     # second" is still a legitimate success — this lets the metric register
     # for a policy that demonstrably reaches the pose.
-    success_height: float = 0.26
+    success_height: float = 0.26          # [m]
     success_tilt: float = 0.4             # rad, roll AND pitch
     success_hold_steps: int = 25          # 0.5 s upright (was 50 / 1 s)
 
-    # Domain randomization (serialised as dict for checkpoints/specs)
+    # Domain randomization (serialised as dict for checkpoints/specs; see
+    # domo.robot.randomization.DomainRandomization.from_dict)
     dr: dict | None = None
 
 
 class Go2GetUpTask(VecTask):
+    """
+    Get-up task with a fixed success metric and an injectable reward.
+
+    Attributes read by domo.eureka:
+        episode_outcomes: list of per-episode dict records appended at every
+            episode end (success or timeout), in env order within a step::
+
+                {"success":      bool   hold reached this episode,
+                 "fitness":      float  time-AVERAGED compute_fitness (dwell),
+                 "peak_height":  float  max base height [m] over the episode,
+                 "ever_upright": bool   compute_success was ever True,
+                 "max_hold":     int    longest consecutive-upright streak}
+
+            The list grows without bound; workers slice the tail.
+        extras["success"]: float [N] 1.0 where the hold was reached this step.
+        extras["time_outs"]: float [N] 1.0 where the budget ran out.
+
+    Without an injected reward `rew_buf` is all zeros (the registry is
+    empty), which is intentional: a stray reward would leak into candidate
+    training.
+    """
 
     OBS_DIM = GETUP_OBS_DIM
     ACT_DIM = GETUP_ACT_DIM
 
     def __init__(self, cfg: Go2GetUpConfig, spec: RobotSpec = GO2):
+        # Imported lazily (see Go2AvoidTask): keeps domo.tasks engine-free.
         from domo.world import World, WorldConfig
 
         world = World(WorldConfig(
@@ -130,6 +186,7 @@ class Go2GetUpTask(VecTask):
         device = world.device
         self.actions = torch.zeros((N, self.ACT_DIM), device=device, dtype=f)
         self.last_actions = torch.zeros_like(self.actions)
+        # Consecutive steps the success condition has held (reset on any miss).
         self._hold = torch.zeros((N,), device=device, dtype=torch.int32)
         # Per-episode progress trackers (dense fitness + diagnostics).
         # Fitness is the time-AVERAGE of the progress signal (dwell), not its
@@ -140,10 +197,14 @@ class Go2GetUpTask(VecTask):
         self._peak_height = torch.zeros((N,), device=device, dtype=f)
         self._ever_upright = torch.zeros((N,), device=device, dtype=torch.bool)
         self._max_hold = torch.zeros((N,), device=device, dtype=torch.int32)
-        # Rolling per-episode records: dict(success, fitness, peak_height,
-        # ever_upright). Read by evaluation/workers.
-        self.episode_outcomes: list = []
+        # Rolling per-episode records (layout in the class docstring).
+        # Read by evaluation/workers.
+        self.episode_outcomes: list[dict] = []
+        self._print_banner()
 
+    def _print_banner(self) -> None:
+        cfg = self.cfg
+        reward = "injected" if self._reward_override else "NONE (inject via set_reward_override)"
         print(f"\n{'=' * 58}")
         print("  Go2 Get-Up task (reward-injection target)")
         print(f"{'=' * 58}")
@@ -151,14 +212,16 @@ class Go2GetUpTask(VecTask):
         print(f"  Obs/Act  : {self.OBS_DIM} / {self.ACT_DIM}")
         print(f"  Success  : h>{cfg.success_height} & tilt<{cfg.success_tilt} "
               f"for {cfg.success_hold_steps} steps")
-        print(f"  Reward   : "
-              f"{'injected' if self._reward_override else 'NONE (inject via set_reward_override)'}")
+        print(f"  Reward   : {reward}")
         print(f"  DR       : {cfg.dr or 'off'}")
         print(f"{'=' * 58}\n")
 
     # ------------------------------------------------------------------
+    # Fixed metrics (never touched by injected rewards)
+    # ------------------------------------------------------------------
 
     def compute_success(self) -> torch.Tensor:
+        """Bool [N]: base high enough AND level (instantaneous, no hold)."""
         state = self.robot.state
         upright = state.base_pos[:, 2] > self.cfg.success_height
         upright &= state.base_euler[:, 0].abs() < self.cfg.success_tilt
@@ -180,6 +243,22 @@ class Go2GetUpTask(VecTask):
         height = torch.clamp(state.base_pos[:, 2] / self.cfg.success_height,
                              0.0, 1.0)
         return uprightness * height
+
+    def _record_episode_outcomes(self, succeeded: torch.Tensor) -> None:
+        """Append one record per env flagged in `reset_buf` (see class doc)."""
+        for idx in self.reset_buf.nonzero(as_tuple=False).flatten():
+            steps = max(int(self.episode_length_buf[idx]), 1)
+            self.episode_outcomes.append({
+                "success": bool(succeeded[idx]),
+                "fitness": float(self._fitness_sum[idx]) / steps,  # time-avg dwell
+                "peak_height": float(self._peak_height[idx]),
+                "ever_upright": bool(self._ever_upright[idx]),
+                "max_hold": int(self._max_hold[idx]),
+            })
+
+    # ------------------------------------------------------------------
+    # Step
+    # ------------------------------------------------------------------
 
     def step(self, actions: torch.Tensor):
         cfg = self.cfg
@@ -206,20 +285,10 @@ class Go2GetUpTask(VecTask):
 
         # Termination: success or timeout (no fall termination — the robot
         # STARTS fallen; thrashing simply wastes its budget).
-        timeout = self.episode_length_buf > self.max_episode_length
+        timeout = self.mark_time_outs()
         self.reset_buf = succeeded | timeout
-
-        self.extras["time_outs"] = timeout.float()
         self.extras["success"] = succeeded.float()
-        for idx in self.reset_buf.nonzero(as_tuple=False).flatten():
-            steps = max(int(self.episode_length_buf[idx]), 1)
-            self.episode_outcomes.append({
-                "success": bool(succeeded[idx]),
-                "fitness": float(self._fitness_sum[idx]) / steps,  # time-avg dwell
-                "peak_height": float(self._peak_height[idx]),
-                "ever_upright": bool(self._ever_upright[idx]),
-                "max_hold": int(self._max_hold[idx]),
-            })
+        self._record_episode_outcomes(succeeded)
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
 
@@ -239,8 +308,11 @@ class Go2GetUpTask(VecTask):
         return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
 
     # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
 
     def reset(self):
+        """Reset all envs and return a fresh, noise-free observation."""
         self.reset_buf[:] = True
         self.reset_idx(torch.arange(self.n_envs, device=self.device))
         self.robot.refresh()
@@ -248,15 +320,16 @@ class Go2GetUpTask(VecTask):
             self.robot.state, self.robot.default_dof_pos, self.last_actions)
         return self.obs_buf, None
 
-    def reset_idx(self, envs_idx: torch.Tensor):
-        if len(envs_idx) == 0:
-            return
+    def _spawn_fallen(self, envs_idx: torch.Tensor) -> None:
+        """
+        Overwrite the default spawn with a FALLEN pose: random side (sign),
+        |roll| in `spawn_roll_range`, random yaw, joints scrambled around
+        the default stance. RNG draw order (roll, side, yaw, joints) is part
+        of seeded reproducibility.
+        """
         cfg = self.cfg
         n = len(envs_idx)
 
-        self.robot.reset_idx(envs_idx)
-
-        # Overwrite the spawn pose: FALLEN, random side, random yaw.
         roll = rand_uniform(*cfg.spawn_roll_range, (n,), self.device)
         roll *= torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0)
         yaw = rand_uniform(-math.pi, math.pi, (n,), self.device)
@@ -275,6 +348,13 @@ class Go2GetUpTask(VecTask):
         self.robot.articulation.set_joint_positions(
             joints, self.robot.dof_idx, envs_idx, zero_velocity=True)
         self.robot.state.dof_pos[envs_idx] = joints
+
+    def reset_idx(self, envs_idx: torch.Tensor):
+        if len(envs_idx) == 0:
+            return
+
+        self.robot.reset_idx(envs_idx)
+        self._spawn_fallen(envs_idx)
 
         if self.dr is not None:
             self.dr.apply(self.robot, envs_idx)

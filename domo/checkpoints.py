@@ -9,6 +9,10 @@ Handles checkpoint I/O for BOTH formats:
 Networks are always rebuilt from weight shapes (ActorCritic.from_state_dict),
 so any locomotion checkpoint ever trained with the 76-dim CPG observation
 loads regardless of provenance.
+
+Config dicts come from JSON-ish serialisation (dataclasses.asdict + json),
+where tuples degrade to lists; `_lists_to_tuples` restores them so the
+dataclasses compare equal to freshly constructed ones.
 """
 
 from __future__ import annotations
@@ -20,14 +24,29 @@ from domo.rl import ActorCritic, PPOConfig
 from domo.robot import LidarModelConfig
 from domo.tasks import Go2AvoidConfig, Go2CPGWalkConfig, ObstacleArenaConfig
 
+__all__ = [
+    "avoid_config_from_dict",
+    "configs_from_checkpoint",
+    "cpg_walk_config_from_dict",
+    "load_checkpoint",
+    "load_locomotion_policy",
+    "pick_device",
+    "world_from_avoid_config",
+]
+
+# Legacy pre-lidar_model configs stored the scan interval in control steps.
+_LEGACY_LIDAR_INTERVAL_STEPS = 5
+
 
 def pick_device(requested: str) -> str:
+    """Fall back to CPU when CUDA is requested but unavailable."""
     if requested == "cuda" and not torch.cuda.is_available():
         return "cpu"
     return requested
 
 
 def load_checkpoint(path: str, device: str):
+    """torch.load with pickled configs allowed (checkpoints carry dataclasses)."""
     return torch.load(path, weights_only=False, map_location=device)
 
 
@@ -56,6 +75,11 @@ def load_locomotion_policy(path: str, device: str):
 # Config (de)serialisation
 # ---------------------------------------------------------------------------
 
+def _lists_to_tuples(d: dict) -> dict:
+    """Shallow copy with list values turned back into tuples (JSON round-trip)."""
+    return {k: tuple(v) if isinstance(v, list) else v for k, v in d.items()}
+
+
 def world_from_avoid_config(task_cfg: Go2AvoidConfig, headless: bool = True):
     """
     Spawn the goal-free digital twin in the same environment an avoidance
@@ -77,58 +101,47 @@ def world_from_avoid_config(task_cfg: Go2AvoidConfig, headless: bool = True):
 
 
 def cpg_walk_config_from_dict(d: dict) -> Go2CPGWalkConfig:
+    """Rebuild a Go2CPGWalkConfig from its serialised dict (nested cpg dict allowed)."""
     d = dict(d)
     if isinstance(d.get("cpg"), dict):
         d["cpg"] = CPGConfig(**d["cpg"])
-    return Go2CPGWalkConfig(**{k: tuple(v) if isinstance(v, list) else v
-                               for k, v in d.items()})
+    return Go2CPGWalkConfig(**_lists_to_tuples(d))
+
+
+def _migrate_legacy_lidar(d: dict) -> None:
+    """
+    In place: convert pre-lidar_model keys ({"lidar": {...}, "lidar_interval": n})
+    into a `lidar_model`, unless the dict already carries one.
+    """
+    lc = d.pop("lidar") or {}
+    interval = d.pop("lidar_interval", _LEGACY_LIDAR_INTERVAL_STEPS)
+    d.setdefault("lidar_model", LidarModelConfig(
+        n_horizontal=lc.get("n_horizontal", 36),
+        n_vertical=lc.get("n_vertical", 5),
+        fov_deg=tuple(lc.get("fov_deg", (360.0, 50.0))),
+        rate_hz=1.0 / (interval * d.get("dt", 0.02)),
+        max_range=lc.get("max_range", 4.0),
+        pos_offset=tuple(lc.get("pos_offset", (0.0, 0.0, 0.35))),
+        draw_debug=lc.get("draw_debug", False)))
 
 
 def avoid_config_from_dict(d: dict) -> Go2AvoidConfig:
+    """Rebuild a Go2AvoidConfig from its serialised dict (nested arena/lidar/cpg dicts allowed)."""
     d = dict(d)
     if isinstance(d.get("arena"), dict):
-        d["arena"] = ObstacleArenaConfig(**{
-            k: tuple(v) if isinstance(v, list) else v
-            for k, v in d["arena"].items()})
+        d["arena"] = ObstacleArenaConfig(**_lists_to_tuples(d["arena"]))
     if isinstance(d.get("lidar_model"), dict):
-        d["lidar_model"] = LidarModelConfig(**{
-            k: tuple(v) if isinstance(v, list) else v
-            for k, v in d["lidar_model"].items()})
-    # Migrate pre-lidar_model configs ({"lidar": {...}, "lidar_interval": n}).
+        d["lidar_model"] = LidarModelConfig(**_lists_to_tuples(d["lidar_model"]))
     if "lidar" in d:
-        lc = d.pop("lidar") or {}
-        interval = d.pop("lidar_interval", 5)
-        d.setdefault("lidar_model", LidarModelConfig(
-            n_horizontal=lc.get("n_horizontal", 36),
-            n_vertical=lc.get("n_vertical", 5),
-            fov_deg=tuple(lc.get("fov_deg", (360.0, 50.0))),
-            rate_hz=1.0 / (interval * d.get("dt", 0.02)),
-            max_range=lc.get("max_range", 4.0),
-            pos_offset=tuple(lc.get("pos_offset", (0.0, 0.0, 0.35))),
-            draw_debug=lc.get("draw_debug", False)))
+        _migrate_legacy_lidar(d)
     if isinstance(d.get("cpg"), dict):
-        d["cpg"] = CPGConfig(**{
-            k: tuple(v) if isinstance(v, list) else v
-            for k, v in d["cpg"].items()})
-    return Go2AvoidConfig(**{k: tuple(v) if isinstance(v, list) else v
-                             for k, v in d.items()})
+        d["cpg"] = CPGConfig(**_lists_to_tuples(d["cpg"]))
+    return Go2AvoidConfig(**_lists_to_tuples(d))
 
 
-def configs_from_checkpoint(ckpt: dict, kind: str):
-    """
-    Reconstruct (task_config, ppo_config) from a checkpoint of either format.
-    kind: "cpg_walk" | "avoid".
-    """
-    if "ppo_config" in ckpt:                      # new library format
-        ppo = PPOConfig(**ckpt["ppo_config"])
-        tc = ckpt["extra"]["task_config"]
-        task = (cpg_walk_config_from_dict(tc) if kind == "cpg_walk"
-                else avoid_config_from_dict(tc))
-        return task, ppo
-
-    # Legacy script format: one flat dict.
-    c = ckpt["config"]
-    ppo = PPOConfig(
+def _legacy_ppo_config(c: dict) -> PPOConfig:
+    """PPOConfig from a flat script config; defaults mirror the original scripts."""
+    return PPOConfig(
         total_steps=c.get("total_steps", 80_000_000),
         rollout_steps=c.get("rollout_steps", 24),
         minibatch_size=c.get("minibatch_size", 8192),
@@ -142,6 +155,7 @@ def configs_from_checkpoint(ckpt: dict, kind: str):
         max_grad_norm=c.get("max_grad_norm", 1.0),
         hidden_size=c.get("hidden_size", 512),
         target_kl=c.get("target_kl"),
+        # The scripts only had a floor fraction when they used a linear decay.
         lr_schedule="linear" if "lr_floor_frac" in c else "constant",
         lr_floor_frac=c.get("lr_floor_frac", 0.05),
         vloss_skip=c.get("vloss_skip"),
@@ -150,14 +164,32 @@ def configs_from_checkpoint(ckpt: dict, kind: str):
         save_interval=c.get("save_interval", 100),
         ep_stat_window=50,
     )
-    if kind == "cpg_walk":
-        task = Go2CPGWalkConfig(
-            n_envs=c.get("n_envs", 4096), dt=c.get("dt", 0.02),
-            max_episode_steps=c.get("max_episode_steps", 1000),
-            headless=c.get("headless", True))
-    else:
-        task = Go2AvoidConfig(
-            n_envs=c.get("n_envs", 4096), dt=c.get("dt", 0.02),
-            max_episode_steps=c.get("max_episode_steps", 1000),
-            headless=c.get("headless", True))
-    return task, ppo
+
+
+def _legacy_task_config(c: dict, kind: str):
+    """Task config from a flat script config (only the shared fields were stored)."""
+    common = dict(
+        n_envs=c.get("n_envs", 4096), dt=c.get("dt", 0.02),
+        max_episode_steps=c.get("max_episode_steps", 1000),
+        headless=c.get("headless", True))
+    return Go2CPGWalkConfig(**common) if kind == "cpg_walk" else Go2AvoidConfig(**common)
+
+
+def configs_from_checkpoint(ckpt: dict, kind: str):
+    """
+    Reconstruct (task_config, ppo_config) from a checkpoint of either format.
+
+    Args:
+        ckpt: loaded checkpoint dict (see `load_checkpoint`).
+        kind: "cpg_walk" | "avoid" — which task dataclass to build.
+    """
+    if "ppo_config" in ckpt:                      # new library format
+        ppo = PPOConfig(**ckpt["ppo_config"])
+        tc = ckpt["extra"]["task_config"]
+        task = (cpg_walk_config_from_dict(tc) if kind == "cpg_walk"
+                else avoid_config_from_dict(tc))
+        return task, ppo
+
+    # Legacy script format: one flat dict.
+    c = ckpt["config"]
+    return _legacy_task_config(c, kind), _legacy_ppo_config(c)

@@ -7,7 +7,8 @@ never imports a physics engine; it only writes spec JSON, spawns
 
     python -m domo.eureka.worker <spec.json>
 
-and reads back <run_dir>/results.json.
+and reads back <run_dir>/results.json. This module is therefore the ONLY
+place in ``domo.eureka`` that imports tasks, the trainer, or the engine.
 
 Spec schema (mode "train"):
     { "mode": "train", "task": "go2_getup",
@@ -16,12 +17,27 @@ Spec schema (mode "train"):
       "ppo": {...},                            # PPOConfig kwargs
       "run_dir": "...", "eval_episodes": 32, "snapshots": 4 }
 
+Results (mode "train"), written to <run_dir>/results.json:
+    { "error": null, "checkpoint": "<run_dir>/checkpoint_final.pt",
+      "success_rate", "fitness", "peak_height", "ever_upright_rate",
+      "max_hold", "mean_ep_len",             # post-training deterministic eval
+      "snapshots": [ {"frac", "components": {name: mean}, "success_rate",
+                      "fitness", "peak_height", "ever_upright_rate",
+                      "mean_ep_len"}, ... ] } # ~equally spaced during training
+
 Spec schema (mode "dr_eval"):
     { "mode": "dr_eval", "task": "go2_getup",
       "task_overrides": {...},
       "checkpoint": ".../checkpoint_final.pt",
       "sweeps": [ {"label": "friction=0.5", "dr": {...}}, ... ],
       "eval_episodes": 32, "run_dir": "..." }
+
+Results (mode "dr_eval"):
+    { "error": null,
+      "sweeps": [ {"label", "dr", "success_rate", "fitness", "mean_ep_len"}, ... ] }
+
+On any exception ``results.json`` is still written, as
+``{"error": "<traceback>"}``; the parent turns that into a failed candidate.
 """
 
 from __future__ import annotations
@@ -34,8 +50,24 @@ import traceback
 
 import torch
 
+# Name of the checkpoint the trainer saves at the end of training; reported
+# back to the parent as the candidate's deployable policy.
+CHECKPOINT_NAME = "checkpoint_final.pt"
 
-def _build_task(spec, dr_override=None):
+# Evaluation rollouts stop after `episodes` finished episodes, or after this
+# many extra steps beyond the theoretical maximum (guards against a task that
+# never terminates episodes).
+_EVAL_STEP_SLACK = 200
+
+# Number of most-recent training episodes summarised in each snapshot.
+_SNAPSHOT_EPISODE_WINDOW = 200
+
+# Number of most-recent episode lengths averaged in each snapshot.
+_SNAPSHOT_EP_LEN_WINDOW = 50
+
+
+def _build_task(spec: dict, dr_override: dict | None = None):
+    """Instantiate the registered task with the spec's config overrides."""
     from .spec import TASK_REGISTRY
     task_spec = TASK_REGISTRY[spec["task"]]
     module = importlib.import_module(task_spec.module)
@@ -47,8 +79,14 @@ def _build_task(spec, dr_override=None):
     return task_cls(config_cls(**overrides))
 
 
-def _record_stats(records) -> dict:
-    """Aggregate a list of per-episode outcome dicts (or legacy bools)."""
+def _record_stats(records: list) -> dict:
+    """Aggregate a list of per-episode outcome dicts (or legacy bools).
+
+    Tasks append one record per finished episode to ``task.episode_outcomes``:
+    ``{"success", "fitness", "peak_height", "ever_upright", "max_hold"}``.
+    Older tasks appended plain success booleans; those are still accepted
+    with fitness mirroring success.
+    """
     if not records:
         return {"success_rate": 0.0, "fitness": 0.0, "peak_height": 0.0,
                 "ever_upright_rate": 0.0, "max_hold": 0.0}
@@ -69,23 +107,46 @@ def _record_stats(records) -> dict:
 
 
 def _evaluate_success(task, net, episodes: int) -> dict:
-    """Deterministic rollouts until `episodes` episodes finish."""
+    """Deterministic rollouts until `episodes` episodes finish.
+
+    Returns the aggregated ``_record_stats`` of exactly those episodes plus
+    ``mean_ep_len``. Note: ``mean_ep_len`` currently reports the task's
+    maximum episode length, not the measured mean (kept for schema
+    stability; it is only the last tie-breaker in ``CandidateResult.rank_key``).
+    """
     start = len(task.episode_outcomes)
     obs, _ = task.reset()
-    step_cap = episodes * task.max_episode_length + 200
+    step_cap = episodes * task.max_episode_length + _EVAL_STEP_SLACK
     steps = 0
     while len(task.episode_outcomes) - start < episodes and steps < step_cap:
         with torch.no_grad():
             act, _, _ = net.get_action(obs, deterministic=True)
-        obs, _, _, reset_buf, _ = task.step(act)
+        obs, _, _, _, _ = task.step(act)
         steps += 1
     stats = _record_stats(task.episode_outcomes[start:start + episodes])
     stats["mean_ep_len"] = float(task.max_episode_length)
     return stats
 
 
-def _run_train(spec) -> dict:
+def _snapshot(task, trainer, frac: float) -> dict:
+    """One reward-reflection sample: mean reward components + recent outcomes."""
+    comps = {k: float(v.mean()) for k, v in task.reward_components.items()}
+    stats = _record_stats(task.episode_outcomes[-_SNAPSHOT_EPISODE_WINDOW:])
+    recent_lengths = trainer.ep_lengths[-_SNAPSHOT_EP_LEN_WINDOW:]
+    return {
+        "frac": frac,
+        "components": comps,
+        "success_rate": stats["success_rate"],
+        "fitness": stats["fitness"],
+        "peak_height": stats["peak_height"],
+        "ever_upright_rate": stats["ever_upright_rate"],
+        "mean_ep_len": (float(sum(recent_lengths) / max(len(recent_lengths), 1))
+                        if trainer.ep_lengths else 0.0),
+    }
 
+
+def _run_train(spec: dict) -> dict:
+    """Mode "train": inject the reward, train PPO, evaluate, report."""
     from domo.rl import PPOConfig, PPOTrainer
 
     from .rewards import load_reward_fn
@@ -114,28 +175,18 @@ def _run_train(spec) -> dict:
     def on_update(tr, update):
         if update % every != 0 and update != total_updates:
             return
-        comps = {k: float(v.mean()) for k, v in task.reward_components.items()}
-        stats = _record_stats(task.episode_outcomes[-200:])
-        snapshots.append({
-            "frac": update / total_updates,
-            "components": comps,
-            "success_rate": stats["success_rate"],
-            "fitness": stats["fitness"],
-            "peak_height": stats["peak_height"],
-            "ever_upright_rate": stats["ever_upright_rate"],
-            "mean_ep_len": (float(sum(tr.ep_lengths[-50:]) / max(len(tr.ep_lengths[-50:]), 1))
-                            if tr.ep_lengths else 0.0),
-        })
+        snapshots.append(_snapshot(task, tr, update / total_updates))
 
     trainer.update_callback = on_update
     trainer.train()
 
-    ckpt = os.path.join(spec["run_dir"], "checkpoint_final.pt")
+    ckpt = os.path.join(spec["run_dir"], CHECKPOINT_NAME)
     stats = _evaluate_success(task, trainer.net, spec.get("eval_episodes", 32))
     return {"error": None, "snapshots": snapshots, "checkpoint": ckpt, **stats}
 
 
-def _run_dr_eval(spec) -> dict:
+def _run_dr_eval(spec: dict) -> dict:
+    """Mode "dr_eval": evaluate a frozen checkpoint under each DR sweep."""
     from domo.rl import ActorCritic, clean_state_dict
 
     ckpt = torch.load(spec["checkpoint"], weights_only=False,
@@ -165,6 +216,7 @@ def _run_dr_eval(spec) -> dict:
 
 
 def main():
+    """CLI: ``python -m domo.eureka.worker <spec.json>``."""
     spec_path = sys.argv[1]
     with open(spec_path) as f:
         spec = json.load(f)
@@ -177,6 +229,9 @@ def main():
         else:
             raise ValueError(f"unknown mode {spec['mode']}")
     except Exception:
+        # Deliberately broad: ANY failure must reach the parent as data. The
+        # full traceback is the payload — it is what the reflection shows the
+        # LLM so it can fix the reward (e.g. an undefined task field).
         results = {"error": traceback.format_exc()}
     with open(os.path.join(spec["run_dir"], "results.json"), "w") as f:
         json.dump(results, f, indent=2)

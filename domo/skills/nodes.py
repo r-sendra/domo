@@ -8,18 +8,27 @@ composition later (closure under composition).
 
 Status protocol: every node exposes `.status` ∈ {RUNNING, SUCCESS, FAILURE}
 after each update. Containers react to child status at the START of their
-next update (sequence advances on SUCCESS, fallback advances on FAILURE).
+next update (sequence advances on SUCCESS, fallback advances on FAILURE), so
+a child's SUCCESS is registered one control tick after it happens; FAILURE
+additionally propagates up the same tick (see SequenceNode/ModifiedNode).
 Program-counter transitions are global across envs (success requires all
 envs, failure triggers on any) — compositions execute at deployment
 (n_envs = 1); training remains the job of tasks.
 
 Every transition is appended to `ctx.trace` with a timestamp — the
 execution log the LLM supervisor reads to diagnose what happened (M4/M5).
+Trace lines are part of the contract: tests and planners grep them.
+
+Node update contract: `update(state, dt) -> joint targets [N, D]`; leaves
+and layers also take `extra_cmd` ([N, 3] velocity contribution handed down
+by the LayerNode above). Terminal nodes return `ctx.hold()` (default pose).
 """
 
 from __future__ import annotations
 
 import torch
+
+from domo.control.skill import all_envs
 
 __all__ = [
     "FAILURE",
@@ -41,25 +50,30 @@ STATUS_NAMES = {RUNNING: "RUNNING", SUCCESS: "SUCCESS", FAILURE: "FAILURE"}
 
 
 class ExecContext:
-    """Shared execution state: clock, trace log, hold-pose targets."""
+    """Shared execution state: program clock, trace log, hold-pose targets."""
 
     def __init__(self):
-        self.t = 0.0
+        self.t = 0.0                    # program time (s), advanced by CompositeSkill
         self.trace: list[str] = []
         self._hold = None
 
     def bind(self, robot):
+        """Allocate the hold pose [N, D] (default stance) for this robot."""
         self._hold = robot.default_dof_pos.unsqueeze(0).repeat(
             robot.n_envs, 1).clone()
 
     def hold(self) -> torch.Tensor:
+        """Joint targets [N, D] returned by finished/terminal nodes."""
         return self._hold
 
     def log(self, msg: str):
+        """Append a timestamped line to the execution trace."""
         self.trace.append(f"[t={self.t:7.2f}s] {msg}")
 
 
 class ExecNode:
+    """Base of the executable tree; see the module docstring for the protocol."""
+
     status: int = RUNNING
 
     def __init__(self, ctx: ExecContext):
@@ -68,9 +82,11 @@ class ExecNode:
 
     @property
     def t_local(self) -> float:
+        """Seconds since this node was last entered (feeds conditions/.for)."""
         return self.ctx.t - self.t0
 
     def enter(self):
+        """(Re)start the node: status RUNNING, local clock reset."""
         self.status = RUNNING
         self.t0 = self.ctx.t
 
@@ -78,6 +94,7 @@ class ExecNode:
         raise NotImplementedError
 
     def label(self) -> str:
+        """Human-readable name used in trace lines."""
         return type(self).__name__
 
 
@@ -119,11 +136,13 @@ class MotorLeaf(ExecNode):
 
     def enter(self):
         super().enter()
-        n = self.skill.robot.n_envs
-        self.skill.reset_idx(torch.arange(n, device=self.skill.robot.device))
+        self.skill.reset_idx(all_envs(self.skill.robot))
         self.ctx.log(f"enter {self.name}")
 
     def update(self, state, dt, extra_cmd: torch.Tensor | None = None):
+        # Command = card defaults/params [3] + everything layered above
+        # (extra_cmd [N, 3]), clamped to the card's constraints — the clamp is
+        # what makes layer authority bounded.
         if self.const_cmd is not None:
             cmd = self.const_cmd.unsqueeze(0)
             if extra_cmd is not None:
@@ -133,6 +152,7 @@ class MotorLeaf(ExecNode):
             self.skill.command[:] = cmd
         targets = self.skill.update(state, dt)
 
+        # Fail conditions and the failsafe take precedence over success.
         fail = _eval_conds(self.fail_conds, state, self.t_local)
         if fail is not None and bool(fail.any()):
             self.status = FAILURE
@@ -154,6 +174,10 @@ class LayerNode(ExecNode):
     'top @ base' — top is a CommandSkill whose output is accumulated into
     the base's command channel each control cycle. The base clamps the
     combined command to its card constraints, so no layer can exceed them.
+
+    Status: mirrors the base (its conditions/failsafe), plus SUCCESS when
+    the top skill's `success_flags` are all True (goal-directed layers such
+    as goto), plus FAILURE from the top card's `fail_when`.
     """
 
     def __init__(self, ctx, top_name, top_skill, top_card, top_fail_conds, base):
@@ -169,6 +193,7 @@ class LayerNode(ExecNode):
 
     @property
     def motor_leaf(self) -> MotorLeaf:
+        """The MotorLeaf at the bottom of this (possibly nested) layer stack."""
         node = self.base
         while isinstance(node, LayerNode):
             node = node.base
@@ -176,9 +201,7 @@ class LayerNode(ExecNode):
 
     def enter(self):
         super().enter()
-        n = self.top_skill.robot.n_envs
-        self.top_skill.reset_idx(
-            torch.arange(n, device=self.top_skill.robot.device))
+        self.top_skill.reset_idx(all_envs(self.top_skill.robot))
         self.base.enter()
         self.ctx.log(f"layer {self.top_name} active")
 
@@ -187,7 +210,7 @@ class LayerNode(ExecNode):
         if not self.top_skill.additive:
             # Override mode: cancel the motor leaf's constant command so the
             # effective command equals this skill's output (plus any layers
-            # stacked above this one).
+            # stacked above this one). The leaf adds const_cmd back, then clamps.
             delta = delta - self.motor_leaf.const_cmd.unsqueeze(0)
         total = delta if extra_cmd is None else delta + extra_cmd
         targets = self.base.update(state, dt, extra_cmd=total)
@@ -211,7 +234,12 @@ class LayerNode(ExecNode):
 # ---------------------------------------------------------------------------
 
 class SequenceNode(ExecNode):
-    """children run in order; advance on SUCCESS; any FAILURE fails the seq."""
+    """children run in order; advance on SUCCESS; any FAILURE fails the seq.
+
+    A child's SUCCESS is registered at the start of the NEXT tick: the tick
+    on which the child succeeds still returns that child's targets, and the
+    following tick enters + runs the next child (one extra update in tests).
+    """
 
     def __init__(self, ctx, children):
         super().__init__(ctx)
@@ -250,7 +278,11 @@ class SequenceNode(ExecNode):
 
 
 class FallbackNode(ExecNode):
-    """children tried in order; advance on FAILURE; first SUCCESS succeeds."""
+    """children tried in order; advance on FAILURE; first SUCCESS succeeds.
+
+    Like SequenceNode, a child's status is acted on at the start of the next
+    tick (a same-tick child failure is passed through as targets first).
+    """
 
     def __init__(self, ctx, children):
         super().__init__(ctx)
@@ -284,7 +316,13 @@ class FallbackNode(ExecNode):
 
 
 class ModifiedNode(ExecNode):
-    """.for(T) / .until(cond) / .repeat(n) wrapper."""
+    """.for(T) / .until(cond) / .repeat(n) wrapper.
+
+    Own criteria (.for elapsed on the node-local clock, .until all-envs true)
+    are checked first each tick and end the node with SUCCESS regardless of
+    the child. `.repeat(n)` re-enters the child after each child SUCCESS
+    until n runs complete. Child FAILURE always fails the node.
+    """
 
     def __init__(self, ctx, child, for_s=None, until=None, until_text="",
                  repeat=None):
@@ -352,6 +390,14 @@ class CompositeSkill:
     Skill-interface wrapper around a compiled program tree. Terminal states
     hold the default stance; the hosting Controller reads `.status` /
     `.finished` and the `.trace` log to decide what happens next.
+
+    Attributes:
+        instances: every skill object the program uses, keyed by name for
+            motor skills and `name#k` for per-'@' command skills.
+        source: canonical program text (`ast.to_text()`).
+
+    Duck-typed as a Skill (not a subclass) so it stays independent of the
+    control package's class hierarchy; it satisfies setup/reset_idx/update.
     """
 
     def __init__(self, root: ExecNode, ctx: ExecContext, instances: dict,
@@ -372,6 +418,8 @@ class CompositeSkill:
         self.ctx.bind(robot)
 
     def reset_idx(self, envs_idx):
+        # A program restarts as a whole: the tree is re-entered for all envs
+        # even if only a subset is reset (program counters are global).
         for skill in self.instances.values():
             skill.reset_idx(envs_idx)
         self.ctx.t = 0.0
@@ -380,6 +428,7 @@ class CompositeSkill:
         self.root.enter()
 
     def update(self, state, dt: float):
+        """Run one tick of the tree; hold the default pose once finished."""
         if self.root.status != RUNNING:
             return self.ctx.hold()
         targets = self.root.update(state, dt)
@@ -392,6 +441,7 @@ class CompositeSkill:
 
     @property
     def status(self) -> int:
+        """RUNNING | SUCCESS | FAILURE of the whole program."""
         return self.root.status
 
     @property
@@ -404,4 +454,5 @@ class CompositeSkill:
 
     @property
     def trace(self):
+        """Copy of the execution log (timestamped transition lines)."""
         return list(self.ctx.trace)

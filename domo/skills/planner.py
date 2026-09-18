@@ -33,9 +33,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import torch
-
-from domo.control import Controller, StandSkill
+from domo.control import Controller, StandSkill, all_envs
 
 from .grammar import GrammarError
 from .library import CompileError, SkillLibrary
@@ -53,8 +51,18 @@ class PlanOutcome:
 
 
 class PlanningController(Controller):
+    """Controller that compiles and runs programs returned by `plan()`.
+
+    Skills: the idle StandSkill (`IDLE`) plus, while one runs, the active
+    CompositeSkill under the name "program".
+
+    Args:
+        library: the SkillLibrary programs are compiled against.
+        decision_interval: control steps between `plan()` consultations.
+    """
 
     IDLE = "__idle__"
+    PROGRAM = "program"
 
     def __init__(self, library: SkillLibrary, decision_interval: int = 10):
         super().__init__({self.IDLE: StandSkill()}, initial=self.IDLE,
@@ -81,6 +89,7 @@ class PlanningController(Controller):
     # ------------------------------------------------------------------
 
     def decide(self, state) -> None:
+        """Close out a finished program, then ask `plan()` if nothing is running."""
         last = None
         if self.program is not None and self.program.finished:
             last = PlanOutcome(self.program.source, self.program.succeeded,
@@ -95,6 +104,7 @@ class PlanningController(Controller):
                 self._install(text)
 
     def _install(self, text: str) -> None:
+        """Compile `text` and make it the active skill; record compile errors."""
         try:
             program = self.library.compile(text, device=self.robot.device)
         except (CompileError, GrammarError) as e:
@@ -104,16 +114,19 @@ class PlanningController(Controller):
             print(f"  [planner] compile error: {e}")
             return
         program.setup(self.robot)
-        self.skills["program"] = program
-        program.reset_idx(torch.arange(self.robot.n_envs,
-                                       device=self.robot.device))
-        self.active = "program"
+        self.skills[self.PROGRAM] = program
+        # Installed directly rather than via activate(): the program must be
+        # reset even when it replaces a previous "program" entry of the same name.
+        program.reset_idx(all_envs(self.robot))
+        self.active = self.PROGRAM
         self.program = program
 
     @property
     def idle(self) -> bool:
+        """True while no program is running (holding the stand pose)."""
         return self.program is None
 
     @property
     def last_outcome(self) -> PlanOutcome | None:
+        """Most recent PlanOutcome (finished or failed-to-compile), if any."""
         return self.history[-1] if self.history else None

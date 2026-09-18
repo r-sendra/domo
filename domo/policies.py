@@ -11,6 +11,9 @@ copy it over the corresponding file in `policies/` (see policies/README.md).
     from domo.policies import stable_go2_library, load_stable_locomotion
     walk_fn, _ = load_stable_locomotion(device)
     library     = stable_go2_library(lidar, device)     # walk (+avoid if lidar)
+
+Heavy imports (torch, domo.rl, domo.skills) happen inside the loaders so
+that resolving a path with `stable_policy` stays free of them.
 """
 
 from __future__ import annotations
@@ -38,7 +41,14 @@ STABLE = {
 
 
 def stable_policy(name: str) -> str:
-    """Absolute path to a blessed checkpoint, by symbolic skill name."""
+    """
+    Absolute path to a blessed checkpoint, by symbolic skill name.
+
+    Raises:
+        KeyError: unknown name.
+        FileNotFoundError: the name is registered but the file has not been
+            copied into `policies/` (the .pt files are git-ignored).
+    """
     if name not in STABLE:
         raise KeyError(f"no stable policy '{name}' (have {sorted(STABLE)})")
     path = os.path.join(POLICY_DIR, STABLE[name])
@@ -50,13 +60,13 @@ def stable_policy(name: str) -> str:
 
 
 def load_stable_locomotion(device: str = "cpu"):
-    """(policy_fn, meta) for the stable CPG walk policy."""
+    """(policy_fn, net) for the stable CPG walk policy; see `load_locomotion_policy`."""
     from domo.checkpoints import load_locomotion_policy
     return load_locomotion_policy(stable_policy("walk"), device)
 
 
 def load_stable_avoid(device: str = "cpu"):
-    """Callable obs → Δv for the stable lidar-avoidance net."""
+    """Callable obs → Δv for the stable lidar-avoidance net (deterministic)."""
     from domo.checkpoints import load_checkpoint
     from domo.rl import ActorCritic, clean_state_dict
     ckpt = load_checkpoint(stable_policy("avoid"), device)
@@ -70,6 +80,11 @@ def stable_go2_library(lidar=None, device: str = "cpu", avoid_deltas=None):
     Build the Go2 skill library from the stable registry — walk always,
     avoid (+ blocked/clear conditions) when a `lidar` is provided. This is the
     'skills point straight at their blessed policies' convenience.
+
+    Args:
+        lidar: sensor with read() → [N, n_sectors] (e.g. `World.lidar`).
+        device: torch device string for the networks.
+        avoid_deltas: forwarded to `make_go2_library` when given.
     """
     from domo.skills import make_go2_library
     walk_fn, _ = load_stable_locomotion(device)

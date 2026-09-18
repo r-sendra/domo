@@ -19,9 +19,22 @@ Contrast path — `--open-loop` runs a hand-written timed PatrolController that
 sets velocity commands on a clock with NO pose feedback; its error integrates
 uncorrected, so the square smears. Compare the printed |dist from origin|.
 
-    python examples/basic_examples/skill_demo.py runs/go2_cpg/checkpoint_final.pt
-    python examples/basic_examples/skill_demo.py CKPT --open-loop
-    python examples/basic_examples/skill_demo.py CKPT --headless --steps 500
+Library pieces exercised: domo.sim (engine/scene), domo.robot (Go2),
+domo.checkpoints (policy loading), domo.skills (grammar + make_go2_library),
+domo.control (SimControlLoop, SingleSkillController, Controller, StandSkill,
+CPGLocomotionSkill). No frozen-script counterpart: this example is
+library-native.
+
+    # GPU (default device), Genesis viewer open
+    python examples/basic_examples/skill_demo.py policies/walk.pt
+    # CPU, no window, short run
+    python examples/basic_examples/skill_demo.py policies/walk.pt --headless --device cpu --steps 500
+    # the drifting open-loop contrast
+    python examples/basic_examples/skill_demo.py policies/walk.pt --open-loop
+
+Prints a progress line every 250 steps, the program's execution trace when
+the route completes, and the final position / distance from the origin.
+Saves nothing.
 """
 
 import argparse
@@ -44,6 +57,9 @@ from domo.skills import make_go2_library
 ROUTE = ("goto(x=2, y=0) @ walk >> goto(x=2, y=2) @ walk >> "
          "goto(x=0, y=2) @ walk >> goto(x=0, y=0) @ walk")
 PROGRAM = f"({ROUTE}) | stand.for(2)"     # fall back to a safe stand if walk fails
+
+CONTROL_DT = 0.02          # control step (s); matches the policy's training rate
+REPORT_EVERY = 250         # progress line cadence (control steps)
 
 
 class PatrolController(Controller):
@@ -76,8 +92,8 @@ class PatrolController(Controller):
             walk.command[:, 0], walk.command[:, 2] = 0.0, self.VYAW
 
 
-def main():
-    p = argparse.ArgumentParser()
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("checkpoint", type=str, help="CPG locomotion checkpoint")
     p.add_argument("--open-loop", action="store_true", default=False,
                    help="run the timed PatrolController (drifts) instead of "
@@ -85,52 +101,39 @@ def main():
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--headless", action="store_true", default=False)
     p.add_argument("--device", type=str, default="cuda")
-    args = p.parse_args()
-    device = pick_device(args.device)
-    dt = 0.02
+    return p.parse_args()
 
-    # --- world ------------------------------------------------------------
+
+def build_world(device: str, headless: bool, dt: float):
+    """Flat ground + one Go2, built and bound for a single env."""
     engine = create_engine("genesis", device=device)
     scene = engine.create_scene(SimConfig(
-        dt=dt, device=device, headless=args.headless, solver_iterations=100,
+        dt=dt, device=device, headless=headless, solver_iterations=100,
         viewer=ViewerConfig(camera_pos=(3.0, -3.0, 2.0))))
     scene.add_ground()
     robot = Robot(GO2, scene, engine.device, kp=100.0, kd=2.0,
                   base_init_pos=(0.0, 0.0, 0.35))
     scene.build(n_envs=1)
     robot.bind(n_envs=1)
+    return engine, scene, robot
 
-    # --- brain ------------------------------------------------------------
-    policy_fn, _ = load_locomotion_policy(args.checkpoint, str(engine.device))
-    if args.open_loop:
+
+def build_controller(policy_fn, device: str, open_loop: bool, dt: float):
+    """The brain: either the timed patrol or the compiled composition program."""
+    if open_loop:
         controller = PatrolController(walk=CPGLocomotionSkill(policy_fn),
                                       stand=StandSkill(), dt=dt)
-        label = "open-loop PatrolController"
-    else:
-        library = make_go2_library(policy_fn)
-        program = library.compile(PROGRAM, device=str(engine.device))
-        controller = SingleSkillController(program)
-        import pdb; pdb.set_trace()
-        label = f"composition: {program.source}"
-    controller.setup(robot)
+        return controller, "open-loop PatrolController"
+    library = make_go2_library(policy_fn)
+    program = library.compile(PROGRAM, device=device)
+    return SingleSkillController(program), f"composition: {program.source}"
 
-    # --- run --------------------------------------------------------------
-    loop = SimControlLoop(scene, robot, controller, dt=dt)
-    loop.reset()
-    print(f"Running {label}")
 
-    def report(step, state):
-        if (step + 1) % 250 == 0:
-            print(f"  step {step + 1:5d} | skill={controller.active:16s} | "
-                  f"pos=({state.base_pos[0, 0]:+.2f},{state.base_pos[0, 1]:+.2f}) "
-                  f"vx={state.base_lin_vel[0, 0]:+.2f}")
-
-    final = loop.run(args.steps, callback=report)
-
+def print_summary(controller, final, open_loop: bool) -> None:
     # If the composition finished (route complete), show its execution trace —
     # the log the LLM supervisor reads to see what happened.
     program = controller.skills.get(controller.active)
-    if not args.open_loop and getattr(program, "finished", False):
+    if not open_loop and getattr(program, "finished", False):
         print("Program trace:")
         for line in program.trace:
             print("   ", line)
@@ -139,6 +142,36 @@ def main():
                   + float(final.base_pos[0, 1]) ** 2) ** 0.5
     print(f"Done. final pos=({final.base_pos[0, 0]:+.2f},"
           f"{final.base_pos[0, 1]:+.2f})  |dist from origin|={origin_err:.2f} m")
+
+
+def main():
+    args = parse_args()
+    device = pick_device(args.device)
+
+    # --- world ------------------------------------------------------------
+    engine, scene, robot = build_world(device, args.headless, CONTROL_DT)
+
+    # --- brain ------------------------------------------------------------
+    policy_fn, _ = load_locomotion_policy(args.checkpoint, str(engine.device))
+    controller, label = build_controller(policy_fn, str(engine.device),
+                                         args.open_loop, CONTROL_DT)
+    controller.setup(robot)
+
+    # --- run --------------------------------------------------------------
+    loop = SimControlLoop(scene, robot, controller, dt=CONTROL_DT)
+    loop.reset()
+    print(f"Running {label}")
+
+    def report(step, state):
+        if (step + 1) % REPORT_EVERY == 0:
+            print(f"  step {step + 1:5d} | skill={controller.active:16s} | "
+                  f"pos=({state.base_pos[0, 0]:+.2f},{state.base_pos[0, 1]:+.2f}) "
+                  f"vx={state.base_lin_vel[0, 0]:+.2f}")
+
+    final = loop.run(args.steps, callback=report)
+
+    # --- report -----------------------------------------------------------
+    print_summary(controller, final, args.open_loop)
 
 
 if __name__ == "__main__":

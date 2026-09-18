@@ -5,6 +5,19 @@ This is the ONLY module in the library that imports `genesis`. Everything it
 returns to callers is either a torch tensor or one of the `domo.sim.base`
 handle types. Genesis conveniently shares DOMO's wxyz quaternion convention,
 so quaternions pass through unconverted.
+
+Genesis 1.0.0 quirks encoded here (keep in sync with the comments below):
+  * `gs.init` may only run once per process — guarded by `_ensure_gs_init`.
+  * `joint.dof_idx_local` is deprecated; `dofs_idx_local` returns a list
+    even for 1-DOF joints, so DOF lists are flattened.
+  * `VisOptions(n_rendered_envs=1)` is deprecated → `rendered_envs_idx=[0]`.
+  * The bundled go2 URDF merges fixed foot links (`FR_foot` etc. do not
+    exist as links) and triggers a benign "qpos0 exceeds joint limits"
+    warning. `Robot.bind` tolerates the missing links.
+  * `SphericalPattern(n_points=(n_h, n_v))` returns distances as
+    [N, n_h, n_v] (azimuth-major); the DOMO contract is [N, n_v, n_h].
+  * Per-DOF gains broadcast over envs; `set_pd_gains_scaled` therefore
+    applies one draw to a whole reset group.
 """
 
 from __future__ import annotations
@@ -24,13 +37,31 @@ from .base import (
     Scene,
     SimConfig,
     TerrainConfig,
+    lidar_ranges_to_grid,
 )
+
+__all__ = [
+    "GenesisArticulation",
+    "GenesisCamera",
+    "GenesisEngine",
+    "GenesisLidar",
+    "GenesisRigidObject",
+    "GenesisScene",
+]
+
+# Genesis link index of the articulation root (base) link — DR targets it.
+_BASE_LINK_IDX = 0
 
 _GS_INITIALIZED = False
 
 
 def _ensure_gs_init(device: str) -> torch.device:
-    """Initialise Genesis once per process; return the torch device to use."""
+    """
+    Initialise Genesis once per process; return the torch device to use.
+
+    Genesis raises if `gs.init` is called twice, and "cuda" silently falls
+    back to CPU when no GPU is available so the same config runs anywhere.
+    """
     global _GS_INITIALIZED
     use_cuda = device == "cuda" and torch.cuda.is_available()
     if not _GS_INITIALIZED:
@@ -44,11 +75,18 @@ def _ensure_gs_init(device: str) -> torch.device:
     return torch.device("cuda" if use_cuda else "cpu")
 
 
+def _default_viewer_fps(dt: float) -> int:
+    """Viewer cap when the config leaves it unset: half the control rate."""
+    return int(0.5 / dt)
+
+
 # ---------------------------------------------------------------------------
 # Handles
 # ---------------------------------------------------------------------------
 
 class GenesisRigidObject(RigidObject):
+    """Wraps a Genesis rigid entity (box/cylinder/sphere/mesh/URDF prop)."""
+
     def __init__(self, entity):
         self._entity = entity
 
@@ -57,6 +95,8 @@ class GenesisRigidObject(RigidObject):
 
 
 class GenesisArticulation(Articulation):
+    """Wraps a Genesis URDF entity; see `Articulation` for the contract."""
+
     def __init__(self, entity):
         self._entity = entity
 
@@ -67,13 +107,15 @@ class GenesisArticulation(Articulation):
 
     # -- structure --------------------------------------------------------
     def dof_indices(self, joint_names: Sequence[str]) -> Sequence[int]:
-        # dofs_idx_local returns a list per joint (1 element for hinges).
-        idx = []
+        # `dofs_idx_local` returns a list per joint (1 element for hinges);
+        # the deprecated scalar `dof_idx_local` must not be used.
+        idx: list[int] = []
         for name in joint_names:
             idx.extend(self._entity.get_joint(name).dofs_idx_local)
         return idx
 
     def link_indices(self, link_names: Sequence[str]) -> Sequence[int]:
+        # Raises gs.GenesisException for unknown links (e.g. merged foot links).
         return [self._entity.get_link(n).idx_local for n in link_names]
 
     # -- state queries -----------------------------------------------------
@@ -81,7 +123,7 @@ class GenesisArticulation(Articulation):
         return self._entity.get_pos()
 
     def get_base_quaternion(self) -> torch.Tensor:
-        return self._entity.get_quat()
+        return self._entity.get_quat()          # already wxyz
 
     def get_base_linear_velocity(self) -> torch.Tensor:
         return self._entity.get_vel()
@@ -100,6 +142,8 @@ class GenesisArticulation(Articulation):
 
     # -- domain randomization ----------------------------------------------
     def set_friction_ratio(self, ratio: torch.Tensor, envs_idx: torch.Tensor) -> None:
+        # Genesis wants a per-link ratio [n_envs, n_links]; broadcast the
+        # per-env scalar over every link.
         n_links = self._entity.n_links
         self._entity.set_friction_ratio(
             ratio.unsqueeze(1).expand(-1, n_links),
@@ -107,12 +151,12 @@ class GenesisArticulation(Articulation):
 
     def set_base_mass_shift(self, shift_kg: torch.Tensor, envs_idx: torch.Tensor) -> None:
         self._entity.set_mass_shift(
-            shift_kg.unsqueeze(1), links_idx_local=[0], envs_idx=envs_idx)
+            shift_kg.unsqueeze(1), links_idx_local=[_BASE_LINK_IDX], envs_idx=envs_idx)
 
     def set_base_com_shift(self, shift_m: torch.Tensor, envs_idx: torch.Tensor) -> None:
         # Genesis expects [n_envs, n_links, 3]; apply to the base link only.
         self._entity.set_COM_shift(
-            shift_m.unsqueeze(1), links_idx_local=[0], envs_idx=envs_idx)
+            shift_m.unsqueeze(1), links_idx_local=[_BASE_LINK_IDX], envs_idx=envs_idx)
 
     def set_pd_gains_scaled(self, kp: torch.Tensor, kd: torch.Tensor,
                             dof_idx: Sequence[int],
@@ -133,6 +177,8 @@ class GenesisArticulation(Articulation):
     # -- resets ------------------------------------------------------------
     def set_base_pose(self, pos: torch.Tensor, quat: torch.Tensor,
                       envs_idx: torch.Tensor) -> None:
+        # Velocities are zeroed separately by `zero_all_velocities` so that a
+        # pose write alone never hides a velocity reset (or the lack of one).
         self._entity.set_pos(pos, zero_velocity=False, envs_idx=envs_idx)
         self._entity.set_quat(quat, zero_velocity=False, envs_idx=envs_idx)
 
@@ -150,58 +196,36 @@ class GenesisArticulation(Articulation):
 
 
 class GenesisLidar(LidarSensorHandle):
+    """
+    Genesis raycast lidar. Genesis lays beams out azimuth-major
+    ([N, n_horizontal, n_vertical]); every reader below normalises to the
+    contract layout so consumers never see the engine's order.
+    """
+
     def __init__(self, sensor, cfg: LidarConfig, device: torch.device):
         self._sensor = sensor
         self.config = cfg
         self._device = device
 
-    def read_sector_distances(self) -> torch.Tensor:
-        """
-        Genesis returns distances shaped [N, n_vert, n_horiz] (or flattened,
-        depending on version/pattern); normalise to [N, n_horizontal] taking
-        the min over vertical rays per sector.
-        """
-        cfg = self.config
-        raw = self._sensor.read().distances
-        if raw.dim() == 3:
-            n_env, _, n_horiz = raw.shape
-            if n_horiz == cfg.n_horizontal:
-                sectors = raw.min(dim=1).values
-            else:
-                flat = raw.reshape(n_env, -1)
-                rays_per_sector = flat.shape[1] // cfg.n_horizontal
-                n_used = rays_per_sector * cfg.n_horizontal
-                sectors = flat[:, :n_used].view(
-                    n_env, cfg.n_horizontal, rays_per_sector).min(dim=2).values
-        else:
-            flat = raw.reshape(raw.shape[0], -1)
-            rays_per_sector = max(flat.shape[1] // cfg.n_horizontal, 1)
-            n_used = rays_per_sector * cfg.n_horizontal
-            sectors = flat[:, :n_used].view(
-                flat.shape[0], cfg.n_horizontal, rays_per_sector).min(dim=2).values
-        return torch.clamp(sectors, 0.0, cfg.max_range)
-
     def read_ranges(self) -> torch.Tensor:
+        """[N, n_vertical, n_horizontal] ranges clamped to max_range."""
         cfg = self.config
         raw = self._sensor.read().distances
-        n_env = raw.shape[0]
-        if raw.dim() == 3 and raw.shape[1] == cfg.n_vertical \
-                and raw.shape[2] == cfg.n_horizontal:
-            ranges = raw
-        else:
-            flat = raw.reshape(n_env, -1)
-            expected = cfg.n_vertical * cfg.n_horizontal
-            if flat.shape[1] != expected:
-                raise RuntimeError(
-                    f"Lidar returned {flat.shape[1]} rays/env, expected "
-                    f"{cfg.n_vertical}x{cfg.n_horizontal}={expected}")
-            ranges = flat.view(n_env, cfg.n_vertical, cfg.n_horizontal)
-        return torch.clamp(ranges, 0.0, cfg.max_range)
+        grid = lidar_ranges_to_grid(raw, cfg.n_vertical, cfg.n_horizontal,
+                                    azimuth_major=True)
+        return torch.clamp(grid, 0.0, cfg.max_range)
+
+    def read_sector_distances(self) -> torch.Tensor:
+        """[N, n_horizontal]: min over the vertical channels of each azimuth."""
+        return self.read_ranges().min(dim=1).values
 
     def read_points(self):
-        """World-frame hit points [N, n_beams, 3] + ranges [N, n_beams].
-        Genesis returns the sensor in world frame (return_world_frame=True);
-        beam (horizontal/vertical) layout is irrelevant once flattened."""
+        """
+        World-frame hit points [N, n_beams, 3] + ranges [N, n_beams].
+        Genesis returns the points in world frame (return_world_frame=True);
+        both tensors are flattened in Genesis' native azimuth-major order and
+        stay paired with each other.
+        """
         data = self._sensor.read()
         pts = data.points                              # [N, n_h, n_v, 3]
         rng = data.distances                           # [N, n_h, n_v]
@@ -218,9 +242,10 @@ class GenesisCamera(CameraHandle):
         self._cam = cam
 
     def render(self):
-        out = self._cam.render()             # (rgb, depth, seg, normal)
-        rgb = out[0] if isinstance(out, tuple) else out
-        return rgb
+        # Genesis returns (rgb, depth, seg, normal) when several outputs are
+        # enabled, or the bare rgb array otherwise.
+        out = self._cam.render()
+        return out[0] if isinstance(out, tuple) else out
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +253,8 @@ class GenesisCamera(CameraHandle):
 # ---------------------------------------------------------------------------
 
 class GenesisScene(Scene):
+    """`gs.Scene` wrapper exposing only the `Scene` contract."""
+
     def __init__(self, cfg: SimConfig, device: torch.device):
         self._cfg = cfg
         self._device = device
@@ -245,11 +272,12 @@ class GenesisScene(Scene):
         self._scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=cfg.dt, substeps=cfg.substeps),
             viewer_options=gs.options.ViewerOptions(
-                max_FPS=cfg.viewer.max_fps or int(0.5 / cfg.dt),
+                max_FPS=cfg.viewer.max_fps or _default_viewer_fps(cfg.dt),
                 camera_pos=cfg.viewer.camera_pos,
                 camera_lookat=cfg.viewer.camera_lookat,
                 camera_fov=cfg.viewer.camera_fov,
             ),
+            # `n_rendered_envs=1` is deprecated in Genesis 1.0; render env 0 only.
             vis_options=gs.options.VisOptions(rendered_envs_idx=[0]),
             rigid_options=gs.options.RigidOptions(**rigid_kwargs),
             show_viewer=not cfg.headless,
@@ -296,11 +324,14 @@ class GenesisScene(Scene):
         return GenesisArticulation(entity)
 
     def add_lidar(self, articulation: Articulation, cfg: LidarConfig) -> LidarSensorHandle:
-        assert isinstance(articulation, GenesisArticulation)
+        if not isinstance(articulation, GenesisArticulation):
+            raise TypeError(
+                f"GenesisScene.add_lidar needs a GenesisArticulation, "
+                f"got {type(articulation).__name__}")
         sensor = self._scene.add_sensor(gs.sensors.Lidar(
             pattern=gs.sensors.SphericalPattern(
                 fov=cfg.fov_deg,
-                n_points=(cfg.n_horizontal, cfg.n_vertical),
+                n_points=(cfg.n_horizontal, cfg.n_vertical),   # (azimuth, elevation)
             ),
             entity_idx=articulation.entity.idx,
             pos_offset=cfg.pos_offset,
@@ -328,6 +359,8 @@ class GenesisScene(Scene):
 # ---------------------------------------------------------------------------
 
 class GenesisEngine(PhysicsEngine):
+    """Genesis backend; created through `domo.sim.create_engine("genesis")`."""
+
     name = "genesis"
 
     def __init__(self, device: str = "cuda"):

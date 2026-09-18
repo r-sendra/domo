@@ -14,14 +14,26 @@ LangChain constructors are imported lazily so the core library needs no
 LLM dependencies.
 """
 
-from .client import (GeminiClient, LLMClient, ScriptedClient,
-                     extract_code_block, extract_json_block, make_llm)
+from .client import (
+    GeminiClient,
+    LLMClient,
+    ScriptedClient,
+    extract_code_block,
+    extract_json_block,
+    make_llm,
+)
 
 __all__ = [
-    "LLMClient", "GeminiClient", "ScriptedClient", "make_llm",
-    "extract_code_block", "extract_json_block",
-    "vllm_client", "openai_client", "gemini_langchain_client",
+    "GeminiClient",
+    "LLMClient",
     "LangChainClient",
+    "ScriptedClient",
+    "extract_code_block",
+    "extract_json_block",
+    "gemini_langchain_client",
+    "make_llm",
+    "openai_client",
+    "vllm_client",
 ]
 
 

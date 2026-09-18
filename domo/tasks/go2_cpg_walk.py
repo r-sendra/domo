@@ -29,22 +29,32 @@ CPG policy (see go2_avoid.py).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
 
 import torch
 
 # build_cpg_observation lives in domo.control.cpg (canonical home shared with
 # CPGLocomotionSkill); re-exported here for backward compatibility.
-from domo.control import (CPG_OBS_DIM, CPG_OBS_SCALES, CPGConfig,
-                          CPGLegController, LegKinematics,
-                          build_cpg_observation)
+from domo.control import (
+    CPG_OBS_DIM,
+    CPG_OBS_SCALES,
+    CPGConfig,
+    CPGLegController,
+    LegKinematics,
+    build_cpg_observation,
+)
 from domo.robot import GO2, Robot, RobotSpec
 from domo.sim import SimConfig, ViewerConfig, create_engine
 
 from .base import VecTask, rand_uniform
 
-__all__ = ["Go2CPGWalkConfig", "Go2CPGWalkTask", "build_cpg_observation",
-           "CPG_OBS_DIM", "CPG_ACT_DIM", "CPG_OBS_SCALES"]
+__all__ = [
+    "CPG_ACT_DIM",
+    "CPG_OBS_DIM",
+    "CPG_OBS_SCALES",
+    "Go2CPGWalkConfig",
+    "Go2CPGWalkTask",
+    "build_cpg_observation",
+]
 
 CPG_ACT_DIM = 12
 
@@ -62,14 +72,14 @@ class Go2CPGWalkConfig:
     # Control (paper gains)
     kp: float = 100.0
     kd: float = 2.0
-    base_init_pos: Tuple[float, float, float] = (0.0, 0.0, 0.35)
+    base_init_pos: tuple[float, float, float] = (0.0, 0.0, 0.35)
     cpg: CPGConfig = field(default_factory=CPGConfig)
 
     # Commands
     resampling_time_s: float = 4.0
-    lin_vel_x_range: Tuple[float, float] = (0.3, 3.0)
-    lin_vel_y_range: Tuple[float, float] = (-0.5, 0.5)
-    ang_vel_range: Tuple[float, float] = (-1.0, 1.0)
+    lin_vel_x_range: tuple[float, float] = (0.3, 3.0)
+    lin_vel_y_range: tuple[float, float] = (-0.5, 0.5)
+    ang_vel_range: tuple[float, float] = (-1.0, 1.0)
 
     # Termination
     termination_pitch: float = 1.0
@@ -79,7 +89,7 @@ class Go2CPGWalkConfig:
     # Rewards (paper weights, signed)
     tracking_sigma: float = 0.5
     reward_clamp: float = 10.0
-    reward_scales: Dict[str, float] = field(default_factory=lambda: {
+    reward_scales: dict[str, float] = field(default_factory=lambda: {
         "tracking_lin_vel_x": 0.75,
         "tracking_lin_vel_y": 0.75,
         "tracking_ang_vel": 0.75,
@@ -123,7 +133,7 @@ class Go2CPGWalkTask(VecTask):
         ik_err = self.kinematics.self_test(self.robot.default_dof_pos)
         contact_mode = "force" if self.robot.contact_sensor else "phase-proxy"
         print(f"\n{'=' * 58}")
-        print(f"  Go2 CPG-RL task")
+        print("  Go2 CPG-RL task")
         print(f"{'=' * 58}")
         print(f"  Envs          : {cfg.n_envs}")
         print(f"  Obs / Act     : {self.OBS_DIM} / {self.ACT_DIM}")

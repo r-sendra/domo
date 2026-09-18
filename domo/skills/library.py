@@ -22,7 +22,7 @@ readable error, never on the robot.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
 
 import torch
 
@@ -31,10 +31,17 @@ from domo.control.skill import CommandSkill
 from . import grammar
 from .card import MOTOR, SkillCard
 from .conditions import ConditionRegistry, standard_conditions
-from .nodes import (CompositeSkill, ExecContext, FallbackNode, LayerNode,
-                    ModifiedNode, MotorLeaf, SequenceNode)
+from .nodes import (
+    CompositeSkill,
+    ExecContext,
+    FallbackNode,
+    LayerNode,
+    ModifiedNode,
+    MotorLeaf,
+    SequenceNode,
+)
 
-__all__ = ["SkillLibrary", "CompileError"]
+__all__ = ["CompileError", "SkillLibrary"]
 
 # Canonical parameter order of the velocity command channel.
 VELOCITY_PARAMS = ("vx", "vy", "vyaw")
@@ -46,9 +53,9 @@ class CompileError(ValueError):
 
 class SkillLibrary:
 
-    def __init__(self, conditions: Optional[ConditionRegistry] = None):
-        self._cards: Dict[str, SkillCard] = {}
-        self._factories: Dict[str, Callable[[], object]] = {}
+    def __init__(self, conditions: ConditionRegistry | None = None):
+        self._cards: dict[str, SkillCard] = {}
+        self._factories: dict[str, Callable[[], object]] = {}
         self.conditions = conditions or standard_conditions()
 
     # ------------------------------------------------------------------
@@ -69,7 +76,7 @@ class SkillLibrary:
                 f"unknown skill '{name}' (library has: {sorted(self._cards)})")
         return self._cards[name]
 
-    def names(self) -> List[str]:
+    def names(self) -> list[str]:
         return sorted(self._cards)
 
     # ------------------------------------------------------------------
@@ -98,7 +105,7 @@ class SkillLibrary:
     def compile(self, program_text: str, device="cpu") -> CompositeSkill:
         ast = grammar.parse(program_text)
         ctx = ExecContext()
-        instances: Dict[str, object] = {}
+        instances: dict[str, object] = {}
         device = torch.device(device)
 
         def instance(name):

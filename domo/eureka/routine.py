@@ -19,17 +19,20 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import asdict
-from typing import List, Optional
 
 from domo.llm.client import LLMClient, make_llm
 
 from . import prompts
 from .rewards import extract_reward_code, validate_reward_code
-from .spec import (TASK_REGISTRY, CandidateResult, IterationResult,
-                   LearnedSkill, SkillLearningRequest)
+from .spec import (
+    TASK_REGISTRY,
+    CandidateResult,
+    IterationResult,
+    LearnedSkill,
+    SkillLearningRequest,
+)
 
-__all__ = ["learn_skill", "run_worker", "make_client"]
+__all__ = ["learn_skill", "make_client", "run_worker"]
 
 
 def make_client(request: SkillLearningRequest) -> LLMClient:
@@ -61,7 +64,7 @@ def run_worker(spec: dict, timeout_s: float) -> dict:
 # ---------------------------------------------------------------------------
 
 def _sample_candidates(llm: LLMClient, prompt: str, k: int,
-                       temperature: float, out_dir: str) -> List[CandidateResult]:
+                       temperature: float, out_dir: str) -> list[CandidateResult]:
     candidates = []
     for i in range(k):
         response = llm.generate(prompt, temperature=temperature)
@@ -156,7 +159,7 @@ def run_iteration(request: SkillLearningRequest, task_spec, llm,
     return IterationResult(index=it_index, candidates=candidates)
 
 
-def select_global_best(history: List[IterationResult]) -> Optional[CandidateResult]:
+def select_global_best(history: list[IterationResult]) -> CandidateResult | None:
     best = None
     for it in history:
         b = it.best
@@ -182,7 +185,7 @@ def finalize_skill(request: SkillLearningRequest, skill: LearnedSkill) -> Learne
 # ---------------------------------------------------------------------------
 
 def learn_skill(request: SkillLearningRequest,
-                llm: Optional[LLMClient] = None) -> LearnedSkill:
+                llm: LLMClient | None = None) -> LearnedSkill:
     if request.task not in TASK_REGISTRY:
         raise ValueError(f"unknown task '{request.task}' "
                          f"(registry: {sorted(TASK_REGISTRY)})")
@@ -210,7 +213,7 @@ def _learn_skill_imperative(request: SkillLearningRequest,
     print(f"\n{'=' * 60}\n  EUREKA — learning '{request.skill_name}' "
           f"({cfg.iterations} iters × {cfg.samples} candidates)\n{'=' * 60}")
 
-    history: List[IterationResult] = []
+    history: list[IterationResult] = []
     reflection = ""
     for it in range(cfg.iterations):
         iteration = run_iteration(request, task_spec, llm, reflection,

@@ -12,8 +12,6 @@ Lifecycle (mirrors engine build semantics):
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 from domo.sim.base import Scene
@@ -28,9 +26,9 @@ __all__ = ["Robot"]
 
 class Robot:
     def __init__(self, spec: RobotSpec, scene: Scene, device: torch.device,
-                 kp: Optional[float] = None, kd: Optional[float] = None,
-                 base_init_pos: Optional[tuple] = None,
-                 base_init_quat: Optional[tuple] = None):
+                 kp: float | None = None, kd: float | None = None,
+                 base_init_pos: tuple | None = None,
+                 base_init_quat: tuple | None = None):
         self.spec = spec
         self.device = device
         self._kp = kp if kp is not None else spec.kp
@@ -49,8 +47,8 @@ class Robot:
         self.n_envs = 0
         self.dof_idx = None
         self.default_dof_pos = None
-        self.state: Optional[RobotState] = None
-        self.actuator: Optional[PDJointPositionActuator] = None
+        self.state: RobotState | None = None
+        self.actuator: PDJointPositionActuator | None = None
         self._state_sensors = []
 
     # ------------------------------------------------------------------
@@ -102,7 +100,7 @@ class Robot:
     # ------------------------------------------------------------------
 
     def reset_idx(self, envs_idx: torch.Tensor,
-                  base_pos: Optional[torch.Tensor] = None) -> None:
+                  base_pos: torch.Tensor | None = None) -> None:
         """
         Reset selected envs to the default configuration.
         base_pos: optional [len(envs_idx), 3] spawn positions (e.g. terrain

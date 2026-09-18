@@ -98,7 +98,7 @@ def save_point_cloud(cloud, path, title="SLAM point cloud"):
         print("  [viz] empty point cloud — nothing to plot")
         return
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D                 # noqa: F401 (register 3d)
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (register 3d)
     c = cloud.cpu().numpy()
     fig = plt.figure(figsize=(10, 7))
     ax = fig.add_subplot(111, projection="3d")
@@ -232,8 +232,8 @@ class SlamRecorder:
         if not self.frames:
             print("  [viz] no frames captured — animation skipped")
             return
-        import numpy as np
         import matplotlib.pyplot as plt
+        import numpy as np
         from matplotlib.animation import FuncAnimation, PillowWriter
 
         allpts = np.concatenate([f[0] for f in self.frames], axis=0)

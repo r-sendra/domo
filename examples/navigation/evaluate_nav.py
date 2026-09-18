@@ -21,7 +21,6 @@ from domo.checkpoints import load_locomotion_policy, pick_device
 from domo.control import NavConfig, PositionController
 from domo.tasks import Go2CPGWalkConfig, Go2CPGWalkTask
 
-
 # ==========================================================================
 #  Stdin intervention (non-blocking, no background thread)
 # ==========================================================================

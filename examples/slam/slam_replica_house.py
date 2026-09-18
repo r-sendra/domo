@@ -26,17 +26,16 @@ import random
 import time
 
 import torch
+from slam_viz import SlamLiveView, SlamRecorder, go2_robot_manifest, save_point_cloud, slam_snapshot
 
-from domo.checkpoints import (load_checkpoint, load_locomotion_policy,
-                              pick_device)
+from domo.checkpoints import load_checkpoint, load_locomotion_policy, pick_device
 from domo.control import SlamConfig, SlamSkill
 from domo.policies import stable_policy
 from domo.rl import ActorCritic, clean_state_dict
 from domo.robot.lidar_models import hesai_xt16
 from domo.skills import PlanningController, make_go2_library
 from domo.world import World, WorldConfig
-from slam_viz import (SlamLiveView, SlamRecorder, go2_robot_manifest,
-                      save_point_cloud, slam_snapshot)
+
 # NOTE: domo.dashboard (all web server/client code) is imported lazily, only
 # when --dashboard/--dashboard-url is set — no web code loads otherwise.
 

@@ -10,20 +10,42 @@ from .cpg import (
 from .kinematics import LegKinematics, leg_fk, leg_ik
 from .loop import RealControlLoop, SimControlLoop
 from .navigation import NavConfig, PositionController
-from .skill import (CommandSkill, CPGLocomotionSkill, LearnedJointSkill,
-                    LidarAvoidanceSkill, NavGains, Skill, StandSkill,
-                    TrajectoryTrackingSkill)
+from .skill import (
+    CommandSkill,
+    CPGLocomotionSkill,
+    LearnedJointSkill,
+    LidarAvoidanceSkill,
+    NavGains,
+    Skill,
+    StandSkill,
+    TrajectoryTrackingSkill,
+)
 from .slam import SlamConfig, SlamSkill
 
 __all__ = [
-    "CPGConfig", "CPGLegController", "CPGOscillators",
-    "CPG_OBS_DIM", "CPG_OBS_SCALES", "build_cpg_observation",
-    "LegKinematics", "leg_fk", "leg_ik",
-    "NavConfig", "PositionController",
-    "Skill", "StandSkill", "CPGLocomotionSkill", "LearnedJointSkill",
-    "CommandSkill", "LidarAvoidanceSkill",
-    "NavGains", "TrajectoryTrackingSkill",
-    "SlamConfig", "SlamSkill",
-    "Controller", "SingleSkillController",
-    "SimControlLoop", "RealControlLoop",
+    "CPG_OBS_DIM",
+    "CPG_OBS_SCALES",
+    "CPGConfig",
+    "CPGLegController",
+    "CPGLocomotionSkill",
+    "CPGOscillators",
+    "CommandSkill",
+    "Controller",
+    "LearnedJointSkill",
+    "LegKinematics",
+    "LidarAvoidanceSkill",
+    "NavConfig",
+    "NavGains",
+    "PositionController",
+    "RealControlLoop",
+    "SimControlLoop",
+    "SingleSkillController",
+    "Skill",
+    "SlamConfig",
+    "SlamSkill",
+    "StandSkill",
+    "TrajectoryTrackingSkill",
+    "build_cpg_observation",
+    "leg_fk",
+    "leg_ik",
 ]

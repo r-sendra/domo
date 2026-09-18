@@ -9,11 +9,10 @@ so quaternions pass through unconverted.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
-
-import torch
+from collections.abc import Sequence
 
 import genesis as gs
+import torch
 
 from .base import (
     Articulation,
@@ -53,7 +52,7 @@ class GenesisRigidObject(RigidObject):
     def __init__(self, entity):
         self._entity = entity
 
-    def set_position(self, pos: torch.Tensor, envs_idx: Optional[torch.Tensor] = None) -> None:
+    def set_position(self, pos: torch.Tensor, envs_idx: torch.Tensor | None = None) -> None:
         self._entity.set_pos(pos, envs_idx=envs_idx)
 
 

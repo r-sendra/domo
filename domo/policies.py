@@ -17,8 +17,14 @@ from __future__ import annotations
 
 import os
 
-__all__ = ["POLICY_DIR", "STABLE", "stable_policy", "load_stable_locomotion",
-           "load_stable_avoid", "stable_go2_library"]
+__all__ = [
+    "POLICY_DIR",
+    "STABLE",
+    "load_stable_avoid",
+    "load_stable_locomotion",
+    "stable_go2_library",
+    "stable_policy",
+]
 
 # <repo>/policies  (this file is <repo>/domo/policies.py)
 POLICY_DIR = os.path.join(

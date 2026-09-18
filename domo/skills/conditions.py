@@ -19,7 +19,7 @@ Standard registry (see also SkillLibrary.register_condition):
 
 from __future__ import annotations
 
-from typing import Callable, Dict
+from collections.abc import Callable
 
 import torch
 
@@ -30,7 +30,7 @@ Condition = Callable[[object, float], torch.Tensor]   # (state, t_s) -> bool [N]
 
 class ConditionRegistry:
     def __init__(self):
-        self._factories: Dict[str, Callable[..., Condition]] = {}
+        self._factories: dict[str, Callable[..., Condition]] = {}
 
     def register(self, name: str, factory: Callable[..., Condition]) -> None:
         self._factories[name] = factory

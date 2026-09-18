@@ -29,8 +29,7 @@ noise) — the surface DrEureka optimises over.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from dataclasses import dataclass
 
 import torch
 
@@ -40,8 +39,13 @@ from domo.robot.state import RobotState
 
 from .base import VecTask, rand_uniform
 
-__all__ = ["Go2GetUpConfig", "Go2GetUpTask", "build_getup_observation",
-           "GETUP_OBS_DIM", "GETUP_ACT_DIM"]
+__all__ = [
+    "GETUP_ACT_DIM",
+    "GETUP_OBS_DIM",
+    "Go2GetUpConfig",
+    "Go2GetUpTask",
+    "build_getup_observation",
+]
 
 GETUP_OBS_DIM = 42
 GETUP_ACT_DIM = 12
@@ -80,7 +84,7 @@ class Go2GetUpConfig:
     # that are nearly impossible to bootstrap from scratch; a real curriculum
     # can widen this once a base policy exists.
     spawn_height: float = 0.18
-    spawn_roll_range: Tuple[float, float] = (math.pi / 3, 5 * math.pi / 6)  # 60°–150°
+    spawn_roll_range: tuple[float, float] = (math.pi / 3, 5 * math.pi / 6)  # 60°–150°
     spawn_joint_noise: float = 0.3        # rad, around default angles
 
     # Fixed success metric (reward-independent). Standing height is ~0.32 m,
@@ -93,7 +97,7 @@ class Go2GetUpConfig:
     success_hold_steps: int = 25          # 0.5 s upright (was 50 / 1 s)
 
     # Domain randomization (serialised as dict for checkpoints/specs)
-    dr: Optional[dict] = None
+    dr: dict | None = None
 
 
 class Go2GetUpTask(VecTask):
@@ -141,7 +145,7 @@ class Go2GetUpTask(VecTask):
         self.episode_outcomes: list = []
 
         print(f"\n{'=' * 58}")
-        print(f"  Go2 Get-Up task (reward-injection target)")
+        print("  Go2 Get-Up task (reward-injection target)")
         print(f"{'=' * 58}")
         print(f"  Envs     : {cfg.n_envs}")
         print(f"  Obs/Act  : {self.OBS_DIM} / {self.ACT_DIM}")

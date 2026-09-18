@@ -15,7 +15,6 @@ same config runs on any backend.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import Optional, Tuple
 
 import torch
 
@@ -29,11 +28,11 @@ def _u(lo, hi, n, device):
 @dataclass
 class DomainRandomization:
     # Physics (per env, resampled at reset)
-    friction_range: Optional[Tuple[float, float]] = None       # ratio, ~1.0
-    base_mass_range: Optional[Tuple[float, float]] = None      # added kg
-    com_shift_range: Optional[Tuple[float, float]] = None      # ±m, each xyz axis
-    kp_scale_range: Optional[Tuple[float, float]] = None       # × nominal kp
-    kd_scale_range: Optional[Tuple[float, float]] = None       # × nominal kd
+    friction_range: tuple[float, float] | None = None       # ratio, ~1.0
+    base_mass_range: tuple[float, float] | None = None      # added kg
+    com_shift_range: tuple[float, float] | None = None      # ±m, each xyz axis
+    kp_scale_range: tuple[float, float] | None = None       # × nominal kp
+    kd_scale_range: tuple[float, float] | None = None       # × nominal kd
 
     # Task-level (consumed by tasks that support them)
     obs_noise_std: float = 0.0
@@ -42,7 +41,7 @@ class DomainRandomization:
     _warned: set = field(default_factory=set, repr=False, compare=False)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "DomainRandomization":
+    def from_dict(cls, d: dict) -> DomainRandomization:
         known = {f.name for f in fields(cls) if not f.name.startswith("_")}
         clean = {}
         for k, v in d.items():

@@ -12,13 +12,27 @@ training always happens in worker subprocesses over simulation tasks.
 """
 
 from .routine import learn_skill, make_client, run_worker
-from .spec import (TASK_REGISTRY, CandidateResult, DrEurekaConfig,
-                   EurekaConfig, IterationResult, LearnedSkill,
-                   SkillLearningRequest, TaskSpec)
+from .spec import (
+                   TASK_REGISTRY,
+                   CandidateResult,
+                   DrEurekaConfig,
+                   EurekaConfig,
+                   IterationResult,
+                   LearnedSkill,
+                   SkillLearningRequest,
+                   TaskSpec,
+)
 
 __all__ = [
-    "learn_skill", "make_client", "run_worker",
-    "SkillLearningRequest", "EurekaConfig", "DrEurekaConfig",
-    "LearnedSkill", "CandidateResult", "IterationResult",
-    "TaskSpec", "TASK_REGISTRY",
+                   "TASK_REGISTRY",
+                   "CandidateResult",
+                   "DrEurekaConfig",
+                   "EurekaConfig",
+                   "IterationResult",
+                   "LearnedSkill",
+                   "SkillLearningRequest",
+                   "TaskSpec",
+                   "learn_skill",
+                   "make_client",
+                   "run_worker",
 ]

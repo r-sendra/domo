@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 
@@ -29,7 +28,7 @@ class SlamConfig:
     """Occupancy-grid + localisation parameters for SlamSkill."""
     resolution: float = 0.15             # metres per map cell
     half_extent: float = 8.0             # map spans origin ± this (m)
-    origin: Tuple[float, float] = (0.0, 0.0)   # world centre of the grid
+    origin: tuple[float, float] = (0.0, 0.0)   # world centre of the grid
     update_interval: int = 5             # control ticks between scan integrations
     l_occ: float = 0.85                  # log-odds added to a hit cell
     l_free: float = -0.4                 # log-odds added to a free (ray) cell
@@ -45,7 +44,7 @@ class SlamConfig:
     # instead of pooled 2D sectors. Maps a robot-height slice into the grid and
     # accumulates the full 3D cloud for visualisation.
     use_points: bool = True              # use read_points() when available
-    z_band: Tuple[float, float] = (0.15, 1.5)  # height slice → 2D occupancy (m)
+    z_band: tuple[float, float] = (0.15, 1.5)  # height slice → 2D occupancy (m)
     map_max_range: float = 10.0          # cap mapping range (device range >> map)
     cloud_max_points: int = 150000       # safety cap on the accumulated cloud
     cloud_stride: int = 2                # keep 1/stride of each scan before dedup
@@ -84,7 +83,7 @@ class SlamSkill(CommandSkill):
     channel = "velocity"
     additive = True                 # contributes zero, so it only observes
 
-    def __init__(self, lidar, cfg: Optional[SlamConfig] = None):
+    def __init__(self, lidar, cfg: SlamConfig | None = None):
         """lidar: sensor with read() → [N, n_sectors] and n_sectors/max_range."""
         self.lidar = lidar
         self.cfg = cfg or SlamConfig()
@@ -294,7 +293,7 @@ class SlamSkill(CommandSkill):
         known = self.grid.abs() > 0.5
         return known.float().mean(dim=(1, 2))
 
-    def render_ascii(self, env: int = 0, step: Optional[int] = None) -> str:
+    def render_ascii(self, env: int = 0, step: int | None = None) -> str:
         """
         Coarse top-down view: '#' occupied, '.' free, ' ' unknown. Downsamples
         by MAX-pooling log-odds over each block (not point-sampling), so a

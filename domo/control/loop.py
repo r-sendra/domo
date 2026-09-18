@@ -20,11 +20,11 @@ reaching the actuators.
 from __future__ import annotations
 
 import time
-from typing import Callable, Optional, Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 
-__all__ = ["SimControlLoop", "RealControlLoop"]
+__all__ = ["RealControlLoop", "SimControlLoop"]
 
 CommandFilter = Callable[[torch.Tensor, object], torch.Tensor]
 
@@ -33,7 +33,7 @@ class _ControlLoopBase:
 
     def __init__(self, robot, controller, dt: float,
                  sensors: Sequence = (),
-                 command_filter: Optional[CommandFilter] = None):
+                 command_filter: CommandFilter | None = None):
         """
         Base class for control loops.
 
@@ -86,7 +86,7 @@ class _ControlLoopBase:
                 sensor.tick()
         return self.robot.state
 
-    def run(self, n_steps: int, callback: Optional[Callable] = None):
+    def run(self, n_steps: int, callback: Callable | None = None):
         """
         Run a fixed number of control cycles.
 
@@ -108,7 +108,7 @@ class SimControlLoop(_ControlLoopBase):
 
     def __init__(self, scene, robot, controller, dt: float,
                  sensors: Sequence = (),
-                 command_filter: Optional[CommandFilter] = None):
+                 command_filter: CommandFilter | None = None):
         """
         Initialises the simulation control loop.
 

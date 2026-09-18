@@ -18,8 +18,8 @@ adjust speed; pass None to run uninterrupted.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -27,7 +27,7 @@ import torch
 __all__ = ["NavConfig", "PositionController"]
 
 StepFn = Callable[[torch.Tensor], None]
-PoseFn = Callable[[], Tuple[float, float, float]]
+PoseFn = Callable[[], tuple[float, float, float]]
 
 
 @dataclass
@@ -76,7 +76,7 @@ class PositionController:
     # High-level commands — return 'done' | 'aborted' | 'stopped' | 'timeout'
     # ------------------------------------------------------------------
 
-    def go_forward(self, distance: float, speed: Optional[float] = None) -> str:
+    def go_forward(self, distance: float, speed: float | None = None) -> str:
         x, y, yaw = self.pose_fn()
         tx = x + distance * math.cos(yaw)
         ty = y + distance * math.sin(yaw)
@@ -85,7 +85,7 @@ class PositionController:
                   f"target=({tx:.2f},{ty:.2f})")
         return self._drive_to(tx, ty, override_vx=spd)
 
-    def go_backward(self, distance: float, speed: Optional[float] = None) -> str:
+    def go_backward(self, distance: float, speed: float | None = None) -> str:
         x, y, yaw = self.pose_fn()
         tx = x - distance * math.cos(yaw)
         ty = y - distance * math.sin(yaw)
@@ -100,8 +100,8 @@ class PositionController:
         self._say(f"→ turn({angle_deg:+.1f}°) target={math.degrees(target_yaw):.1f}°")
         return self._rotate_to(target_yaw)
 
-    def go_to(self, x: float, y: float, speed: Optional[float] = None,
-              final_yaw_deg: Optional[float] = None) -> str:
+    def go_to(self, x: float, y: float, speed: float | None = None,
+              final_yaw_deg: float | None = None) -> str:
         self._say(f"→ go_to({x:.2f},{y:.2f})")
         result = self._drive_to(x, y, override_vx=speed)
         if result == "done" and final_yaw_deg is not None:
@@ -119,7 +119,7 @@ class PositionController:
     # ------------------------------------------------------------------
 
     def _drive_to(self, tx: float, ty: float, reverse: bool = False,
-                  override_vx: Optional[float] = None) -> str:
+                  override_vx: float | None = None) -> str:
         cfg = self.cfg
         max_steps = int(cfg.drive_timeout_s / cfg.dt)
         vx_limit = override_vx or cfg.max_vx
@@ -180,7 +180,7 @@ class PositionController:
             self._step()
         return "timeout"
 
-    def _check_intervention(self) -> Optional[str]:
+    def _check_intervention(self) -> str | None:
         if self.ctrl.stopped:
             self.stop()
             return "stopped"

@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
 
 import torch
 
 from domo.sim.base import Scene
 
-__all__ = ["ObstacleArenaConfig", "ObstacleArena"]
+__all__ = ["ObstacleArena", "ObstacleArenaConfig"]
 
 
 def _rand(lo, hi, shape, device):
@@ -43,21 +42,21 @@ class ObstacleArenaConfig:
     chair_leg_radius: float = 0.03
     chair_leg_height: float = 0.45
     chair_leg_spread: float = 0.25
-    sofa_width_range: Tuple[float, float] = (0.8, 1.6)
-    sofa_depth_range: Tuple[float, float] = (0.3, 0.5)
-    sofa_height_range: Tuple[float, float] = (0.35, 0.50)
-    pillar_radius_range: Tuple[float, float] = (0.04, 0.10)
-    pillar_height_range: Tuple[float, float] = (0.60, 1.20)
-    step_size_range: Tuple[float, float] = (0.20, 0.50)
-    step_height_range: Tuple[float, float] = (0.04, 0.15)
-    ball_radius_range: Tuple[float, float] = (0.06, 0.16)
+    sofa_width_range: tuple[float, float] = (0.8, 1.6)
+    sofa_depth_range: tuple[float, float] = (0.3, 0.5)
+    sofa_height_range: tuple[float, float] = (0.35, 0.50)
+    pillar_radius_range: tuple[float, float] = (0.04, 0.10)
+    pillar_height_range: tuple[float, float] = (0.60, 1.20)
+    step_size_range: tuple[float, float] = (0.20, 0.50)
+    step_height_range: tuple[float, float] = (0.04, 0.15)
+    ball_radius_range: tuple[float, float] = (0.06, 0.16)
 
 
 class ObstacleArena:
     """Builds walls + obstacle entities; randomises obstacle poses per env."""
 
     def __init__(self, scene: Scene, cfg: ObstacleArenaConfig,
-                 spawn_xy: Tuple[float, float] = (0.0, 0.0)):
+                 spawn_xy: tuple[float, float] = (0.0, 0.0)):
         self.cfg = cfg
         self.spawn_xy = spawn_xy
         self.termination_distance = cfg.half_size + 0.5

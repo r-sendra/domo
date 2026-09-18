@@ -19,13 +19,22 @@ execution log the LLM supervisor reads to diagnose what happened (M4/M5).
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 import torch
 
-__all__ = ["RUNNING", "SUCCESS", "FAILURE", "STATUS_NAMES",
-           "ExecContext", "ExecNode", "MotorLeaf", "LayerNode",
-           "SequenceNode", "FallbackNode", "ModifiedNode", "CompositeSkill"]
+__all__ = [
+    "FAILURE",
+    "RUNNING",
+    "STATUS_NAMES",
+    "SUCCESS",
+    "CompositeSkill",
+    "ExecContext",
+    "ExecNode",
+    "FallbackNode",
+    "LayerNode",
+    "ModifiedNode",
+    "MotorLeaf",
+    "SequenceNode",
+]
 
 RUNNING, SUCCESS, FAILURE = 0, 1, 2
 STATUS_NAMES = {RUNNING: "RUNNING", SUCCESS: "SUCCESS", FAILURE: "FAILURE"}
@@ -36,7 +45,7 @@ class ExecContext:
 
     def __init__(self):
         self.t = 0.0
-        self.trace: List[str] = []
+        self.trace: list[str] = []
         self._hold = None
 
     def bind(self, robot):
@@ -93,8 +102,8 @@ class MotorLeaf(ExecNode):
     card's success/fail conditions.
     """
 
-    def __init__(self, ctx, name, skill, card, const_cmd: Optional[torch.Tensor],
-                 cmd_lo: Optional[torch.Tensor], cmd_hi: Optional[torch.Tensor],
+    def __init__(self, ctx, name, skill, card, const_cmd: torch.Tensor | None,
+                 cmd_lo: torch.Tensor | None, cmd_hi: torch.Tensor | None,
                  success_conds, fail_conds):
         super().__init__(ctx)
         self.name = name
@@ -114,7 +123,7 @@ class MotorLeaf(ExecNode):
         self.skill.reset_idx(torch.arange(n, device=self.skill.robot.device))
         self.ctx.log(f"enter {self.name}")
 
-    def update(self, state, dt, extra_cmd: Optional[torch.Tensor] = None):
+    def update(self, state, dt, extra_cmd: torch.Tensor | None = None):
         if self.const_cmd is not None:
             cmd = self.const_cmd.unsqueeze(0)
             if extra_cmd is not None:
@@ -159,7 +168,7 @@ class LayerNode(ExecNode):
         return f"{self.top_name} @ {self.base.label()}"
 
     @property
-    def motor_leaf(self) -> "MotorLeaf":
+    def motor_leaf(self) -> MotorLeaf:
         node = self.base
         while isinstance(node, LayerNode):
             node = node.base
@@ -173,7 +182,7 @@ class LayerNode(ExecNode):
         self.base.enter()
         self.ctx.log(f"layer {self.top_name} active")
 
-    def update(self, state, dt, extra_cmd: Optional[torch.Tensor] = None):
+    def update(self, state, dt, extra_cmd: torch.Tensor | None = None):
         delta = self.top_skill.update_command(state, dt)
         if not self.top_skill.additive:
             # Override mode: cancel the motor leaf's constant command so the

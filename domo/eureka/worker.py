@@ -85,7 +85,6 @@ def _evaluate_success(task, net, episodes: int) -> dict:
 
 
 def _run_train(spec) -> dict:
-    from dataclasses import asdict
 
     from domo.rl import PPOConfig, PPOTrainer
 

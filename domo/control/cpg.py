@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
 
 import torch
 
@@ -24,8 +23,14 @@ from domo.robot.state import RobotState
 
 from .kinematics import LegKinematics
 
-__all__ = ["CPGConfig", "CPGOscillators", "CPGLegController",
-           "CPG_OBS_DIM", "CPG_OBS_SCALES", "build_cpg_observation"]
+__all__ = [
+    "CPG_OBS_DIM",
+    "CPG_OBS_SCALES",
+    "CPGConfig",
+    "CPGLegController",
+    "CPGOscillators",
+    "build_cpg_observation",
+]
 
 # The canonical observation interface of every CPG locomotion policy
 # checkpoint (76 dims). Anything that drives such a policy — the training
@@ -40,7 +45,7 @@ def build_cpg_observation(state: RobotState, commands: torch.Tensor,
                           default_dof_pos: torch.Tensor,
                           last_actions: torch.Tensor,
                           foot_contacts: torch.Tensor,
-                          oscillators: "CPGOscillators") -> torch.Tensor:
+                          oscillators: CPGOscillators) -> torch.Tensor:
     """The 76-dim observation every CPG locomotion checkpoint expects."""
     s = CPG_OBS_SCALES
     return torch.cat([
@@ -73,8 +78,8 @@ class CPGConfig:
     integration_dt: float = 0.001    # internal step [s] (1 kHz, as the paper)
     coupling_weight: float = 2.0     # Kuramoto coupling toward trot (0 = free)
     # Action ranges: policy tanh outputs map into these
-    mu_range: Tuple[float, float] = (1.0, 2.0)
-    omega_range_hz: Tuple[float, float] = (1.5, 3.5)
+    mu_range: tuple[float, float] = (1.0, 2.0)
+    omega_range_hz: tuple[float, float] = (1.5, 3.5)
     psi_max: float = 1.5             # [rad/s]
     # Foot-trajectory shaping
     d_step: float = 0.2              # max step length scale [m]

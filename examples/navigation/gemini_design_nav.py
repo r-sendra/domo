@@ -34,8 +34,7 @@ goto-only strategy are reliable.)
 import argparse
 import math
 
-from domo.checkpoints import (load_checkpoint, load_locomotion_policy,
-                              pick_device)
+from domo.checkpoints import load_checkpoint, load_locomotion_policy, pick_device
 from domo.control import SimControlLoop, SingleSkillController
 from domo.llm import extract_code_block, make_llm
 from domo.rl import ActorCritic, clean_state_dict

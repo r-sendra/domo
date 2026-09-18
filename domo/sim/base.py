@@ -17,21 +17,21 @@ Conventions (identical everywhere in DOMO):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Tuple
 
 import torch
 
 __all__ = [
-    "SimConfig",
-    "ViewerConfig",
-    "TerrainConfig",
-    "LidarConfig",
-    "RigidObject",
     "Articulation",
+    "LidarConfig",
     "LidarSensorHandle",
-    "Scene",
     "PhysicsEngine",
+    "RigidObject",
+    "Scene",
+    "SimConfig",
+    "TerrainConfig",
+    "ViewerConfig",
 ]
 
 
@@ -41,10 +41,10 @@ __all__ = [
 
 @dataclass
 class ViewerConfig:
-    camera_pos: Tuple[float, float, float] = (2.0, -2.0, 1.5)
-    camera_lookat: Tuple[float, float, float] = (0.0, 0.0, 0.3)
+    camera_pos: tuple[float, float, float] = (2.0, -2.0, 1.5)
+    camera_lookat: tuple[float, float, float] = (0.0, 0.0, 0.3)
     camera_fov: float = 50.0
-    max_fps: Optional[int] = None
+    max_fps: int | None = None
 
 
 @dataclass
@@ -53,19 +53,19 @@ class SimConfig:
     substeps: int = 2
     device: str = "cuda"          # "cuda" | "cpu" | "mps"
     headless: bool = True
-    solver_iterations: Optional[int] = None   # None → engine default
+    solver_iterations: int | None = None   # None → engine default
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
 
 
 @dataclass
 class TerrainConfig:
     """Procedural rough-terrain grid (engine maps this to its own morph)."""
-    n_subterrains: Tuple[int, int] = (4, 4)
-    subterrain_size: Tuple[float, float] = (8.0, 8.0)
+    n_subterrains: tuple[int, int] = (4, 4)
+    subterrain_size: tuple[float, float] = (8.0, 8.0)
     horizontal_scale: float = 0.25
     vertical_scale: float = 0.005
     randomize: bool = True
-    position: Tuple[float, float, float] = (-16.0, -16.0, 0.0)
+    position: tuple[float, float, float] = (-16.0, -16.0, 0.0)
     subterrain_types: str = "random_uniform_terrain"
 
 
@@ -73,9 +73,9 @@ class TerrainConfig:
 class LidarConfig:
     n_horizontal: int = 36
     n_vertical: int = 5
-    fov_deg: Tuple[float, float] = (360.0, 50.0)   # (horizontal, vertical)
+    fov_deg: tuple[float, float] = (360.0, 50.0)   # (horizontal, vertical)
     max_range: float = 4.0
-    pos_offset: Tuple[float, float, float] = (0.0, 0.0, 0.35)
+    pos_offset: tuple[float, float, float] = (0.0, 0.0, 0.35)
     draw_debug: bool = False
 
 
@@ -87,7 +87,7 @@ class RigidObject(ABC):
     """A (possibly fixed) rigid body: obstacle, prop, furniture piece."""
 
     @abstractmethod
-    def set_position(self, pos: torch.Tensor, envs_idx: Optional[torch.Tensor] = None) -> None:
+    def set_position(self, pos: torch.Tensor, envs_idx: torch.Tensor | None = None) -> None:
         """pos: [len(envs_idx), 3] world positions."""
 
 
@@ -237,39 +237,39 @@ class Scene(ABC):
     def add_terrain(self, cfg: TerrainConfig) -> None: ...
 
     @abstractmethod
-    def add_mesh(self, file_path: str, pos: Tuple[float, float, float],
-                 quat_wxyz: Tuple[float, float, float, float],
+    def add_mesh(self, file_path: str, pos: tuple[float, float, float],
+                 quat_wxyz: tuple[float, float, float, float],
                  fixed: bool = True, scale: float = 1.0) -> RigidObject:
         """Static/prop mesh asset (.glb / .obj)."""
 
     @abstractmethod
-    def add_urdf_prop(self, file_path: str, pos: Tuple[float, float, float],
-                      quat_wxyz: Tuple[float, float, float, float],
+    def add_urdf_prop(self, file_path: str, pos: tuple[float, float, float],
+                      quat_wxyz: tuple[float, float, float, float],
                       fixed: bool = True) -> RigidObject:
         """Non-robot URDF asset (furniture, appliances, ...)."""
 
     @abstractmethod
-    def add_box(self, size: Tuple[float, float, float],
-                pos: Tuple[float, float, float], fixed: bool = True) -> RigidObject: ...
+    def add_box(self, size: tuple[float, float, float],
+                pos: tuple[float, float, float], fixed: bool = True) -> RigidObject: ...
 
     @abstractmethod
     def add_cylinder(self, radius: float, height: float,
-                     pos: Tuple[float, float, float], fixed: bool = True) -> RigidObject: ...
+                     pos: tuple[float, float, float], fixed: bool = True) -> RigidObject: ...
 
     @abstractmethod
     def add_sphere(self, radius: float,
-                   pos: Tuple[float, float, float], fixed: bool = True) -> RigidObject: ...
+                   pos: tuple[float, float, float], fixed: bool = True) -> RigidObject: ...
 
     @abstractmethod
     def add_articulation(self, urdf_path: str,
-                         pos: Tuple[float, float, float],
-                         quat_wxyz: Tuple[float, float, float, float]) -> Articulation: ...
+                         pos: tuple[float, float, float],
+                         quat_wxyz: tuple[float, float, float, float]) -> Articulation: ...
 
     @abstractmethod
     def add_lidar(self, articulation: Articulation, cfg: LidarConfig) -> LidarSensorHandle: ...
 
     def add_camera(self, res=(320, 240), pos=(3.0, -3.0, 2.0),
-                   lookat=(0.0, 0.0, 0.3), fov: float = 50.0) -> "CameraHandle":
+                   lookat=(0.0, 0.0, 0.3), fov: float = 50.0) -> CameraHandle:
         """
         Optional offscreen RGB camera for visualisation (e.g. the dashboard's
         'Genesis window'). Must be called BEFORE build(). Backends that do not

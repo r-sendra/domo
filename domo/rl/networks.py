@@ -61,7 +61,7 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.00)
 
     @classmethod
-    def from_state_dict(cls, sd: dict) -> "ActorCritic":
+    def from_state_dict(cls, sd: dict) -> ActorCritic:
         """
         Rebuild the network purely from checkpoint weight shapes (tolerates
         old script checkpoints and any config drift). Accepts a raw

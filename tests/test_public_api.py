@@ -35,6 +35,5 @@ def test_all_names_importable(pkg_name):
 
 def test_demo_import_surface():
     # The exact symbols examples/eureka/eureka_getup.py::demo imports.
-    from domo.control import (LearnedJointSkill, SimControlLoop,
-                              SingleSkillController)
+    from domo.control import LearnedJointSkill, SimControlLoop, SingleSkillController
     assert LearnedJointSkill and SimControlLoop and SingleSkillController

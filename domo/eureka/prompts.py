@@ -6,11 +6,9 @@ surface is reviewable and versionable like any other interface.
 
 from __future__ import annotations
 
-from typing import List
-
 from .spec import CandidateResult, SkillLearningRequest, TaskSpec
 
-__all__ = ["reward_prompt", "reflection_block", "dr_prompt", "SAFETY_INSTRUCTION"]
+__all__ = ["SAFETY_INSTRUCTION", "dr_prompt", "reflection_block", "reward_prompt"]
 
 
 _REWARD_SYSTEM = """\
@@ -74,7 +72,7 @@ def reward_prompt(request: SkillLearningRequest, task_spec: TaskSpec,
     return "\n".join(parts)
 
 
-def reflection_block(candidates: List[CandidateResult]) -> str:
+def reflection_block(candidates: list[CandidateResult]) -> str:
     """
     Eureka reward reflection: outcomes + component trajectories. Candidates
     are compared on the DENSE fitness (0–1 progress toward the goal), not

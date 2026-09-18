@@ -5,8 +5,7 @@ import torch
 
 from domo.eureka import TASK_REGISTRY, CandidateResult, IterationResult
 from domo.eureka.prompts import dr_prompt, reflection_block, reward_prompt
-from domo.eureka.rewards import (extract_reward_code, load_reward_fn,
-                                 validate_reward_code)
+from domo.eureka.rewards import extract_reward_code, load_reward_fn, validate_reward_code
 from domo.eureka.spec import EurekaConfig, SkillLearningRequest
 from domo.llm.client import ScriptedClient, extract_code_block, extract_json_block
 from domo.robot.randomization import DomainRandomization
@@ -138,7 +137,7 @@ def test_dr_prompt_and_config_roundtrip():
 
 def test_safety_instruction_in_reward_prompt():
     from domo.eureka.prompts import reward_prompt
-    from domo.eureka.spec import EurekaConfig, SkillLearningRequest, TASK_REGISTRY
+    from domo.eureka.spec import TASK_REGISTRY, EurekaConfig, SkillLearningRequest
     req = SkillLearningRequest(skill_name="g", description="Stand up.",
                                eureka=EurekaConfig(iterations=1, samples=1))
     ts = TASK_REGISTRY["go2_getup"]

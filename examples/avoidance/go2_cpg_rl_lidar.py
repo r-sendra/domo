@@ -19,11 +19,13 @@ on top of a FROZEN CPG locomotion policy.
 import argparse
 from dataclasses import asdict
 
-import torch
-
-from domo.checkpoints import (avoid_config_from_dict, configs_from_checkpoint,
-                    load_checkpoint, load_locomotion_policy, pick_device,
-                    world_from_avoid_config)
+from domo.checkpoints import (
+    configs_from_checkpoint,
+    load_checkpoint,
+    load_locomotion_policy,
+    pick_device,
+    world_from_avoid_config,
+)
 from domo.rl import ActorCritic, PPOConfig, PPOTrainer, clean_state_dict
 from domo.skills import PlanningController, make_go2_library
 from domo.tasks import Go2AvoidConfig, Go2AvoidTask

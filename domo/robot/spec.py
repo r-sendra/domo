@@ -9,8 +9,7 @@ parameters used by analytic controllers live in `QuadrupedGeometry`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from dataclasses import dataclass
 
 __all__ = ["QuadrupedGeometry", "RobotSpec"]
 
@@ -23,7 +22,7 @@ class QuadrupedGeometry:
     l_calf: float
     # Lateral sign per leg, ordered like the leg blocks in joint_names
     # (+1 left legs, -1 right legs).
-    side_sign: Tuple[float, ...] = (-1.0, +1.0, -1.0, +1.0)
+    side_sign: tuple[float, ...] = (-1.0, +1.0, -1.0, +1.0)
 
 
 @dataclass(frozen=True)
@@ -32,12 +31,12 @@ class RobotSpec:
     urdf_path: str
     # Actuated joints in canonical order; every dof-indexed tensor in DOMO
     # follows this ordering.
-    joint_names: Tuple[str, ...]
-    default_joint_angles: Dict[str, float]
-    foot_link_names: Tuple[str, ...] = ()
+    joint_names: tuple[str, ...]
+    default_joint_angles: dict[str, float]
+    foot_link_names: tuple[str, ...] = ()
     # Initial base pose (wxyz quaternion).
-    base_init_pos: Tuple[float, float, float] = (0.0, 0.0, 0.4)
-    base_init_quat: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    base_init_pos: tuple[float, float, float] = (0.0, 0.0, 0.4)
+    base_init_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
     # Nominal joint PD gains (a task may override via its ActuatorConfig).
     kp: float = 20.0
     kd: float = 0.5
@@ -48,6 +47,6 @@ class RobotSpec:
         return len(self.joint_names)
 
     @property
-    def default_dof_angles(self) -> Tuple[float, ...]:
+    def default_dof_angles(self) -> tuple[float, ...]:
         """Default joint angles in joint_names order."""
         return tuple(self.default_joint_angles[n] for n in self.joint_names)

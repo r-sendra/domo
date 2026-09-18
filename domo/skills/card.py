@@ -16,9 +16,8 @@ Interface typing is the grammar's type system:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
 
-__all__ = ["ParamSpec", "SkillCard", "MOTOR", "CMD_VELOCITY"]
+__all__ = ["CMD_VELOCITY", "MOTOR", "ParamSpec", "SkillCard"]
 
 MOTOR = "motor"
 CMD_VELOCITY = "command:velocity"
@@ -29,7 +28,7 @@ class ParamSpec:
     name: str
     description: str
     default: float = 0.0
-    range: Optional[Tuple[float, float]] = None
+    range: tuple[float, float] | None = None
     unit: str = ""
 
 
@@ -38,25 +37,25 @@ class SkillCard:
     name: str
     description: str                      # natural language, one paragraph
     interface: str = MOTOR                # MOTOR | CMD_VELOCITY
-    accepts: Optional[str] = None         # command channel consumed (motor skills)
-    params: List[ParamSpec] = field(default_factory=list)
+    accepts: str | None = None         # command channel consumed (motor skills)
+    params: list[ParamSpec] = field(default_factory=list)
 
     # Semantics for the planner (natural language; not machine-checked).
-    preconditions: List[str] = field(default_factory=list)
-    effects: List[str] = field(default_factory=list)
+    preconditions: list[str] = field(default_factory=list)
+    effects: list[str] = field(default_factory=list)
 
     # Termination — condition expressions in the grammar's condition syntax,
     # evaluated by the executor every decision tick.
-    success_when: List[str] = field(default_factory=list)   # [] → runs until a modifier ends it
-    fail_when: List[str] = field(default_factory=list)      # safety/abort conditions
+    success_when: list[str] = field(default_factory=list)   # [] → runs until a modifier ends it
+    fail_when: list[str] = field(default_factory=list)      # safety/abort conditions
 
     # Hard limits on the command channel this skill CONSUMES (clamped by the
     # executor after layering, before the skill sees the command).
-    constraints: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    constraints: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     # Safety documentation + failsafe duration (FAILURE after this long).
-    safety_notes: List[str] = field(default_factory=list)
-    max_duration_s: Optional[float] = None
+    safety_notes: list[str] = field(default_factory=list)
+    max_duration_s: float | None = None
 
     # ------------------------------------------------------------------
 

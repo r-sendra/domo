@@ -22,15 +22,14 @@ imperative path if it is not installed.
 from __future__ import annotations
 
 import os
-from typing import List, Optional, TypedDict
+from typing import TypedDict
 
 from domo.llm.client import LLMClient
 
 from . import prompts
-from .spec import (TASK_REGISTRY, IterationResult, LearnedSkill,
-                   SkillLearningRequest)
+from .spec import TASK_REGISTRY, IterationResult, LearnedSkill, SkillLearningRequest
 
-__all__ = ["run_graph", "build_graph"]
+__all__ = ["build_graph", "run_graph"]
 
 
 class EurekaState(TypedDict, total=False):
@@ -38,8 +37,8 @@ class EurekaState(TypedDict, total=False):
     llm: LLMClient
     reflection: str
     iteration: int
-    history: List[IterationResult]
-    skill: Optional[LearnedSkill]
+    history: list[IterationResult]
+    skill: LearnedSkill | None
 
 
 def _node_iterate(state: EurekaState) -> EurekaState:

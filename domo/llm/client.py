@@ -19,10 +19,15 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import List, Optional
 
-__all__ = ["LLMClient", "GeminiClient", "ScriptedClient", "make_llm",
-           "extract_code_block", "extract_json_block"]
+__all__ = [
+    "GeminiClient",
+    "LLMClient",
+    "ScriptedClient",
+    "extract_code_block",
+    "extract_json_block",
+    "make_llm",
+]
 
 
 class LLMClient:
@@ -32,7 +37,7 @@ class LLMClient:
 
 class GeminiClient(LLMClient):
     def __init__(self, model: str = "gemini-2.5-flash",
-                 api_key: Optional[str] = None,
+                 api_key: str | None = None,
                  max_output_tokens: int = 16384,
                  max_retries: int = 4, verbose: bool = True):
         try:
@@ -106,11 +111,11 @@ class GeminiClient(LLMClient):
 class ScriptedClient(LLMClient):
     """Replays a fixed list of responses (cycling if exhausted)."""
 
-    def __init__(self, responses: List[str]):
+    def __init__(self, responses: list[str]):
         if not responses:
             raise ValueError("ScriptedClient needs at least one response")
         self.responses = list(responses)
-        self.calls: List[str] = []       # prompts received, for inspection
+        self.calls: list[str] = []       # prompts received, for inspection
 
     def generate(self, prompt: str, temperature: float = 1.0) -> str:
         self.calls.append(prompt)
@@ -121,7 +126,7 @@ class ScriptedClient(LLMClient):
 # Response parsing helpers
 # ---------------------------------------------------------------------------
 
-def extract_code_block(text: str, language: str = "python") -> Optional[str]:
+def extract_code_block(text: str, language: str = "python") -> str | None:
     """
     Extract a fenced code block, tolerantly: any/no language tag and
     case, `python` or `py`, CRLF, and — importantly for thinking models —
@@ -144,7 +149,7 @@ def extract_code_block(text: str, language: str = "python") -> Optional[str]:
     return None
 
 
-def extract_json_block(text: str) -> Optional[str]:
+def extract_json_block(text: str) -> str | None:
     m = re.search(r"```json\s*\n(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
@@ -157,7 +162,7 @@ def extract_json_block(text: str) -> Optional[str]:
 # Provider factory
 # ---------------------------------------------------------------------------
 
-def make_llm(provider: str = "gemini", **kwargs) -> "LLMClient":
+def make_llm(provider: str = "gemini", **kwargs) -> LLMClient:
     """
     Construct an LLM client by provider name — the single dispatch point for
     Eureka / DrEureka and any future supervisor.
@@ -177,8 +182,7 @@ def make_llm(provider: str = "gemini", **kwargs) -> "LLMClient":
     if provider == "scripted":
         return ScriptedClient(kwargs.get("responses") or ["-"])
     if provider in ("vllm", "openai", "gemini-lc", "gemini_langchain"):
-        from .langchain_client import (gemini_langchain_client, openai_client,
-                                       vllm_client)
+        from .langchain_client import gemini_langchain_client, openai_client, vllm_client
         if provider == "vllm":
             return vllm_client(**kwargs)
         if provider == "openai":

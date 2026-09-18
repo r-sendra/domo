@@ -27,8 +27,13 @@ uncorrected, so the square smears. Compare the printed |dist from origin|.
 import argparse
 
 from domo.checkpoints import load_locomotion_policy, pick_device
-from domo.control import (Controller, CPGLocomotionSkill, SimControlLoop,
-                          SingleSkillController, StandSkill)
+from domo.control import (
+    Controller,
+    CPGLocomotionSkill,
+    SimControlLoop,
+    SingleSkillController,
+    StandSkill,
+)
 from domo.robot import GO2, Robot
 from domo.sim import SimConfig, ViewerConfig, create_engine
 from domo.skills import make_go2_library

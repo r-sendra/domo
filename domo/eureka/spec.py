@@ -11,11 +11,17 @@ subprocesses; the caller's world is never touched.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional
 
-__all__ = ["TaskSpec", "TASK_REGISTRY", "EurekaConfig", "DrEurekaConfig",
-           "SkillLearningRequest", "CandidateResult", "IterationResult",
-           "LearnedSkill"]
+__all__ = [
+    "TASK_REGISTRY",
+    "CandidateResult",
+    "DrEurekaConfig",
+    "EurekaConfig",
+    "IterationResult",
+    "LearnedSkill",
+    "SkillLearningRequest",
+    "TaskSpec",
+]
 
 
 @dataclass(frozen=True)
@@ -46,7 +52,7 @@ The reward function receives `task` (the running environment). Available:
 All tensors are torch tensors on the same device. N = number of envs."""
 
 
-TASK_REGISTRY: Dict[str, TaskSpec] = {
+TASK_REGISTRY: dict[str, TaskSpec] = {
     "go2_getup": TaskSpec(
         module="domo.tasks.go2_getup",
         task_class="Go2GetUpTask",
@@ -85,11 +91,11 @@ class DrEurekaConfig:
     """Reward-aware physics prior sweep + LLM-proposed randomization."""
     # RAPP: values swept per parameter to find the feasible bounds. One
     # frozen-policy evaluation per value, one parameter perturbed at a time.
-    friction_values: List[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 1.5, 2.0, 4.0])
-    base_mass_values: List[float] = field(default_factory=lambda: [-1.0, 0.0, 1.0, 2.0, 3.0, 5.0])
-    com_shift_values: List[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1, 0.15])
-    kp_scale_values: List[float] = field(default_factory=lambda: [0.5, 0.7, 0.85, 1.0, 1.15, 1.3, 1.5])
-    obs_noise_values: List[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1])
+    friction_values: list[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 1.5, 2.0, 4.0])
+    base_mass_values: list[float] = field(default_factory=lambda: [-1.0, 0.0, 1.0, 2.0, 3.0, 5.0])
+    com_shift_values: list[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1, 0.15])
+    kp_scale_values: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.85, 1.0, 1.15, 1.3, 1.5])
+    obs_noise_values: list[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1])
     # A setting is feasible if success ≥ max(floor, ratio × nominal success)
     feasible_ratio: float = 0.5
     feasible_floor: float = 0.1
@@ -110,7 +116,7 @@ class SkillLearningRequest:
     dr: DrEurekaConfig = field(default_factory=DrEurekaConfig)
     run_root: str = "runs/eureka"
     llm: str = "gemini"            # gemini | vllm | openai | gemini-lc | scripted
-    llm_kwargs: Optional[dict] = None   # forwarded to the client (model, base_url, ...)
+    llm_kwargs: dict | None = None   # forwarded to the client (model, base_url, ...)
     use_graph: bool = True         # orchestrate via LangGraph when available
 
 
@@ -128,9 +134,9 @@ class CandidateResult:
     ever_upright_rate: float = 0.0  # diagnostic: fraction that ever stood ≥1 step
     max_hold: float = 0.0           # diagnostic: mean longest upright streak (steps)
     mean_ep_len: float = 0.0
-    snapshots: List[dict] = field(default_factory=list)
-    checkpoint: Optional[str] = None
-    error: Optional[str] = None
+    snapshots: list[dict] = field(default_factory=list)
+    checkpoint: str | None = None
+    error: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -146,10 +152,10 @@ class CandidateResult:
 @dataclass
 class IterationResult:
     index: int
-    candidates: List[CandidateResult]
+    candidates: list[CandidateResult]
 
     @property
-    def best(self) -> Optional[CandidateResult]:
+    def best(self) -> CandidateResult | None:
         ranked = sorted((c for c in self.candidates if c.ok),
                         key=lambda c: c.rank_key)
         return ranked[0] if ranked else None
@@ -162,9 +168,9 @@ class LearnedSkill:
     checkpoint: str
     reward_code: str
     success_rate: float
-    dr_config: Optional[dict] = None       # DrEureka output, if run
-    dr_success_rate: Optional[float] = None
-    history: List[IterationResult] = field(default_factory=list)
+    dr_config: dict | None = None       # DrEureka output, if run
+    dr_success_rate: float | None = None
+    history: list[IterationResult] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [f"LearnedSkill '{self.name}' ({self.task})",

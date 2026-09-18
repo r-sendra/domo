@@ -21,7 +21,6 @@ executed with 1 step of latency (matches real Go2 command pipeline).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -53,9 +52,9 @@ class Go2WalkConfig:
 
     # Commands
     resampling_time_s: float = 4.0
-    lin_vel_x_range: Tuple[float, float] = (0.5, 0.5)
-    lin_vel_y_range: Tuple[float, float] = (0.0, 0.0)
-    ang_vel_range: Tuple[float, float] = (0.0, 0.0)
+    lin_vel_x_range: tuple[float, float] = (0.5, 0.5)
+    lin_vel_y_range: tuple[float, float] = (0.0, 0.0)
+    ang_vel_range: tuple[float, float] = (0.0, 0.0)
 
     # Termination
     termination_pitch: float = 1.0           # [rad]
@@ -65,7 +64,7 @@ class Go2WalkConfig:
     # Rewards
     tracking_sigma: float = 0.25
     base_height_target: float = 0.34
-    reward_scales: Dict[str, float] = field(default_factory=lambda: {
+    reward_scales: dict[str, float] = field(default_factory=lambda: {
         "tracking_lin_vel": 1.0,
         "tracking_ang_vel": 0.2,
         "lin_vel_z": -1.0,
@@ -75,7 +74,7 @@ class Go2WalkConfig:
     })
 
     # Observation scales
-    obs_scales: Dict[str, float] = field(default_factory=lambda: {
+    obs_scales: dict[str, float] = field(default_factory=lambda: {
         "lin_vel": 2.0, "ang_vel": 0.25, "dof_pos": 1.0, "dof_vel": 0.05,
     })
 

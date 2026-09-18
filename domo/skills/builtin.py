@@ -10,16 +10,27 @@ whatever the robot knows at that moment in its development.
 
 from __future__ import annotations
 
-from domo.control.skill import (CPGLocomotionSkill, LidarAvoidanceSkill,
-                                StandSkill, TrajectoryTrackingSkill)
+from domo.control.skill import (
+    CPGLocomotionSkill,
+    LidarAvoidanceSkill,
+    StandSkill,
+    TrajectoryTrackingSkill,
+)
 from domo.control.slam import SlamSkill
 
 from .card import CMD_VELOCITY, MOTOR, ParamSpec, SkillCard
 from .library import SkillLibrary
 
-__all__ = ["STAND_CARD", "WALK_CARD", "AVOID_CARD",
-           "FORWARD_CARD", "BACKWARD_CARD", "GOTO_CARD", "SLAM_CARD",
-           "make_go2_library"]
+__all__ = [
+    "AVOID_CARD",
+    "BACKWARD_CARD",
+    "FORWARD_CARD",
+    "GOTO_CARD",
+    "SLAM_CARD",
+    "STAND_CARD",
+    "WALK_CARD",
+    "make_go2_library",
+]
 
 
 STAND_CARD = SkillCard(

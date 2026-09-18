@@ -24,12 +24,15 @@ Then:
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 from .client import LLMClient
 
-__all__ = ["LangChainClient", "vllm_client", "openai_client",
-           "gemini_langchain_client"]
+__all__ = [
+    "LangChainClient",
+    "gemini_langchain_client",
+    "openai_client",
+    "vllm_client",
+]
 
 
 class LangChainClient(LLMClient):
@@ -82,7 +85,7 @@ def _content_to_text(content) -> str:
 # ---------------------------------------------------------------------------
 
 def vllm_client(model: str,
-                base_url: Optional[str] = None,
+                base_url: str | None = None,
                 api_key: str = "EMPTY",
                 max_tokens: int = 16384,
                 verbose: bool = True) -> LangChainClient:
@@ -100,8 +103,8 @@ def vllm_client(model: str,
 
 
 def openai_client(model: str = "gpt-4o-mini",
-                  api_key: Optional[str] = None,
-                  base_url: Optional[str] = None,
+                  api_key: str | None = None,
+                  base_url: str | None = None,
                   max_tokens: int = 16384,
                   verbose: bool = True) -> LangChainClient:
     """OpenAI (or any OpenAI-compatible gateway via base_url)."""
@@ -113,7 +116,7 @@ def openai_client(model: str = "gpt-4o-mini",
 
 
 def gemini_langchain_client(model: str = "gemini-2.5-flash",
-                            api_key: Optional[str] = None,
+                            api_key: str | None = None,
                             max_tokens: int = 16384,
                             verbose: bool = True) -> LangChainClient:
     """Gemini through langchain-google-genai (vs. the direct GeminiClient)."""

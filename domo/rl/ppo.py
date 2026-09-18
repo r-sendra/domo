@@ -17,8 +17,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import asdict, dataclass, field
-from typing import Optional
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import torch
@@ -46,14 +45,14 @@ class PPOConfig:
     max_grad_norm: float = 1.0
     hidden_size: int = 512
     trunk_layers: int = 2
-    head_hidden: Optional[int] = None    # None → hidden_size
+    head_hidden: int | None = None    # None → hidden_size
 
     # Stability guards (opt-in)
-    target_kl: Optional[float] = None
+    target_kl: float | None = None
     lr_schedule: str = "constant"        # "constant" | "linear"
     lr_floor_frac: float = 0.05
     guard_nonfinite: bool = False
-    vloss_skip: Optional[float] = None   # rollback update if value loss exceeds this
+    vloss_skip: float | None = None   # rollback update if value loss exceeds this
 
     # Logging / checkpoints
     run_dir: str = "runs/experiment"
@@ -113,7 +112,7 @@ class PPOTrainer:
         n_updates = cfg.total_steps // steps_per_rollout
 
         print(f"\n{'=' * 55}")
-        print(f"  PPO Training")
+        print("  PPO Training")
         print(f"{'=' * 55}")
         print(f"  Envs          : {self.env.num_envs}")
         print(f"  Total steps   : {cfg.total_steps:,}")

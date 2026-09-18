@@ -20,7 +20,6 @@ import torch
 from domo.rl import ActorCritic, PPOConfig, PPOTrainer, clean_state_dict
 from domo.tasks import Go2WalkConfig, Go2WalkTask
 
-
 # ==========================================================================
 # Config
 # ==========================================================================

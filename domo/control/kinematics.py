@@ -13,18 +13,16 @@ Ported from scripts/house_scene/go2_cpg_rl.py.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 
 from domo.robot.spec import QuadrupedGeometry
 
-__all__ = ["leg_fk", "leg_ik", "LegKinematics"]
+__all__ = ["LegKinematics", "leg_fk", "leg_ik"]
 
 
 def leg_fk(qh: torch.Tensor, qt: torch.Tensor, qc: torch.Tensor,
            side_sign: torch.Tensor, l1: float, l2: float, l3: float
-           ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+           ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward kinematics: joint angles → foot position in hip frame."""
     s = side_sign
     z_s = -l2 * torch.cos(qt) - l3 * torch.cos(qt + qc)
@@ -36,7 +34,7 @@ def leg_fk(qh: torch.Tensor, qt: torch.Tensor, qc: torch.Tensor,
 
 def leg_ik(px: torch.Tensor, py: torch.Tensor, pz: torch.Tensor,
            side_sign: torch.Tensor, l1: float, l2: float, l3: float
-           ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+           ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Closed-form inverse kinematics: foot position in hip frame → angles."""
     l1_s = side_sign * l1
     L = torch.sqrt(torch.clamp(py * py + pz * pz - l1 * l1, min=1e-8))

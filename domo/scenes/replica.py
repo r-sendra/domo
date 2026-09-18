@@ -15,19 +15,18 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
 
 from domo.sim.base import Scene
 
-__all__ = ["ReplicaSpawn", "resolve_replica_assets", "load_replica_scene"]
+__all__ = ["ReplicaSpawn", "load_replica_scene", "resolve_replica_assets"]
 
 
 @dataclass
 class ReplicaSpawn:
     template_name: str
     asset_path: str
-    pos: Tuple[float, float, float]          # Genesis frame (Z-up)
-    quat_wxyz: Tuple[float, float, float, float]
+    pos: tuple[float, float, float]          # Genesis frame (Z-up)
+    quat_wxyz: tuple[float, float, float, float]
     fixed: bool
     scale: float = 1.0
 
@@ -39,7 +38,7 @@ def _habitat_to_zup(pos, quat_wxyz):
     return (x, -z, y), (qw, qx, -qz, qy)
 
 
-def _resolve_asset_path(template_path: str, root_dir: str) -> Optional[str]:
+def _resolve_asset_path(template_path: str, root_dir: str) -> str | None:
     """Hunt for the matching Habitat config JSON and return the asset path."""
     base_name = os.path.basename(template_path)
     search_dir = os.path.join(root_dir, "configs")
@@ -51,7 +50,7 @@ def _resolve_asset_path(template_path: str, root_dir: str) -> Optional[str]:
             if file.startswith(base_name) and file.endswith(".json"):
                 json_path = os.path.join(subdir, file)
                 try:
-                    with open(json_path, "r") as f:
+                    with open(json_path) as f:
                         obj_config = json.load(f)
                     asset_rel = (obj_config.get("urdf_filepath")
                                  or obj_config.get("render_asset"))
@@ -66,15 +65,15 @@ def _resolve_asset_path(template_path: str, root_dir: str) -> Optional[str]:
 
 
 def resolve_replica_assets(scene_json: str, asset_root: str,
-                           stage_z_nudge: float = -0.05) -> List[ReplicaSpawn]:
+                           stage_z_nudge: float = -0.05) -> list[ReplicaSpawn]:
     """
     Parse the scene instance file and resolve every entity to a spawnable
     asset. Pure I/O — no physics engine involved.
     """
-    with open(scene_json, "r") as f:
+    with open(scene_json) as f:
         config = json.load(f)
 
-    spawns: List[ReplicaSpawn] = []
+    spawns: list[ReplicaSpawn] = []
 
     # Stage (room shell)
     stage_info = config.get("stage_instance", {})

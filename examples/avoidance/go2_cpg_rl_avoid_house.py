@@ -15,12 +15,16 @@ Habitat ReplicaCAD apartment instead of the randomised arena.
 import argparse
 from dataclasses import asdict
 
-from domo.checkpoints import (configs_from_checkpoint, load_checkpoint,
-                    load_locomotion_policy, pick_device)
+from go2_cpg_rl_lidar import evaluate, lidar_model_from_args
+
+from domo.checkpoints import (
+    configs_from_checkpoint,
+    load_checkpoint,
+    load_locomotion_policy,
+    pick_device,
+)
 from domo.rl import PPOConfig, PPOTrainer
 from domo.tasks import Go2AvoidConfig, Go2AvoidTask
-
-from go2_cpg_rl_lidar import evaluate, lidar_model_from_args
 
 
 def build_configs(args):

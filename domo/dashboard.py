@@ -36,10 +36,15 @@ import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
 
-__all__ = ["TelemetryHub", "DashboardServer", "DashboardClient", "Dashboard",
-           "serve", "make_server"]
+__all__ = [
+    "Dashboard",
+    "DashboardClient",
+    "DashboardServer",
+    "TelemetryHub",
+    "make_server",
+    "serve",
+]
 
 
 class TelemetryHub:
@@ -55,7 +60,7 @@ class TelemetryHub:
         self._roots: dict = {}             # asset-name → absolute dir (for /assets)
         self._t0 = time.time()
 
-    def publish(self, state: dict, frame: Optional[bytes] = None) -> None:
+    def publish(self, state: dict, frame: bytes | None = None) -> None:
         with self._lock:
             self._state = state
             if frame is not None:
@@ -199,8 +204,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _encode_jpeg(frame) -> bytes:
-    from PIL import Image
     import numpy as np
+    from PIL import Image
     arr = np.asarray(frame)
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
@@ -257,7 +262,7 @@ class DashboardClient:
         self._stop = threading.Event()
         self._thread = None
 
-    def start(self) -> "DashboardClient":
+    def start(self) -> DashboardClient:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         print(f"  [dashboard] pushing telemetry to {self.base} (decoupled; "
@@ -265,7 +270,7 @@ class DashboardClient:
               f"{self.base.rsplit(':', 1)[-1]})")
         return self
 
-    def set_scene(self, scene: dict, roots: Optional[dict] = None) -> None:
+    def set_scene(self, scene: dict, roots: dict | None = None) -> None:
         with self._lock:
             self._scene = {"scene": scene, "roots": roots or {}}
 
@@ -334,7 +339,7 @@ class Dashboard:
         self._server = None
         self._thread = None
 
-    def start(self) -> "Dashboard":
+    def start(self) -> Dashboard:
         self._server = make_server(self.port, self.hub, self.title)
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         daemon=True)

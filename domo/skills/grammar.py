@@ -33,10 +33,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
 
-__all__ = ["parse", "GrammarError",
-           "SkillRef", "CondRef", "Layer", "Sequence", "Fallback", "Modified"]
+__all__ = [
+    "CondRef",
+    "Fallback",
+    "GrammarError",
+    "Layer",
+    "Modified",
+    "Sequence",
+    "SkillRef",
+    "parse",
+]
 
 
 class GrammarError(ValueError):
@@ -50,7 +57,7 @@ class GrammarError(ValueError):
 @dataclass
 class CondRef:
     name: str
-    args: Tuple[float, ...] = ()
+    args: tuple[float, ...] = ()
 
     def to_text(self):
         return self.name + (f"({', '.join(_num(a) for a in self.args)})"
@@ -79,7 +86,7 @@ class Layer:
 
 @dataclass
 class Sequence:
-    children: List[object]
+    children: list[object]
 
     def to_text(self):
         return " >> ".join(_paren(c, (Sequence,)) for c in self.children)
@@ -87,7 +94,7 @@ class Sequence:
 
 @dataclass
 class Fallback:
-    children: List[object]
+    children: list[object]
 
     def to_text(self):
         return " | ".join(_paren(c, (Sequence, Fallback)) for c in self.children)
@@ -96,9 +103,9 @@ class Fallback:
 @dataclass
 class Modified:
     child: object
-    for_s: Optional[float] = None
-    until: Optional[CondRef] = None
-    repeat: Optional[int] = None
+    for_s: float | None = None
+    until: CondRef | None = None
+    repeat: int | None = None
 
     def to_text(self):
         t = _paren(self.child, (Sequence, Fallback, Layer))

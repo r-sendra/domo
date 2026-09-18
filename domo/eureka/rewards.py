@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Callable, Optional, Tuple
+from collections.abc import Callable
 
 import torch
 
 from domo.llm.client import extract_code_block
 
-__all__ = ["extract_reward_code", "validate_reward_code", "load_reward_fn"]
+__all__ = ["extract_reward_code", "load_reward_fn", "validate_reward_code"]
 
 REWARD_FN_NAME = "compute_reward"
 
@@ -27,14 +27,14 @@ REWARD_FN_NAME = "compute_reward"
 ALLOWED_IMPORTS = {"torch", "math"}
 
 
-def extract_reward_code(llm_response: str) -> Optional[str]:
+def extract_reward_code(llm_response: str) -> str | None:
     code = extract_code_block(llm_response, "python")
     if code and REWARD_FN_NAME in code:
         return code
     return None
 
 
-def validate_reward_code(code: str) -> Optional[str]:
+def validate_reward_code(code: str) -> str | None:
     """Static checks. Returns an error string or None if plausible."""
     for forbidden in ("__", "open(", "exec(", "eval(", "subprocess"):
         if forbidden in code:
@@ -69,7 +69,7 @@ def load_reward_fn(code: str) -> Callable:
     exec(compile(code, "<reward>", "exec"), namespace)
     fn = namespace[REWARD_FN_NAME]
 
-    def wrapped(task) -> Tuple[torch.Tensor, dict]:
+    def wrapped(task) -> tuple[torch.Tensor, dict]:
         out = fn(task)
         if not (isinstance(out, tuple) and len(out) == 2):
             raise TypeError(f"{REWARD_FN_NAME} must return (reward, components)")

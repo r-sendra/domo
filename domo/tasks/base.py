@@ -14,7 +14,6 @@ Step API (legged-gym style 5-tuple):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -43,21 +42,21 @@ class VecTask(ABC):
         self.rew_buf = torch.zeros((n_envs,), device=device, dtype=f)
         self.reset_buf = torch.ones((n_envs,), device=device, dtype=torch.bool)
         self.episode_length_buf = torch.zeros((n_envs,), device=device, dtype=i)
-        self.extras: Dict = {}
+        self.extras: dict = {}
 
-        self._reward_functions: Dict[str, callable] = {}
-        self.reward_scales: Dict[str, float] = {}
-        self.episode_sums: Dict[str, torch.Tensor] = {}
+        self._reward_functions: dict[str, callable] = {}
+        self.reward_scales: dict[str, float] = {}
+        self.episode_sums: dict[str, torch.Tensor] = {}
 
         # Injected reward (Eureka / M2): fn(task) → (reward [N], components).
         self._reward_override = None
-        self.reward_components: Dict[str, torch.Tensor] = {}
+        self.reward_components: dict[str, torch.Tensor] = {}
 
     # ------------------------------------------------------------------
     # Reward registry
     # ------------------------------------------------------------------
 
-    def register_rewards(self, scales: Dict[str, float],
+    def register_rewards(self, scales: dict[str, float],
                          scale_by_dt: bool = True) -> None:
         """
         Bind reward terms by name: each name must have a `_reward_<name>`
@@ -127,11 +126,11 @@ class VecTask(ABC):
 
     @abstractmethod
     def step(self, actions: torch.Tensor
-             ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor,
-                        torch.Tensor, Dict]: ...
+             ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor,
+                        torch.Tensor, dict]: ...
 
     @abstractmethod
-    def reset(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
+    def reset(self) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
     @abstractmethod
     def reset_idx(self, envs_idx: torch.Tensor) -> None: ...
@@ -139,5 +138,5 @@ class VecTask(ABC):
     def get_observations(self) -> torch.Tensor:
         return self.obs_buf
 
-    def get_privileged_observations(self) -> Optional[torch.Tensor]:
+    def get_privileged_observations(self) -> torch.Tensor | None:
         return None

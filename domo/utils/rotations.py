@@ -18,14 +18,14 @@ import torch
 
 __all__ = [
     "identity_quat",
+    "normalize_quat",
+    "quat_apply",
+    "quat_apply_inverse",
     "quat_conjugate",
     "quat_inverse",
     "quat_mul",
-    "quat_apply",
-    "quat_apply_inverse",
     "quat_to_euler_xyz",
     "quat_to_rpy",
-    "normalize_quat",
 ]
 
 

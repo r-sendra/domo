@@ -32,14 +32,13 @@ its own programs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 import torch
 
 from domo.control import Controller, StandSkill
 
-from .library import CompileError, SkillLibrary
 from .grammar import GrammarError
+from .library import CompileError, SkillLibrary
 
 __all__ = ["PlanOutcome", "PlanningController"]
 
@@ -49,8 +48,8 @@ class PlanOutcome:
     """What the planner learns about its previous decision."""
     program: str
     succeeded: bool
-    trace: List[str] = field(default_factory=list)
-    compile_error: Optional[str] = None    # program never ran
+    trace: list[str] = field(default_factory=list)
+    compile_error: str | None = None    # program never ran
 
 
 class PlanningController(Controller):
@@ -62,13 +61,13 @@ class PlanningController(Controller):
                          decision_interval=decision_interval)
         self.library = library
         self.program = None                    # active CompositeSkill
-        self.history: List[PlanOutcome] = []   # everything that happened
+        self.history: list[PlanOutcome] = []   # everything that happened
 
     # ------------------------------------------------------------------
     # The intelligence slot
     # ------------------------------------------------------------------
 
-    def plan(self, state, last: Optional[PlanOutcome]) -> Optional[str]:
+    def plan(self, state, last: PlanOutcome | None) -> str | None:
         """
         Produce the next skill program (grammar text), or None to idle.
         `last` is the outcome of the previous program (None on the very
@@ -116,5 +115,5 @@ class PlanningController(Controller):
         return self.program is None
 
     @property
-    def last_outcome(self) -> Optional[PlanOutcome]:
+    def last_outcome(self) -> PlanOutcome | None:
         return self.history[-1] if self.history else None

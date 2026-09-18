@@ -21,17 +21,24 @@ and on the real robot.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import torch
 
-from .cpg import CPGConfig, CPGLegController, build_cpg_observation, CPG_OBS_SCALES
+from .cpg import CPG_OBS_SCALES, CPGConfig, CPGLegController, build_cpg_observation
 from .kinematics import LegKinematics
 
-__all__ = ["Skill", "StandSkill", "CPGLocomotionSkill",
-           "CommandSkill", "LidarAvoidanceSkill", "LearnedJointSkill",
-           "NavGains", "TrajectoryTrackingSkill"]
+__all__ = [
+    "CPGLocomotionSkill",
+    "CommandSkill",
+    "LearnedJointSkill",
+    "LidarAvoidanceSkill",
+    "NavGains",
+    "Skill",
+    "StandSkill",
+    "TrajectoryTrackingSkill",
+]
 
 
 class Skill(ABC):
@@ -83,7 +90,7 @@ class CPGLocomotionSkill(Skill):
     name = "cpg_locomotion"
 
     def __init__(self, policy_fn: Callable[[torch.Tensor], torch.Tensor],
-                 cpg: Optional[CPGConfig] = None):
+                 cpg: CPGConfig | None = None):
         self.policy_fn = policy_fn
         self.cpg_cfg = cpg or CPGConfig()
 
@@ -180,7 +187,7 @@ class CommandSkill(Skill):
             raise TypeError(
                 f"{type(self).__name__} takes no parameters (got {params})")
 
-    def success_flags(self, state) -> Optional[torch.Tensor]:
+    def success_flags(self, state) -> torch.Tensor | None:
         """
         Optional per-env completion signal [N] (bool). When a layered command
         skill returns all-True, the hosting LayerNode reports SUCCESS — this is
@@ -281,7 +288,7 @@ class TrajectoryTrackingSkill(CommandSkill):
 
     def __init__(self, mode: str = "forward", distance: float = 1.0,
                  target=(0.0, 0.0), speed: float = 0.5,
-                 cfg: Optional[NavGains] = None):
+                 cfg: NavGains | None = None):
         if mode not in ("forward", "backward", "goto"):
             raise ValueError(f"unknown nav mode '{mode}'")
         self.mode = mode

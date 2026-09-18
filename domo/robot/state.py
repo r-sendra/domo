@@ -39,7 +39,7 @@ class RobotState:
 
     @classmethod
     def zeros(cls, n_envs: int, n_dofs: int, n_feet: int,
-              device: torch.device, dtype=torch.float32) -> "RobotState":
+              device: torch.device, dtype=torch.float32) -> RobotState:
         def z(*shape):
             return torch.zeros((n_envs, *shape), device=device, dtype=dtype)
         state = cls(

@@ -17,8 +17,12 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
-from domo.checkpoints import (configs_from_checkpoint, load_checkpoint,
-                    load_locomotion_policy, pick_device)
+from domo.checkpoints import (
+    configs_from_checkpoint,
+    load_checkpoint,
+    load_locomotion_policy,
+    pick_device,
+)
 from domo.rl import PPOConfig, PPOTrainer
 from domo.tasks import Go2CPGWalkConfig, Go2CPGWalkTask
 

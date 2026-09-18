@@ -17,7 +17,7 @@ tasks and controllers cannot tell them apart.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -27,13 +27,13 @@ from domo.utils.rotations import quat_apply_inverse, quat_to_euler_xyz
 from .state import RobotState
 
 __all__ = [
-    "StateSensor",
     "ExteroceptiveSensor",
-    "SimIMU",
-    "SimJointEncoders",
+    "SectorLidar",
     "SimBaseStateSensor",
     "SimContactSensor",
-    "SectorLidar",
+    "SimIMU",
+    "SimJointEncoders",
+    "StateSensor",
 ]
 
 

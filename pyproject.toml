@@ -30,3 +30,25 @@ include = ["domo*"]
 
 [tool.ruff]
 line-length = 100
+target-version = "py310"
+extend-exclude = ["scripts", "runs", "policies"]
+
+[tool.ruff.lint]
+# Correctness (E/F/B), import order (I), modern syntax (UP), simplifications
+# (SIM) and ruff's own checks (RUF). Keep the list small and explicit so the
+# baseline stays reproducible for every contributor.
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",    # line length: handled by the formatter / reviewed by hand
+    "RUF012",  # mutable class attributes: dataclass-free configs use them deliberately
+    "SIM108",  # ternaries are not always clearer than if/else
+    "B905",    # zip(strict=) churn on tensor-shaped iterables
+    "RUF001", "RUF002", "RUF003",  # arrows and dashes in prose are intentional
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["domo"]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/*" = ["E402"]   # sys.path tweaks before imports in standalone scripts
+"__init__.py" = ["F401"]  # re-exports

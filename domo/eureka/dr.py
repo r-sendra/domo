@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List, Optional, Tuple
 
 from domo.llm.client import LLMClient, extract_json_block
 from domo.robot.randomization import DomainRandomization
@@ -29,8 +28,12 @@ from . import prompts
 from .routine import run_worker
 from .spec import LearnedSkill, SkillLearningRequest
 
-__all__ = ["physics_prior", "feasible_bounds", "propose_dr_configs",
-           "run_dr_eureka"]
+__all__ = [
+    "feasible_bounds",
+    "physics_prior",
+    "propose_dr_configs",
+    "run_dr_eureka",
+]
 
 # param key → (DR range field, default/nominal value, human label)
 _PARAMS = {
@@ -42,7 +45,7 @@ _PARAMS = {
 }
 
 
-def _sweeps(dr_cfg) -> List[dict]:
+def _sweeps(dr_cfg) -> list[dict]:
     """Single-parameter perturbations; each carries its param name + value."""
     sweeps = [{"label": "nominal", "param": None, "value": 0.0, "dr": {}}]
 
@@ -68,7 +71,7 @@ def _sweeps(dr_cfg) -> List[dict]:
 
 
 def physics_prior(request: SkillLearningRequest, skill: LearnedSkill,
-                  run_dir: str) -> List[dict]:
+                  run_dir: str) -> list[dict]:
     """Run all single-parameter sweeps in one worker; return per-value success."""
     cfg = request.eureka
     spec = {
@@ -93,15 +96,15 @@ def physics_prior(request: SkillLearningRequest, skill: LearnedSkill,
     return results["sweeps"]
 
 
-def feasible_bounds(sweeps: List[dict], dr_cfg, nominal: float
-                    ) -> Tuple[Dict[str, Tuple[float, float]], str]:
+def feasible_bounds(sweeps: list[dict], dr_cfg, nominal: float
+                    ) -> tuple[dict[str, tuple[float, float]], str]:
     """
     RAPP: per parameter, the [min, max] over which the policy stays feasible
     (success ≥ threshold), always including the nominal/default value.
     Returns (bounds dict keyed by DR field, human-readable block).
     """
     threshold = max(dr_cfg.feasible_floor, dr_cfg.feasible_ratio * nominal)
-    bounds: Dict[str, Tuple[float, float]] = {}
+    bounds: dict[str, tuple[float, float]] = {}
     lines = [f"(a value is feasible if success ≥ {threshold:.0%}; "
              f"nominal success {nominal:.0%})"]
 
@@ -120,7 +123,7 @@ def feasible_bounds(sweeps: List[dict], dr_cfg, nominal: float
     return bounds, "\n".join(lines)
 
 
-def prior_table(sweeps: List[dict], dr_cfg, nominal: float) -> str:
+def prior_table(sweeps: list[dict], dr_cfg, nominal: float) -> str:
     threshold = max(dr_cfg.feasible_floor, dr_cfg.feasible_ratio * nominal)
     lines = []
     for s in sweeps:
@@ -131,7 +134,7 @@ def prior_table(sweeps: List[dict], dr_cfg, nominal: float) -> str:
     return "\n".join(lines)
 
 
-def _clamp_to_bounds(dr_dict: dict, bounds: Dict[str, Tuple[float, float]]) -> dict:
+def _clamp_to_bounds(dr_dict: dict, bounds: dict[str, tuple[float, float]]) -> dict:
     """Keep the LLM honest: no proposed range may exceed the feasible bounds."""
     out = {}
     for k, v in dr_dict.items():
@@ -145,9 +148,9 @@ def _clamp_to_bounds(dr_dict: dict, bounds: Dict[str, Tuple[float, float]]) -> d
     return out
 
 
-def propose_dr_configs(llm: LLMClient, skill: LearnedSkill, sweeps: List[dict],
+def propose_dr_configs(llm: LLMClient, skill: LearnedSkill, sweeps: list[dict],
                        dr_cfg, n_samples: int
-                       ) -> Tuple[List[DomainRandomization], str]:
+                       ) -> tuple[list[DomainRandomization], str]:
     """
     DrEureka Stage 2: sample `n_samples` INDEPENDENT DR configs from the LLM,
     each clamped to the RAPP feasible bounds. Falls back to the feasible
@@ -159,7 +162,7 @@ def propose_dr_configs(llm: LLMClient, skill: LearnedSkill, sweeps: List[dict],
     prompt = prompts.dr_prompt(skill.name, nominal, bounds_text,
                                prior_table(sweeps, dr_cfg, nominal))
 
-    configs: List[DomainRandomization] = []
+    configs: list[DomainRandomization] = []
     for i in range(n_samples):
         response = llm.generate(prompt, temperature=0.8)   # diverse samples
         raw = extract_json_block(response)

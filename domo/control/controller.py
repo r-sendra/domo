@@ -27,7 +27,6 @@ the generated program is a Controller subclass calling the skill library.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict
 
 import torch
 
@@ -38,7 +37,7 @@ __all__ = ["Controller", "SingleSkillController"]
 
 class Controller(ABC):
 
-    def __init__(self, skills: Dict[str, Skill], initial: str,
+    def __init__(self, skills: dict[str, Skill], initial: str,
                  decision_interval: int = 5):
         if initial not in skills:
             raise ValueError(f"initial skill '{initial}' not in {list(skills)}")

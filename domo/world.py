@@ -25,14 +25,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
 
 from domo.robot import GO2, Robot, RobotSpec, SimulatedLidar
 from domo.robot.lidar_models import LidarModelConfig, generic_sector_lidar
 from domo.scenes import ObstacleArena, ObstacleArenaConfig
 from domo.sim import SimConfig, TerrainConfig, ViewerConfig, create_engine
 
-__all__ = ["WorldConfig", "World"]
+__all__ = ["World", "WorldConfig"]
 
 
 @dataclass
@@ -42,7 +41,7 @@ class WorldConfig:
     device: str = "cuda"
     dt: float = 0.02
     substeps: int = 2
-    solver_iterations: Optional[int] = 100
+    solver_iterations: int | None = 100
     headless: bool = False
     viewer: ViewerConfig = field(default_factory=lambda: ViewerConfig(
         camera_pos=(3.0, -3.0, 2.5), camera_lookat=(0.0, 0.0, 0.3),
@@ -59,19 +58,19 @@ class WorldConfig:
     # Robot
     kp: float = 100.0
     kd: float = 2.0
-    base_init_pos: Tuple[float, float, float] = (0.0, 0.0, 0.35)
+    base_init_pos: tuple[float, float, float] = (0.0, 0.0, 0.35)
     base_init_yaw_deg: float = 0.0
 
     # Sensors (None → no lidar)
-    lidar_model: Optional[LidarModelConfig] = field(
+    lidar_model: LidarModelConfig | None = field(
         default_factory=generic_sector_lidar)
     lidar_sectors: int = 36
 
     # Optional offscreen dashboard camera (None → none). (w, h) resolution.
     # Rendering it costs frame time — twin/eval viz only, never training.
-    camera_res: Optional[Tuple[int, int]] = None
-    camera_pos: Tuple[float, float, float] = (4.0, -4.0, 3.0)
-    camera_lookat: Tuple[float, float, float] = (0.0, 0.0, 0.3)
+    camera_res: tuple[int, int] | None = None
+    camera_pos: tuple[float, float, float] = (4.0, -4.0, 3.0)
+    camera_lookat: tuple[float, float, float] = (0.0, 0.0, 0.3)
 
 
 class World:
@@ -93,7 +92,7 @@ class World:
             viewer=cfg.viewer))
 
         # ---- environment ---------------------------------------------------
-        self.arena: Optional[ObstacleArena] = None
+        self.arena: ObstacleArena | None = None
         if cfg.scene_kind == "flat":
             self.scene.add_ground(cfg.ground_height)
         elif cfg.scene_kind == "rough":
@@ -132,7 +131,7 @@ class World:
         self.scene.build(n_envs)
         self.robot.bind(n_envs)
 
-        self.lidar: Optional[SimulatedLidar] = None
+        self.lidar: SimulatedLidar | None = None
         if lidar_handle is not None:
             self.lidar = SimulatedLidar(
                 lidar_handle, cfg.lidar_model, n_envs,

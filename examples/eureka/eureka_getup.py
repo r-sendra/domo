@@ -36,8 +36,7 @@ import math
 import torch
 
 from domo.checkpoints import pick_device
-from domo.eureka import (DrEurekaConfig, EurekaConfig, SkillLearningRequest,
-                         learn_skill)
+from domo.eureka import DrEurekaConfig, EurekaConfig, SkillLearningRequest, learn_skill
 from domo.llm.client import ScriptedClient
 
 REQUEST_DESCRIPTION = (
@@ -93,7 +92,7 @@ SCRIPTED_DR = '''```json
 
 def demo(checkpoint: str, device: str, headless: bool, episodes: int = 3):
     """Deploy the learned policy as a skill in the twin: fallen → standing."""
-    from domo.control import LearnedJointSkill, SimControlLoop, SingleSkillController
+    from domo.control import LearnedJointSkill, SingleSkillController
     from domo.rl import ActorCritic, clean_state_dict
     from domo.tasks.go2_getup import build_getup_observation
     from domo.world import World, WorldConfig

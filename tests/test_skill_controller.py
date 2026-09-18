@@ -2,8 +2,13 @@
 
 import torch
 
-from domo.control import (Controller, CPGLocomotionSkill, SingleSkillController,
-                          SimControlLoop, StandSkill)
+from domo.control import (
+    Controller,
+    CPGLocomotionSkill,
+    SimControlLoop,
+    SingleSkillController,
+    StandSkill,
+)
 from domo.control.cpg import CPG_OBS_DIM
 from domo.robot import GO2
 from domo.robot.state import RobotState

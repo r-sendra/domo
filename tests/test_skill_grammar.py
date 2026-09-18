@@ -3,11 +3,18 @@
 import pytest
 import torch
 
-from domo.skills import (CompileError, GrammarError, FAILURE, RUNNING,
-                         SUCCESS, make_go2_library, parse)
-from domo.skills.grammar import Fallback, Layer, Modified, Sequence, SkillRef
 from domo.robot import GO2
 from domo.robot.state import RobotState
+from domo.skills import (
+    FAILURE,
+    RUNNING,
+    SUCCESS,
+    CompileError,
+    GrammarError,
+    make_go2_library,
+    parse,
+)
+from domo.skills.grammar import Fallback, Layer, Modified, Sequence, SkillRef
 
 N = 2
 DEVICE = torch.device("cpu")

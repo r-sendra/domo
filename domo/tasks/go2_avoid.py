@@ -21,22 +21,28 @@ Action (3): raw corrections, tanh-squashed to (Δvx, Δvy, Δvyaw) limits.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Tuple
 
 import torch
 
 from domo.control import CPGConfig, CPGLocomotionSkill
 from domo.robot import GO2, RobotSpec
 from domo.robot.lidar_models import LidarModelConfig, generic_sector_lidar
+
 # ObstacleArenaConfig re-exported for backward compatibility; the builder
 # lives in domo.scenes so the goal-free World shares the same environments.
 from domo.scenes.arena import ObstacleArenaConfig
 
 from .base import VecTask
 
-__all__ = ["ObstacleArenaConfig", "Go2AvoidConfig", "Go2AvoidTask",
-           "AVOID_OBS_DIM", "AVOID_ACT_DIM"]
+__all__ = [
+    "AVOID_ACT_DIM",
+    "AVOID_OBS_DIM",
+    "Go2AvoidConfig",
+    "Go2AvoidTask",
+    "ObstacleArenaConfig",
+]
 
 AVOID_OBS_DIM = 36
 AVOID_ACT_DIM = 3
@@ -58,7 +64,7 @@ class Go2AvoidConfig:
     replica_scene_json: str = "scripts/house_scene/data/replica_cad/configs/scenes/apt_0.scene_instance.json"
     replica_asset_root: str = "scripts/house_scene/data/replica_cad/"
     ground_height: float = 0.0           # house floor sits at 0.2 in the scripts
-    base_init_pos: Tuple[float, float, float] = (0.0, 0.0, 0.42)
+    base_init_pos: tuple[float, float, float] = (0.0, 0.0, 0.42)
     base_init_yaw_deg: float = 0.0       # house replica spawned facing 180°
 
     # Frozen locomotion inner loop (paper gains)
@@ -88,10 +94,10 @@ class Go2AvoidConfig:
     delta_vyaw_max: float = 1.5
 
     # Base command + final clamps
-    base_command: Tuple[float, float, float] = (0.6, 0.0, 0.0)
-    vx_clamp: Tuple[float, float] = (-1.0, 2.0)
-    vy_clamp: Tuple[float, float] = (-0.5, 0.5)
-    vyaw_clamp: Tuple[float, float] = (-1.5, 1.5)
+    base_command: tuple[float, float, float] = (0.6, 0.0, 0.0)
+    vx_clamp: tuple[float, float] = (-1.0, 2.0)
+    vy_clamp: tuple[float, float] = (-0.5, 0.5)
+    vyaw_clamp: tuple[float, float] = (-1.5, 1.5)
 
     # Termination
     termination_pitch: float = 1.0
@@ -99,7 +105,7 @@ class Go2AvoidConfig:
     termination_height: float = 0.18
 
     # Reward scales (× dt at registration)
-    reward_scales: Dict[str, float] = field(default_factory=lambda: {
+    reward_scales: dict[str, float] = field(default_factory=lambda: {
         "survival": 1.0,
         "avoidance": 5.0,
         "smoothness": -0.05,
@@ -180,7 +186,7 @@ class Go2AvoidTask(VecTask):
         print(f"  Avoid obs  : {self.OBS_DIM} sectors (normalised to "
               f"{cfg.obs_max_range:.1f} m)")
         print(f"  Avoid act  : {self.ACT_DIM} (Δvx, Δvy, Δvyaw)")
-        print(f"  Locomotion : frozen policy (injected)")
+        print("  Locomotion : frozen policy (injected)")
         print(f"{'=' * 60}\n")
 
     # ------------------------------------------------------------------

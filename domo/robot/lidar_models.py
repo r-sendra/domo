@@ -27,8 +27,7 @@ Presets:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Tuple
+from dataclasses import dataclass
 
 import torch
 
@@ -36,8 +35,13 @@ from domo.sim.base import LidarConfig, LidarSensorHandle
 
 from .sensors import ExteroceptiveSensor
 
-__all__ = ["LidarModelConfig", "hesai_xt16", "generic_sector_lidar",
-           "SimulatedLidar", "XT16_FULL_AZIMUTH"]
+__all__ = [
+    "XT16_FULL_AZIMUTH",
+    "LidarModelConfig",
+    "SimulatedLidar",
+    "generic_sector_lidar",
+    "hesai_xt16",
+]
 
 # The real device scans 2000 pts/ring (0.18° @ 10 Hz). 2000 is not divisible
 # by the 36 policy sectors, so full-fidelity sim uses 1980 (0.182°/step,
@@ -51,7 +55,7 @@ class LidarModelConfig:
     # Beam geometry (n_horizontal is the sim-fidelity knob)
     n_horizontal: int = 36
     n_vertical: int = 5
-    fov_deg: Tuple[float, float] = (360.0, 50.0)
+    fov_deg: tuple[float, float] = (360.0, 50.0)
     # Device behaviour
     rate_hz: float = 10.0
     min_range: float = 0.0
@@ -59,7 +63,7 @@ class LidarModelConfig:
     range_noise_std: float = 0.0
     dropout_prob: float = 0.0
     # Mounting (position offset from the base link; measure on the real robot)
-    pos_offset: Tuple[float, float, float] = (0.0, 0.0, 0.35)
+    pos_offset: tuple[float, float, float] = (0.0, 0.0, 0.35)
     draw_debug: bool = False
 
     def to_lidar_config(self) -> LidarConfig:
@@ -74,7 +78,7 @@ class LidarModelConfig:
 
 
 def hesai_xt16(n_horizontal: int = 180,
-               pos_offset: Tuple[float, float, float] = (0.0, 0.0, 0.35),
+               pos_offset: tuple[float, float, float] = (0.0, 0.0, 0.35),
                rate_hz: float = 10.0,
                draw_debug: bool = False) -> LidarModelConfig:
     """
@@ -136,7 +140,9 @@ class SimulatedLidar(ExteroceptiveSensor):
         self._points = torch.zeros((n_envs, n_beams, 3), device=device)
         self._points_valid = torch.zeros((n_envs, n_beams), dtype=torch.bool,
                                          device=device)
-        self._has_points = True
+        # Only backends that implement ``read_points`` feed the cloud; fakes
+        # and ranges-only handles fall back to sector mode.
+        self._has_points = hasattr(handle, "read_points")
 
     @property
     def update_interval(self) -> int:
@@ -174,7 +180,7 @@ class SimulatedLidar(ExteroceptiveSensor):
         if self._has_points:
             try:
                 pts, prng = self._handle.read_points()
-            except NotImplementedError:
+            except (NotImplementedError, AttributeError):
                 self._has_points = False
             else:
                 valid = (prng > m.min_range) & (prng < m.max_range)

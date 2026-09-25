@@ -15,7 +15,7 @@ theme:
     text: IBM Plex Sans
     code: IBM Plex Mono
   icon:
-    logo: domo/go2
+    logo: domo/mark
     repo: fontawesome/brands/git-alt
     annotation: material/plus-circle
   favicon: assets/favicon.svg

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- DOMO monogram. A single geometric D: flat stem, half-round bowl, one
+       counter. Deliberately not a pictogram - the earlier layer-stack marks
+       collided with the hamburger menu in the same header, and a robot
+       silhouette turns to mush below 28 px. This reads at 16 px and never
+       gets mistaken for a UI control. -->
+  <path fill-rule="evenodd" d="M4.9 3.6h5.7a8.4 8.4 0 0 1 0 16.8H4.9zm3.4 3.6v9.6h4.1a4.8 4.8 0 0 0 0-9.6z" fill="currentColor"/>
+</svg>

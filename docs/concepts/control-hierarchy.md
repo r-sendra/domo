@@ -46,7 +46,7 @@ cannot.
     "a policy" — a policy is the neural network *inside* a skill. A
     `ControlLoop` is never "an environment": environments have rewards and
     episodes, and live in `domo/tasks/`. See
-    [conventions](conventions.md#control-hierarchy-naming).
+    [conventions](conventions.md#naming).
 
 ## Motor skills and command skills
 

@@ -10,11 +10,12 @@ use_directory_urls: true
 theme:
   name: material
   language: en
+  custom_dir: docs/overrides
   font:
     text: IBM Plex Sans
     code: IBM Plex Mono
   icon:
-    logo: material/robot-industrial
+    logo: domo/go2
     repo: fontawesome/brands/git-alt
     annotation: material/plus-circle
   favicon: assets/favicon.svg
@@ -62,6 +63,15 @@ theme:
     - content.tabs.link
     - content.tooltips
     - announce.dismiss
+
+# Treat every broken internal link or anchor as a build failure, so a page
+# can never ship pointing at a heading that was renamed or removed.
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
 
 extra_css:
   - stylesheets/domo.css

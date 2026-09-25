@@ -1,17 +1,21 @@
-# `domo.skills` — cards, grammar, compiler, programs
+# domo.skills
 
-`domo.skills` is the skill library layer (M5). It gives every primitive in
-`domo.control` an LLM-legible card, defines a small composition grammar
-(`@` layering, `>>` sequence, `|` fallback, `.for/.until/.repeat`
-modifiers), type-checks programs against the cards, and runs the result as
-a `CompositeSkill`, an ordinary skill that any `Controller` can host.
+`domo.skills` is the skill library layer (M5): it gives every primitive in
+[`domo.control`](control.md) an LLM-legible card, defines a small composition
+grammar, and runs a compiled program as a `CompositeSkill` that any
+[`Controller`](control.md#controller-abc) can host. The one rule it enforces
+is that **a program is type-checked against the cards before anything runs** —
+channels, parameter names and parameter ranges are all compile-time errors,
+so a planner's mistake becomes a message it can read rather than a robot that
+misbehaves.
+
 `PlanningController` closes the loop: programs are authored at runtime,
-inside the controller, by whatever intelligence occupies `plan()`.
-
-It sits above `domo.control` (the primitives it composes) and below
-`domo.world` and `examples/`. Pure torch, engine-free: it can be imported
-and tested on a machine without Genesis (`tests/test_skill_grammar.py`,
-`tests/test_skills_library.py`, `tests/test_planner.py` run on fakes).
+inside the controller, by whatever intelligence occupies `plan()`. The
+package sits above `domo.control` and below `domo.world` and `examples/`.
+Pure torch, engine-free: it can be imported and tested on a machine without
+Genesis (`tests/test_skill_grammar.py`, `tests/test_skills_library.py`,
+`tests/test_planner.py` run on fakes). The rationale for the operators is in
+[the skill grammar](../concepts/grammar.md).
 
 ```python
 from domo.skills import make_go2_library
@@ -22,6 +26,35 @@ program = library.compile("(avoid @ walk(vx=0.6)).until(moved(3)) >> stand.for(2
 program.setup(robot)                 # a CompositeSkill is an ordinary Skill
 print(library.describe())            # the catalogue an LLM plans against
 ```
+
+Text to motion, in five stages:
+
+```mermaid
+flowchart TB
+    T["program text<br/><small>e.g. (avoid @ walk).until(moved(3)) then stand.for(2)</small>"]
+    P["parse<br/><small>grammar.py · tokenizer + recursive descent</small>"]
+    A["AST<br/><small>Sequence · Fallback · Layer · Modified · SkillRef</small>"]
+    K["type-check<br/><small>library.py · cards, channels, params, ranges</small>"]
+    I["instantiate<br/><small>one motor skill per name, one command skill per '@'</small>"]
+    X["CompositeSkill<br/><small>ExecNode tree + hold pose + trace</small>"]
+    R["update(state, dt) → [N, D]<br/><small>RUNNING · SUCCESS · FAILURE</small>"]
+    E1["GrammarError<br/><small>malformed text</small>"]
+    E2["CompileError<br/><small>well-formed, ill-typed</small>"]
+
+    T --> P --> A --> K --> I --> X --> R
+    P -. "bad syntax" .-> E1
+    K -. "bad types" .-> E2
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
+    class T,P,A,K,I,R box;
+    class X accent;
+    class E1,E2 box;
+```
+
+`PlanningController` catches both error classes and hands the message back to
+`plan()` through `PlanOutcome.compile_error`; that is the repair path an LLM
+planner needs.
 
 ## Module map
 
@@ -190,9 +223,14 @@ Whitespace is insignificant. Tokens are `>>`, `@`, `|`, `.`, `(`, `)`,
 | loosest | `>>` | left to right |
 
 So `avoid @ walk(vx=0.6) | stand >> walk.for(3)` parses as
-`Sequence(Fallback(Layer(avoid, walk), stand), Modified(walk, for=3))`, and
-`(avoid @ walk).for(4)` needs its parentheses while `avoid @ walk.for(4)`
-would attach `.for` to `walk` (and then fail to compile, see below).
+`Sequence(Fallback(Layer(avoid, walk), stand), Modified(walk, for=3))`.
+
+!!! warning "Modifiers bind tighter than `@` — parenthesise the layer"
+
+    `avoid @ walk.for(4)` attaches `.for` to `walk` alone and is rejected at
+    compile time; the program you meant is `(avoid @ walk).for(4)`. The
+    compiler's hint quotes the layer *as parsed*, so the text it suggests is
+    not itself a valid fix — move the modifier outside the parentheses.
 
 ### Valid programs
 
@@ -279,10 +317,15 @@ checks, in the order the compiler applies them, with the library built by
 | channels must match down to the motor leaf | `avoid @ stand` | `cannot layer 'avoid' (drives 'velocity') on 'stand' (accepts 'nothing')` |
 | the factory must return a `CommandSkill` | a mis-registered card | `'x' card says command:velocity but the instance is not a CommandSkill` |
 
-Unknown conditions are different: `walk.until(flying)` and a card whose
-`fail_when` names an unregistered condition raise the registry's
-`KeyError("unknown condition 'flying' (known: [...])")`, not a
-`CompileError` (see Gotchas).
+!!! danger "An unknown condition raises `KeyError`, not `CompileError`"
+
+    `walk.until(flying)` — and a card whose `fail_when` names an
+    unregistered condition — raises the registry's
+    `KeyError("unknown condition 'flying' (known: [...])")`.
+    `PlanningController._install` catches only `CompileError` and
+    `GrammarError`, so this one **crashes the control loop** instead of
+    becoming repair feedback. Validate names against
+    `library.conditions.names()` before returning a program from `plan()`.
 
 ### Instance policy
 
@@ -325,6 +368,16 @@ Every node exposes `.status` after each update. Two global rules:
   tick enters and runs the successor. `FAILURE` is additionally
   propagated up through `SequenceNode` and `ModifiedNode` on the same tick
   (a `FallbackNode` ancestor still intercepts it on its next tick).
+
+!!! warning "`SUCCESS` is registered one tick late, `FAILURE` is not"
+
+    Success costs an extra tick at every container boundary, so a test that
+    counts ticks needs one more update per transition; failure propagates
+    the same tick through sequences and modifiers. Both transitions are
+    also **global**: `SUCCESS` needs every env, `FAILURE` triggers on any
+    env, and the program counter is shared. Compositions are for
+    `n_envs = 1`; batched training is the job of
+    [tasks](tasks.md).
 
 Finished nodes return `ctx.hold()`, the default stance `[N, D]`.
 
@@ -541,7 +594,9 @@ make_go2_library(walk_policy, avoid_policy=None, lidar=None, cpg=None,
 
 `walk_policy` and `avoid_policy` are the callables described in
 [control.md](control.md#cpglocomotionskill) (see
-`domo.checkpoints.load_locomotion_policy`); `cpg`, `avoid_deltas` and
+[`domo.checkpoints.load_locomotion_policy`](world-and-services.md#domocheckpoints),
+or [`domo.policies.stable_go2_library`](world-and-services.md#domopolicies)
+for the blessed pair); `cpg`, `avoid_deltas` and
 `obs_max_range` must match the values the policies were trained with.
 
 ```python
@@ -555,7 +610,7 @@ lib.names()                      # ['backward', 'forward', 'goto', 'stand', 'wal
 
 Programs are authored **inside `plan()`**, from the state and the previous
 outcome; they are never CLI flags or configuration
-([conventions.md](../conventions.md)). Host the controller in a loop
+([conventions](../concepts/conventions.md)). Host the controller in a loop
 exactly like any other controller.
 
 ```python
@@ -693,29 +748,17 @@ not how it works.
 
 ## Gotchas
 
-* **Unknown conditions raise `KeyError`, not `CompileError`.**
-  `library.compile("walk.until(flying)")` raises the registry's `KeyError`,
-  and `PlanningController._install` catches only `CompileError` and
-  `GrammarError`, so a program naming an unregistered condition crashes the
-  loop. Validate condition names against `library.conditions.names()`
-  before returning them from `plan()`.
+* **Unknown conditions raise `KeyError`, not `CompileError`**
+  ([above](#compileerror)).
 * **After a compile error, `plan()` gets `last=None`.** The error is in
   `self.last_outcome.compile_error` (and in `history`); `last` only carries
   outcomes of programs that ran.
 * **`NUM` is `-?\d+\.?\d*`.** `.5` and `1e3` are grammar errors; write
   `0.5` and `1000`. `.repeat(n)` accepts any `NUM` and truncates with
   `int(float(n))`, so `.repeat(2.7)` loops twice.
-* **Modifiers bind tighter than `@`.** `avoid @ walk.for(4)` attaches
-  `.for` to `walk` and is rejected at compile time; write
-  `(avoid @ walk).for(4)`. The compiler's hint quotes the layer text as
-  parsed, so `'(avoid @ walk(vx=0.5).for(3)).for(...)'` is not itself a
-  valid fix; move the modifier outside.
-* **`SUCCESS` is registered one tick late.** A container acts on a child's
-  success at the start of its next update; `FAILURE` propagates the same
-  tick through sequences and modifiers. Tests that count ticks need one
-  extra update per transition.
-* **All envs, any env.** `SUCCESS` requires every env, `FAILURE` any env,
-  and the program counter is global. Compositions are for `n_envs = 1`.
+* **Modifiers bind tighter than `@`** ([above](#precedence)).
+* **`SUCCESS` is registered one tick late**, `FAILURE` is not, and both are
+  global across envs ([above](#status)).
 * **`CompositeSkill.reset_idx` restarts the whole program** even when
   `envs_idx` is a subset, and clears the trace.
 * **`LayerNode.enter()` resets the top skill and the motor skill for all

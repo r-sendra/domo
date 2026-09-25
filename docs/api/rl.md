@@ -1,17 +1,18 @@
-# `domo.rl` — PPO over the `VecTask` API
+# domo.rl
 
-The learning layer: a shared-trunk actor-critic, a rollout buffer with
-GAE-λ, and a PPO trainer that consumes any environment implementing the
-`domo.tasks.VecTask` step API (`reset()`, `step(actions)`, plus `num_envs`,
-`num_obs`, `num_actions`, `device`). The package is pure torch and imports
-no physics engine, so networks and checkpoints load on machines without a
-simulator (deployment, evaluation, tests). It is one optional consumer of
-a task; nothing in `domo.tasks` depends on it.
+The learning layer: a shared-trunk actor-critic, a rollout buffer with GAE-λ,
+and a PPO trainer that consumes any environment implementing the
+[`VecTask`](tasks.md#vectask) step API (`reset()`, `step(actions)`, plus
+`num_envs`, `num_obs`, `num_actions`, `device`). The one rule it enforces is
+that **the trainer knows nothing but that API** — it is one optional consumer
+of a task, and nothing in `domo.tasks` depends on it.
 
-`main.py` at the repository root is the reference entry point: it trains
-and evaluates `Go2WalkTask` with this trainer. The other training scripts
-under `examples/` follow the same pattern with their own tasks
-([running.md](../running.md)).
+The package is pure torch and imports no physics engine, so networks and
+checkpoints load on machines without a simulator (deployment, evaluation,
+tests). `main.py` at the repository root is the reference entry point: it
+trains and evaluates [`Go2WalkTask`](tasks.md#go2walktask) with this trainer.
+The other training scripts under `examples/` follow the same pattern with
+their own tasks ([running and training](../guides/running.md)).
 
 ## Module map
 
@@ -103,42 +104,52 @@ The recursion is the textbook one:
 A_t   = δ_t + γ λ (1 − done_t) · A_{t+1}
 ```
 
-`dones` cut the recursion, so nothing bootstraps through a reset. Time-outs
-are stored as dones too (the trainer passes `reset_buf`), which is a known
-simplification (see [Known limitations](#known-limitations)).
+`dones` cut the recursion, so nothing bootstraps through a reset.
 `tests/test_rl_ppo.py::test_gae_matches_reference_recursion` pins this
 against an explicit loop.
+
+!!! warning "Truncation is treated as termination"
+
+    The trainer passes `reset_buf`, so a time-out is stored as an ordinary
+    done and the value of the truncated state is dropped rather than
+    bootstrapped — the policy is told the episode genuinely ended.
+    [`extras["time_outs"]`](tasks.md#the-step-api) carries the distinction
+    but nothing consumes it. With 20 s episodes and `γ = 0.99` the bias is
+    small, which is why the original trainer did the same; it matters more
+    as episodes get shorter.
 
 ## `PPOConfig`
 
 Serialised into every checkpoint as `ppo_config`; `PPOConfig(**ckpt["ppo_config"])`
-rebuilds it.
+rebuilds it. The defaults reproduce the reference locomotion runs.
 
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `total_steps` | `100_000_000` | env steps to train (`num_envs × rollout_steps × updates`) |
-| `rollout_steps` | `24` | `T`: steps per env per update |
-| `minibatch_size` | `8192` | samples per gradient step |
-| `n_epochs` | `5` | passes over each rollout |
-| `gamma` | `0.99` | discount |
-| `lam` | `0.95` | GAE λ |
-| `clip_eps` | `0.2` | clipping range for the probability ratio **and** the value |
-| `lr` | `3e-4` | Adam learning rate (Adam `eps = 1e-5`, as in the original trainer) |
-| `vf_coef` | `1.0` | value-loss weight |
-| `ent_coef` | `0.01` | entropy-bonus weight |
-| `max_grad_norm` | `1.0` | gradient clipping |
-| `hidden_size` | `512` | `ActorCritic` trunk width |
-| `trunk_layers` | `2` | trunk depth |
-| `head_hidden` | `None` | head width; `None` → `hidden_size` |
-| `target_kl` | `None` | when set, stop the remaining epochs of an update once the mean approximate KL of an epoch exceeds `1.5 × target_kl` |
-| `lr_schedule` | `"constant"` | `"constant"` or `"linear"`: decay from `lr` to `lr × lr_floor_frac` over `total_steps` |
-| `lr_floor_frac` | `0.05` | floor of the linear decay |
-| `guard_nonfinite` | `False` | snapshot the network before the update and restore it if any minibatch produces a non-finite loss or gradient norm |
-| `vloss_skip` | `None` | when set, roll the update back if a minibatch value loss exceeds this |
-| `run_dir` | `"runs/experiment"` | checkpoints and TensorBoard events |
-| `log_interval` | `10` | updates between console / TensorBoard lines |
-| `save_interval` | `100` | updates between checkpoints |
-| `ep_stat_window` | `20` | finished episodes averaged for `mean_return` / `mean_length` |
+??? info "Every `PPOConfig` field, with its default"
+
+    | Field | Default | Meaning |
+    |-------|---------|---------|
+    | `total_steps` | `100_000_000` | env steps to train (`num_envs × rollout_steps × updates`) |
+    | `rollout_steps` | `24` | `T`: steps per env per update |
+    | `minibatch_size` | `8192` | samples per gradient step |
+    | `n_epochs` | `5` | passes over each rollout |
+    | `gamma` | `0.99` | discount |
+    | `lam` | `0.95` | GAE λ |
+    | `clip_eps` | `0.2` | clipping range for the probability ratio **and** the value |
+    | `lr` | `3e-4` | Adam learning rate (Adam `eps = 1e-5`, as in the original trainer) |
+    | `vf_coef` | `1.0` | value-loss weight |
+    | `ent_coef` | `0.01` | entropy-bonus weight |
+    | `max_grad_norm` | `1.0` | gradient clipping |
+    | `hidden_size` | `512` | `ActorCritic` trunk width |
+    | `trunk_layers` | `2` | trunk depth |
+    | `head_hidden` | `None` | head width; `None` → `hidden_size` |
+    | `target_kl` | `None` | when set, stop the remaining epochs of an update once the mean approximate KL of an epoch exceeds `1.5 × target_kl` |
+    | `lr_schedule` | `"constant"` | `"constant"` or `"linear"`: decay from `lr` to `lr × lr_floor_frac` over `total_steps` |
+    | `lr_floor_frac` | `0.05` | floor of the linear decay |
+    | `guard_nonfinite` | `False` | snapshot the network before the update and restore it if any minibatch produces a non-finite loss or gradient norm |
+    | `vloss_skip` | `None` | when set, roll the update back if a minibatch value loss exceeds this |
+    | `run_dir` | `"runs/experiment"` | checkpoints and TensorBoard events |
+    | `log_interval` | `10` | updates between console / TensorBoard lines |
+    | `save_interval` | `100` | updates between checkpoints |
+    | `ep_stat_window` | `20` | finished episodes averaged for `mean_return` / `mean_length` |
 
 The two guards share a mechanism: with either enabled the whole update is
 treated as atomic. The network state is cloned before the epochs; a bad
@@ -171,9 +182,30 @@ restored by `load_state`), `ep_returns` / `ep_lengths` (every finished
 episode's undiscounted return and length, in rollout order), `writer`.
 
 `update_callback(trainer, update_idx)` is called after every PPO update;
-`domo.eureka` uses it to take reward-reflection snapshots.
+[`domo.eureka`](eureka.md#the-worker-protocol) uses it to take
+reward-reflection snapshots.
 
 ### The loop
+
+```mermaid
+flowchart TB
+    R["reset()<br/><small>once, at the start</small>"]
+    LR["_apply_lr_schedule()<br/><small>linear decay when configured</small>"]
+    CO["_collect_rollout<br/><small>T steps, no_grad, stochastic policy<br/>store_step → env.step → store_outcome</small>"]
+    G["compute_gae(net.get_value(obs))<br/><small>δ and A backwards over T; dones cut the recursion</small>"]
+    N["normalise advantages<br/><small>over the whole rollout</small>"]
+    MB["n_epochs × minibatches<br/><small>clipped surrogate + vf_coef·value − ent_coef·entropy<br/>clip_grad_norm_ · opt.step()</small>"]
+    S["log · checkpoint · update_callback"]
+    R --> LR --> CO --> G --> N --> MB --> S
+    S -- "next update; envs are NOT reset" --> LR
+    MB -. "target_kl exceeded" .-> S
+    MB -. "guard: non-finite loss or vloss_skip<br/>restore the pre-update snapshot" .-> S
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    class R,LR,CO,G,N,MB,S box;
+```
+
+In pseudo-code, with the buffer calls in place:
 
 ```
 train():
@@ -202,6 +234,15 @@ train():
   save_checkpoint(tag="final")                   checkpoint_final.pt
 ```
 
+!!! warning "`--resume` trains a whole new budget"
+
+    `train()` computes `n_updates = total_steps // (rollout_steps ×
+    num_envs)` without subtracting the restored `global_step`, so resuming a
+    finished run trains `total_steps` again — with the checkpoint's own
+    `total_steps`, not the flag you passed. Checkpoint step numbers keep
+    counting from the restored value, so the files do not collide, but the
+    wall-clock does not shrink.
+
 Envs are never reset by the trainer between rollouts: the next rollout
 starts from the last observation. The losses are the clipped surrogate
 `−min(ratio · A, clip(ratio, 1 ± ε) · A)`, the clipped value loss
@@ -226,8 +267,10 @@ and every example:
 }
 ```
 
-The Eureka worker stores `{"task": <registry key>, "task_config":
-<task_overrides>, "reward_code": <str>}` in `extra`.
+The [Eureka worker](eureka.md#the-worker-protocol) stores
+`{"task": <registry key>, "task_config": <task_overrides>, "reward_code":
+<str>}` in `extra`, so every generated-reward checkpoint carries its own
+provenance.
 
 The frozen scripts under `scripts/` wrote the **legacy format**, which
 `policies/walk.pt` and `policies/avoid.pt` still use:
@@ -302,26 +345,47 @@ python main.py [--n-envs 4096] [--total-steps 100000000] [--rollout-steps 24]
 | `--resume` | none | checkpoint to continue from |
 | `--eval` | none | checkpoint to evaluate instead of training |
 
-Three modes:
+Three modes, one entry point:
 
-* **train**: `build_configs(args)` returns `Go2WalkConfig(n_envs, dt=0.02,
-  max_episode_steps=1000, device, headless, terrain)` and
-  `PPOConfig(total_steps, rollout_steps, minibatch_size = max(n_envs ·
-  rollout_steps // 4, 256), hidden_size=512, run_dir)`; then
-  `PPOTrainer(env, ppo_cfg, extra_checkpoint_data={"task_config":
-  asdict(task_cfg)}).train()`.
-* **`--resume CKPT`**: `load_checkpoint` maps the file onto CUDA when
-  available, else CPU; `PPOConfig(**ckpt["ppo_config"])` and
-  `Go2WalkConfig(**ckpt["extra"]["task_config"])` rebuild both configs with
-  only the device overridden; `load_state(ckpt)`; `train()`. The CLI flags
-  other than `--resume` are ignored.
-* **`--eval CKPT`**: `evaluate(path, n_episodes=10, headless=False)` rebuilds
-  the task from the checkpoint's config with `n_envs=1` and the viewer on,
-  rebuilds the network with the checkpoint's architecture via
-  `build_policy(ckpt, ppo_cfg, num_obs, num_actions)`, and runs 10 episodes
-  with **stochastic** actions (as in training), printing return and length
-  per episode and their means. The device is chosen as for `--resume`;
-  `--device` is ignored.
+=== "Train"
+
+    ```bash
+    python main.py --n-envs 4096 --device cuda --run-dir runs/go2_walk
+    ```
+
+    `build_configs(args)` returns `Go2WalkConfig(n_envs, dt=0.02,
+    max_episode_steps=1000, device, headless, terrain)` and
+    `PPOConfig(total_steps, rollout_steps, minibatch_size = max(n_envs ·
+    rollout_steps // 4, 256), hidden_size=512, run_dir)`; then
+    `PPOTrainer(env, ppo_cfg, extra_checkpoint_data={"task_config":
+    asdict(task_cfg)}).train()`.
+
+=== "Resume"
+
+    ```bash
+    python main.py --resume runs/go2_walk/checkpoint_final.pt
+    ```
+
+    `load_checkpoint` maps the file onto CUDA when available, else CPU;
+    `PPOConfig(**ckpt["ppo_config"])` and
+    `Go2WalkConfig(**ckpt["extra"]["task_config"])` rebuild both configs
+    with only the device overridden; then `load_state(ckpt)` and `train()`.
+    **Every CLI flag other than `--resume` is ignored**, including
+    `--device`.
+
+=== "Evaluate"
+
+    ```bash
+    python main.py --eval runs/go2_walk/checkpoint_final.pt
+    ```
+
+    `evaluate(path, n_episodes=10, headless=False)` rebuilds the task from
+    the checkpoint's config with `n_envs=1` and the viewer on, rebuilds the
+    network with the checkpoint's architecture via `build_policy(ckpt,
+    ppo_cfg, num_obs, num_actions)`, and runs 10 episodes with
+    **stochastic** actions (as in training), printing return and length per
+    episode and their means. The device is chosen as for `--resume`;
+    `--device` is ignored.
 
 Helpers, all importable from the module (`tests/test_rl_networks.py`
 imports `main.py` by path to pin the parser and `build_policy`):
@@ -337,17 +401,8 @@ def main()
 
 ## Known limitations
 
-* **Resuming trains `total_steps` more.** `train()` computes
-  `n_updates = total_steps // (rollout_steps × num_envs)` without
-  subtracting the restored `global_step`, so `--resume` on a finished run
-  trains a full budget again (with the checkpoint's own `total_steps`).
-  Checkpoint step numbers keep counting from the restored value, so the
-  files do not collide.
-* **Time-outs are not bootstrapped.** `compute_gae` treats
-  `extras["time_outs"]` like any other done; the last value of a truncated
-  episode is dropped rather than bootstrapped. With 20 s episodes and
-  `γ = 0.99` the effect is small, which is why the original trainer did
-  the same.
+* **Resuming trains `total_steps` more** ([above](#the-loop)).
+* **Time-outs are not bootstrapped** ([above](#rolloutbuffer)).
 * **`main.py --headless` cannot be turned off.** The flag is `store_true`
   with default `True`. Evaluation always opens the viewer (`evaluate` is
   called with its default `headless=False`).

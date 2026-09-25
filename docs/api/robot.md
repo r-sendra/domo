@@ -1,22 +1,24 @@
-# `domo.robot` — robot spec, state, sensors, actuators
+# domo.robot
 
-`domo.robot` turns a physics handle into a robot. It sits above `domo.sim`
-and below `domo.control` / `domo.scenes` (see
-[architecture.md](../architecture.md)). A `RobotSpec` says what the robot
-is, a `Robot` binds that spec to a scene, and sensors and actuators move
-data between the physics handles and a `RobotState` of `[N, ...]` tensors.
+`domo.robot` turns a physics handle into a robot: a `RobotSpec` says what the
+robot is, a `Robot` binds that spec to a scene, and sensors and actuators move
+data between the handles and a `RobotState` of `[N, ...]` tensors. The one
+rule it enforces is that **sensors and actuators are the only classes that
+call physics handles.**
 
-The rule it enforces: **sensors and actuators are the only classes that
-call physics handles.** Tasks, controllers and skills see `RobotState`
-tensors and call `Robot.set_joint_targets` / `Robot.reset_idx`; nothing
-above this package touches an `Articulation`. Real-robot drivers
+Tasks, controllers and skills see `RobotState` tensors and call
+`Robot.set_joint_targets` / `Robot.reset_idx`; nothing above this package
+touches an [`Articulation`](sim.md#articulation). Real-robot drivers
 reimplement the same sensor and actuator classes on top of DDS/ROS topics,
-which is why the layers above cannot tell sim from hardware.
+which is why the layers above cannot tell sim from hardware. The package
+sits above [`domo.sim`](sim.md) and below [`domo.control`](control.md) and
+[`domo.scenes`](world-and-services.md#domoscenes); see
+[architecture](../concepts/architecture.md).
 
 Conventions: quaternions `wxyz`; joint tensors follow `RobotSpec.joint_names`
 (for Go2, `[FR, FL, RR, RL] × [hip, thigh, calf]`); `base_euler` is
 intrinsic X-Y-Z, not aerospace roll-pitch-yaw
-([conventions.md](../conventions.md)).
+([conventions](../concepts/conventions.md)).
 
 ## Module map
 
@@ -110,6 +112,16 @@ structure is filled from the state-estimation stack.
 | `dof_vel` | `[N, D]` | canonical joint order (rad/s) | encoders |
 | `foot_contacts` | `[N, n_feet]` | float 0/1 | contact sensor, or a task-provided proxy |
 
+!!! danger "`base_euler` is intrinsic X-Y-Z, not roll-pitch-yaw"
+
+    It is produced by `quat_to_euler_xyz` (`R = Rx · Ry · Rz`), the Genesis
+    default, and it is what every task, termination test and `tipped()`
+    condition reads. The aerospace convention lives in
+    [`quat_to_rpy`](world-and-services.md#domoutilsrotations) and has the
+    same shape and the same field order, so nothing will stop you mixing
+    them; the two agree only for pure single-axis rotations. Yaw is index 2
+    in both.
+
 ```python
 @classmethod
 def zeros(cls, n_envs: int, n_dofs: int, n_feet: int,
@@ -144,6 +156,33 @@ state = robot.refresh()                # once per control step
 robot.set_joint_targets(targets)       # [N, D]
 ```
 
+Everything crosses the handle boundary here and nowhere else:
+
+```mermaid
+flowchart LR
+    A["Articulation<br/><small>domo.sim handle</small>"] --> IMU["SimIMU"]
+    A --> ENC["SimJointEncoders"]
+    A --> BASE["SimBaseStateSensor<br/><small>privileged</small>"]
+    A --> CON["SimContactSensor<br/><small>optional</small>"]
+    IMU --> S["RobotState<br/><small>[N, …] tensors, written in place</small>"]
+    ENC --> S
+    BASE --> S
+    CON --> S
+    S --> UP["Skills · Controllers · Tasks<br/><small>read only</small>"]
+    UP -- "set_joint_targets [N, D]" --> ACT["PDJointPositionActuator"]
+    ACT --> A
+    L["LidarSensorHandle"] --> SL["SimulatedLidar<br/><small>own tensor, not in RobotState</small>"]
+    SL --> UP
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
+    class A,IMU,ENC,BASE,CON,UP,ACT,L,SL box;
+    class S accent;
+```
+
+`SimIMU` runs first because `SimBaseStateSensor` rotates by the quaternion
+it writes; see [Sensor order](#sensors).
+
 ### `bind`
 
 ```python
@@ -166,10 +205,15 @@ State sensors are created in a **fixed order**: `SimIMU`, then
 available. The IMU must run first because the others read
 `state.base_quat`.
 
-Missing foot links are tolerated: `link_indices` may raise an
-engine-specific error (Genesis' bundled go2 merges them), which is logged at
-`INFO` (`"no foot links for contact sensing"`) and results in
-`contact_sensor = None`. Tasks then fall back to a stance-phase proxy.
+!!! warning "The bundled Go2 URDF has no foot links"
+
+    Genesis merges `FR_foot` and friends into the calves, so `link_indices`
+    raises, `contact_sensor` stays `None` and `state.foot_contacts` stays
+    zero unless something writes a proxy into it. The failure is logged at
+    `INFO` (`"no foot links for contact sensing"`) and is deliberately not
+    fatal; the CPG tasks substitute the oscillator stance mask
+    ([tasks.md](tasks.md#observation-76-build_cpg_observation)). Anything
+    that reads `foot_contacts` must tolerate all-zeros.
 
 ### `refresh`, `set_joint_targets`, `reset_idx`
 
@@ -208,7 +252,17 @@ Two families, both ABCs in `domo/robot/sensors.py`:
 
 Exteroceptive sensors handed to a control loop are duck-typed: anything
 with `tick()` is advanced after time moves, anything with `reset_idx()` is
-reset with the robot. `SectorLidar` and `SimulatedLidar` expose both.
+reset with the robot ([control.md](control.md#control-loops)). `SectorLidar`
+and `SimulatedLidar` expose both.
+
+!!! warning "`SimBaseStateSensor` is privileged"
+
+    `base_pos`, `base_lin_vel_world` and `base_lin_vel` are free in
+    simulation and come from a state estimator on the real robot, where they
+    are noisier and can be wrong. An observation built from them trains fine
+    and may not transfer; prefer the IMU and encoder fields for anything
+    meant for hardware. The sensor order is fixed for the same reason —
+    `SimIMU` writes `base_quat`, and this sensor rotates by it.
 
 ### Simulated proprioception
 
@@ -301,9 +355,11 @@ XT16_FULL_AZIMUTH = 1980
 
 * `hesai_xt16` — the Hesai PandarXT-16 mounted on the real Go2: 16 channels
   over ±15° (`fov_deg=(360, 30)`, 2° spacing), 0.05–120 m, σ = 1 cm,
-  0.3 % dropout, supported real frame rates 5 / 10 / 20 Hz. The real device
-  scans 2000 points per ring; 2000 is not divisible by the 36 policy
-  sectors, so full-fidelity simulation uses 1980 (55 rays per sector).
+  0.3 % dropout, supported real frame rates 5 / 10 / 20 Hz. The preset sets
+  `min_range` and `max_range` itself, so it does not inherit the 0.0–4.0 m
+  defaults of the bare `LidarModelConfig` above. The real device scans 2000
+  points per ring; 2000 is not divisible by the 36 policy sectors, so
+  full-fidelity simulation uses 1980 (55 rays per sector).
 * `generic_sector_lidar` — the idealised 36 × 5, 4 m, noiseless sensor of
   the original avoidance scripts; the default `WorldConfig.lidar_model`.
 
@@ -357,8 +413,9 @@ from domo.robot.randomization import DomainRandomization
 ```
 
 Per-env physics perturbations resampled on reset — the sim-side half of
-sim-to-real robustness and the surface DrEureka optimises over. All
-parameters are optional (`None` → untouched).
+sim-to-real robustness and the surface
+[DrEureka](eureka.md#dreureka-domoeurekadr) optimises over. All parameters
+are optional (`None` → untouched).
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -428,16 +485,10 @@ backend, and probe it as `SimContactSensor` does.
 
 ## Gotchas
 
-* **`base_euler` is intrinsic X-Y-Z**, produced by `quat_to_euler_xyz`, the
-  Genesis default; it is not aerospace roll-pitch-yaw. Cross terms differ in
-  sign. Treat it as the observation feature it is; yaw is index 2.
-* **`SimBaseStateSensor` is privileged.** `base_pos`, `base_lin_vel_world`
-  and `base_lin_vel` exist in sim for free; on the real robot they come from
-  an estimator. Observations meant to transfer should be built from IMU and
-  encoder fields.
-* **`contact_sensor` is `None` on Genesis' bundled go2** because the foot
-  links are merged into the calves; `foot_contacts` stays zero unless a task
-  writes a proxy into it.
+* **`base_euler` is intrinsic X-Y-Z**, not aerospace roll-pitch-yaw
+  ([above](#robotstate)).
+* **`SimBaseStateSensor` is privileged** and **`contact_sensor` is `None` on
+  Genesis' bundled go2** ([above](#bind)).
 * **Sensor order matters.** `SimIMU` fills `base_quat`; `SimBaseStateSensor`
   rotates with it. A custom sensor that depends on a state field must be
   appended after the sensor that fills it.
@@ -451,5 +502,6 @@ backend, and probe it as `SimContactSensor` does.
 * **`DomainRandomization.to_dict()` drops inactive knobs**, so a
   round-tripped config prints as the minimal set of parameters that are on.
 * Nominal gains (`kp=20`, `kd=0.5` in `GO2`) are not what the twin uses:
-  `WorldConfig` defaults to the stiff `100 / 2` pair, and tasks carry their
-  own. Pass gains to `Robot`, never mutate the (frozen) spec.
+  [`WorldConfig`](world-and-services.md#worldconfig) defaults to the stiff
+  `100 / 2` pair, and [tasks](tasks.md) carry their own. Pass gains to
+  `Robot`, never mutate the (frozen) spec.

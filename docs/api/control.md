@@ -1,27 +1,44 @@
-# `domo.control` — skills, controllers, control loops
+# domo.control
 
-`domo.control` is the engine-free control hierarchy: the primitives that
-turn a `RobotState` into joint targets (`Skill`), the orchestration layer
-that decides which primitive runs and with what parameters (`Controller`),
-and the metronome that ticks everything at a fixed rate (`ControlLoop`).
-It also holds the locomotion machinery those primitives are built from
-(the CPG, analytic leg IK), a passive SLAM layer and the legacy waypoint
-driver.
+`domo.control` is the engine-free control hierarchy: the primitives that turn
+a [`RobotState`](robot.md#robotstate) into joint targets (`Skill`), the
+orchestration layer that decides which primitive runs and with what
+parameters (`Controller`), and the metronome that ticks everything at a fixed
+rate (`ControlLoop`). The one rule it enforces is that **nothing here imports
+a physics engine** — every class reads `RobotState` tensors and calls
+[`Robot`](robot.md#robot) methods, so it runs unchanged on a machine without
+Genesis and, later, on the real robot.
 
-It sits above `domo.robot` and below `domo.skills` (which composes these
-primitives through the grammar) and `domo.world` (which builds the loop).
-Nothing in the package imports a physics engine: every class here runs
-unchanged on a machine without Genesis and, later, on the real robot,
-because it only ever reads `RobotState` tensors and calls `Robot` methods.
-All batched tensors are `[n_envs, ...]` on the robot's device; shapes below
-follow [conventions.md](../conventions.md).
+The package also holds the locomotion machinery those primitives are built
+from (the CPG, analytic leg IK), a passive SLAM layer and the legacy waypoint
+driver. It sits above [`domo.robot`](robot.md) and below
+[`domo.skills`](skills.md) (which composes these primitives through the
+grammar) and [`domo.world`](world-and-services.md#domoworld) (which builds
+the loop). All batched tensors are `[n_envs, ...]` on the robot's device;
+shapes below follow [conventions](../concepts/conventions.md), and the
+layering is argued in
+[the control hierarchy](../concepts/control-hierarchy.md).
 
+```mermaid
+flowchart TB
+    P["LLM / planner<br/><small>writes Controller code or grammar programs · ~0.01 Hz</small>"]
+    C["Controller<br/><small>activates skills, sets their parameters · 1–10 Hz</small>"]
+    CS["CommandSkill<br/><small>emits (Δvx, Δvy, Δvyaw) · 50 Hz</small>"]
+    M["Motor Skill<br/><small>RobotState → joint targets [N, 12] · 50 Hz</small>"]
+    L["ControlLoop<br/><small>sensors · controller · command_filter · actuators · time</small>"]
+    P --> C
+    C --> CS
+    C --> M
+    CS -- "layered with @<br/>clamped by the card" --> M
+    M --> L
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    class P,C,CS,M,L box;
 ```
-LLM / planner        writes Controller code or grammar programs   (~0.01 Hz)
-Controller           activates skills, sets their parameters       (1–10 Hz)
-Skill                RobotState → joint targets [N, 12]            (50 Hz)
-ControlLoop          sensors, controller, command_filter, actuators, time
-```
+
+A command skill never reaches the actuators on its own: it writes into the
+`command` channel of the motor skill beneath it, and the motor skill's card
+constraints clamp whatever the stack above produced.
 
 ## Module map
 
@@ -93,7 +110,9 @@ CPGLocomotionSkill(policy_fn: Callable[[Tensor], Tensor], cpg: CPGConfig | None 
 ```
 
 Velocity-tracking locomotion: frozen CPG policy + oscillators + leg IK, the
-locomotion stack of the avoidance experiments as a reusable primitive.
+locomotion stack of the avoidance experiments as a reusable primitive. It is
+the deployment-time twin of [`Go2CPGWalkTask`](tasks.md#go2cpgwalktask): the
+same oscillators, the same 76-dim observation, the same IK.
 
 | Member | Type / shape | Meaning |
 |--------|--------------|---------|
@@ -103,9 +122,13 @@ locomotion stack of the avoidance experiments as a reusable primitive.
 | `stance_mask()` | `[N, 4]` float | 1 where `sin(theta) < 0` (phase-proxy foot contact) |
 | `update(state, dt)` | `[N, 12]` | `build_cpg_observation` → policy → `CPGLegController.joint_targets` |
 
-`reset_idx` restarts the oscillators in the trot pattern and zeroes
-`command` and the last action for those envs. Setting `command` must
-therefore happen *after* reset.
+!!! warning "`reset_idx` zeroes `command` — write it afterwards"
+
+    Restarting the oscillators in the trot pattern also zeroes `command` and
+    the last action for those envs. `Controller.activate` resets the
+    incoming skill, and so does every `LayerNode.enter()` in a compiled
+    program, so a command written before activation is thrown away. Set the
+    command after `activate()` / `reset_idx()`, never before.
 
 ```python
 from domo.control import CPGLocomotionSkill, all_envs
@@ -124,8 +147,8 @@ LearnedJointSkill(policy_fn, obs_builder, action_scale: float = 0.35, name: str 
 ```
 
 Generic wrapper turning an Eureka/RL joint-space policy into a library
-skill; this is how M3 outputs (for instance a get-up policy) enter the M5
-library.
+skill; this is how M3 outputs (for instance an [Eureka](eureka.md) get-up
+policy) enter the M5 library.
 
 | Argument | Contract |
 |----------|----------|
@@ -233,11 +256,15 @@ An unknown mode raises `ValueError("unknown nav mode '...'")`.
 validates names and ranges at compile time; the method itself ignores
 keys it does not know).
 
-**Lazy latch.** `reset_idx` receives no state, so it only marks the envs
-as needing initialisation; the start pose, unit path direction `u`, path
-length and heading are latched on the first `update_command` after the
-reset, per env. That is what makes `forward` mean "from wherever the robot
-is when this leg starts".
+!!! warning "The path is latched lazily, and `arrived` never un-latches"
+
+    `reset_idx` receives no state, so it only marks the envs as needing
+    initialisation; the start pose, unit path direction `u`, path length and
+    heading are latched on the **first `update_command` after the reset**,
+    per env. That is what makes `forward` mean "from wherever the robot is
+    when this leg starts" — and it means `success_flags` is `False` until
+    that first tick, and stays `True` once the goal is reached even if the
+    robot is pushed away afterwards.
 
 **Control law**, per tick, with `rel = pos - start`, `perp = rot90(u)`:
 
@@ -344,9 +371,17 @@ point per voxel** (the last occurrence, at its true sensor position) rather
 than snapping to voxel centres, so density is uniform without a visible
 lattice.
 
-`reset_idx(envs_idx)` zeroes those envs' grids, re-seeds their odometry on
-the next tick, and drops the cloud if env 0 is in `envs_idx`. The tick
-counter used for `update_interval` is not reset.
+!!! danger "`SlamSkill.reset_idx` wipes the map"
+
+    It zeroes those envs' grids, re-seeds their odometry on the next tick
+    and drops the cloud if env 0 is in `envs_idx`. Every
+    [`LayerNode.enter()`](skills.md#node-semantics) resets its top skill, so
+    `slam @ leg @ walk` starts a **fresh map on every leg** of a mission.
+    When the map must survive, own the `SlamSkill` in a `Controller`
+    attribute and call `update_command` from `update()` each tick
+    ([the persistent-SLAM pattern](skills.md#write-a-planningcontroller));
+    use the `slam` card only for per-leg maps. The tick counter behind
+    `update_interval` is not reset.
 
 ```python
 from domo.control import SlamConfig, SlamSkill
@@ -385,8 +420,9 @@ floored at 1.
 | `ticks` | control steps since the last reset (`time = ticks * dt`) |
 | `skills`, `active` | the dict and the active name |
 
-The values of `skills` may be `CompositeSkill`s from `domo.skills`: a
-compiled program is duck-typed as a skill.
+The values of `skills` may be
+[`CompositeSkill`](skills.md#compositeskill)s from `domo.skills`: a compiled
+program is duck-typed as a skill.
 
 ### `SingleSkillController`
 
@@ -407,17 +443,33 @@ controller = SingleSkillController(program)
 
 Both loops share one cycle; only "how time advances" differs.
 
-```
-command = controller.update(robot.state, dt)   # brain
-command = command_filter(command, robot.state) # M7 safety choke point (if given)
-robot.set_joint_targets(command)               # actuator write
-<time advances>                                # scene.step() | sleep to 1/dt
-robot.refresh()                                # sensors → RobotState
-sensor.tick() for each sensor                  # exteroceptive sensors
+```mermaid
+sequenceDiagram
+    autonumber
+    participant L as ControlLoop
+    participant C as Controller
+    participant F as command_filter
+    participant R as Robot
+    participant T as time
+    participant S as sensors
+
+    L->>C: update(robot.state, dt)
+    C-->>L: targets [N, D]
+    L->>F: filter(targets, robot.state)
+    Note right of F: M7 safety seat —<br/>optional, unbypassable
+    F-->>L: targets [N, D]
+    L->>R: set_joint_targets(targets)
+    L->>T: scene.step() | sleep to 1/dt
+    L->>R: refresh()
+    R-->>L: RobotState
+    L->>S: tick() on each sensor
 ```
 
-Sensors are duck-typed: anything with `tick()` is refreshed after time
-advances, anything with `reset_idx()` is reset with the robot.
+The order is the contract: the command is computed from the state of the
+*previous* tick, and the state the caller receives from `step()` is the one
+measured after time advanced. Sensors are duck-typed — anything with
+`tick()` is refreshed after time advances, anything with `reset_idx()` is
+reset with the robot.
 
 | Method | Behaviour |
 |--------|-----------|
@@ -438,8 +490,8 @@ SimControlLoop(scene, robot, controller, dt: float, sensors: Sequence = (),
 ```
 
 Time advances by `scene.step()`; the scene's own dt must equal `dt`.
-`World.make_loop(controller, command_filter=None)` builds one with the
-world's scene, robot and lidar.
+[`World.make_loop(controller, command_filter=None)`](world-and-services.md#domoworld)
+builds one with the world's scene, robot and lidar.
 
 ```python
 loop = SimControlLoop(scene, robot, controller, dt=0.02, sensors=[lidar],
@@ -734,11 +786,7 @@ estimator) owns it as an attribute and ticks it from an overridden
 
 ## Gotchas
 
-* **`SlamSkill.reset_idx` wipes the map.** Every `LayerNode.enter()` resets
-  its top skill, so `slam @ leg @ walk` starts a fresh map on every leg.
-  When the map must survive a mission, host `SlamSkill` in a `Controller`
-  attribute and call `update_command` from `update()` each tick; use the
-  `slam` card only for per-leg maps.
+* **`SlamSkill.reset_idx` wipes the map** ([above](#slamskill)).
 * **`SlamSkill.point_cloud()` is env 0 only.** The grid is per env; the
   cloud is not.
 * **`SlamConfig.occ_first` is never read.** Hits are always applied before
@@ -748,14 +796,12 @@ estimator) owns it as an attribute and ticks it from an overridden
 * **Point mode is decided once, in `setup`.** `use_points and
   hasattr(lidar, "read_points")`; a `NotImplementedError` from
   `read_points()` demotes the skill to sector mode permanently.
-* **`TrajectoryTrackingSkill` latches lazily.** Nothing is known about the
-  path until the first `update_command` after `reset_idx`; `success_flags`
-  is `False` until then and the `arrived` latch never un-latches, even if
-  the robot is pushed away afterwards.
+* **`TrajectoryTrackingSkill` latches lazily**
+  ([above](#trajectorytrackingskill)).
 * **`TrajectoryTrackingSkill.configure` ignores unknown keys.** Parameter
   names are validated by the card at compile time, not by the skill.
-* **`CPGLocomotionSkill.reset_idx` zeroes `command`.** Set the command after
-  `activate()`/`reset_idx`, not before.
+* **`CPGLocomotionSkill.reset_idx` zeroes `command`**
+  ([above](#cpglocomotionskill)).
 * **One active skill for all envs.** `Controller` switches globally; per-env
   selection or blending means subclassing `update()`.
 * **`decide()` runs on tick 0.** With `decision_interval=k` it runs on

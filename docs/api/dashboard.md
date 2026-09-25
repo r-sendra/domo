@@ -1,43 +1,72 @@
-# `domo.dashboard` — live telemetry for the digital twin
+# domo.dashboard
 
 `domo/dashboard.py` is a single-file web dashboard for watching a twin or
 evaluation run in a browser: a 3D view of the robot in its scene, the SLAM
-occupancy map, the lidar sweep, the point cloud, velocity and height
-charts, and three buttons (pause, reset, stop) that reach back into the
-simulation loop. It is standard library only (`http.server`, `urllib`,
-`threading`, `json`); the page itself is one HTML constant embedded in the
-module.
+occupancy map, the lidar sweep, the point cloud, velocity and height charts,
+and three buttons (pause, reset, stop) that reach back into the simulation
+loop. The one rule it enforces is that **it is never on the training path** —
+no task, trainer or [`VecTask`](tasks.md) imports it, and the examples that
+use it load it lazily, so no web code exists in a training process.
 
-**It is never on the training path.** The dashboard exists for the twin
-runtime and for evaluation ([architecture.md](../architecture.md)); no
-task, trainer or `VecTask` imports it, and the examples that use it
-(`examples/slam/slam_demo.py`, `examples/slam/slam_replica_house.py`)
-import `domo.dashboard` lazily, only when `--dashboard PORT` or
-`--dashboard-url URL` is given, so no web code loads otherwise. Keep it
-that way when wiring it into a new example.
+It is standard library only (`http.server`, `urllib`, `threading`, `json`)
+and the page itself is one HTML constant embedded in the module. The
+examples that use it (`examples/slam/slam_demo.py`,
+`examples/slam/slam_replica_house.py`) import `domo.dashboard` only when
+`--dashboard PORT` or `--dashboard-url URL` is given; keep it that way when
+wiring it into a new example. Failure modes (blank page, no 3D, `NameError`
+on `python -m domo.dashboard`) are in
+[troubleshooting](../guides/troubleshooting.md#dashboard); see
+[architecture](../concepts/architecture.md) for where the dashboard sits.
 
-Failure modes (blank page, no 3D, `NameError` on `python -m
-domo.dashboard`) are in
-[troubleshooting.md, Dashboard](../troubleshooting.md#dashboard).
+## Module map
+
+| Module | Contents | On the training path? |
+|--------|----------|-----------------------|
+| `domo/dashboard.py` | `TelemetryHub`, `_Handler`, `DashboardServer`, `DashboardClient`, `Dashboard`, `make_server`, `serve`, `_DASHBOARD_HTML` | no — twin and evaluation only |
+| `examples/slam/slam_viz.py` | `slam_snapshot`, `go2_robot_manifest` — build a telemetry payload and a scene manifest from a [`RobotState`](robot.md#robotstate) and a [`SlamSkill`](control.md#slamskill) | no |
+
+Everything in `domo/dashboard.py` is importable directly; there is no
+package `__init__` and no re-export layer.
 
 ## Architecture
 
+The sim thread and the network meet only through lock-guarded slots in the
+hub, which is why `publish` is O(1) and a dead server costs the simulation
+nothing:
+
+```mermaid
+flowchart LR
+    subgraph sim["Simulation process"]
+        direction TB
+        S["control loop<br/><small>publish(state, frame)<br/>poll_command()</small>"]
+        Q["pending slots<br/><small>reference swap under a short lock</small>"]
+        D["daemon thread (_run)<br/><small>loops at post_hz · 1 s timeouts<br/>errors swallowed at DEBUG</small>"]
+        S -- "O(1), never blocks" --> Q
+        Q -- "latest only; stale dropped" --> D
+    end
+
+    subgraph srv["Server process"]
+        direction TB
+        H["_Handler<br/><small>one per request, ThreadingHTTPServer</small>"]
+        T["TelemetryHub<br/><small>latest state · frame · scene ·<br/>one pending command (read-and-clear)</small>"]
+        H --- T
+    end
+
+    B["browser<br/><small>polls /state every 150 ms</small>"]
+
+    D -- "POST /ingest · /scene · /frame" --> H
+    H -- "GET /cmd-poll → {cmd}" --> D
+    B -- "GET /, /state, /scene, /frame.jpg, /assets/…" --> H
+    B -- "GET /cmd?c=pause|reset|stop" --> H
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
+    class S,Q,D,H,B box;
+    class T accent;
 ```
-  browser ◀── GET /, /state, /scene, /frame.jpg, /assets/… ──┐
-          ──▶ GET /cmd?c=pause|reset|stop ─────────────────────┤
-                                                              ▼
-                                                    DashboardServer
-                                                   (ThreadingHTTPServer,
-                                                    one _Handler per request)
-                                                              │
-                                                        TelemetryHub
-                                                   latest state · frame ·
-                                                   scene · pending command
-                                                              ▲
-     sim process ── DashboardClient ── daemon thread ─────────┤
-       publish()      ref swap          POST /ingest, /scene, /frame
-       poll_command() ref swap          GET  /cmd-poll
-```
+
+With the in-process `Dashboard` the two subgraphs collapse into one process
+and `publish` writes straight into the hub — at the cost described below.
 
 Five classes, in the order the module defines them:
 
@@ -67,11 +96,15 @@ running, hangs or goes away mid-run costs the sim nothing: publishes are
 dropped, `poll_command` returns `None`, the thread stays alive
 (`test_client_survives_missing_server`).
 
-The in-process `Dashboard` has the same interface but one cost: with a
-camera frame, `_encode_jpeg` (numpy plus Pillow, imported lazily; Pillow is
-not a declared dependency) runs on the sim thread. That is why the camera
-panel is opt-in (`--dashboard-camera`) and why the decoupled client is
-the recommended path. Without a frame `Dashboard.publish` is a hub write.
+!!! warning "In-process, a camera frame is encoded on the sim thread"
+
+    `Dashboard.publish(state, frame=...)` calls `_encode_jpeg` (numpy plus
+    Pillow, imported lazily; Pillow is **not** a declared dependency) inline,
+    so every published frame is JPEG time stolen from the control loop. That
+    is why the camera panel is opt-in (`--dashboard-camera`) and why the
+    decoupled `DashboardClient` is the recommended path — it encodes on its
+    own daemon thread. Without a frame, `Dashboard.publish` is just a hub
+    write.
 
 The server side is also O(1) per request: `TelemetryHub.publish` swaps
 the dict, `get_state` copies it and adds bookkeeping keys, `pop_command`
@@ -79,51 +112,55 @@ is read-and-clear so a button press reaches the sim exactly once.
 
 ## Starting it
 
-### Decoupled (recommended): two processes
+=== "Decoupled (recommended)"
 
-```
-# shell 1: the server, bound to 127.0.0.1
-python -m domo.dashboard --port 8080 [--title "DOMO twin"]
+    Two processes: the server outlives the simulation, so restarting a run
+    does not drop the browser tab, and nothing encodes on the sim thread.
 
-# shell 2: the simulation
-python examples/slam/slam_demo.py --headless --device cpu --dashboard-url http://127.0.0.1:8080
-```
+    ```bash
+    # shell 1: the server, bound to 127.0.0.1
+    python -m domo.dashboard --port 8080 --title "DOMO twin"
 
-In code:
+    # shell 2: the simulation
+    python examples/slam/slam_demo.py --headless --device cpu         --dashboard-url http://127.0.0.1:8080
+    ```
 
-```python
-from domo.dashboard import DashboardClient
+    ```python
+    from domo.dashboard import DashboardClient
 
-dash = DashboardClient("http://127.0.0.1:8080", post_hz=20.0).start()
-dash.set_scene(manifest, roots)              # once, before or after start()
-for i in range(steps):
-    cmd = dash.poll_command()                # "pause" | "reset" | "stop" | None
-    ...
-    state = loop.step()
-    if i % 10 == 0:
-        dash.publish(snapshot_dict, frame=None)   # non-blocking
-dash.stop()                                  # sets the stop event; the daemon thread exits
-```
+    dash = DashboardClient("http://127.0.0.1:8080", post_hz=20.0).start()
+    dash.set_scene(manifest, roots)              # once, before or after start()
+    for i in range(steps):
+        cmd = dash.poll_command()                # "pause" | "reset" | "stop" | None
+        ...
+        state = loop.step()
+        if i % 10 == 0:
+            dash.publish(snapshot_dict, frame=None)   # non-blocking
+    dash.stop()                                  # sets the stop event; the thread exits
+    ```
 
-`start()` returns `self` and prints the server command to run if none is
-listening. Open `http://127.0.0.1:8080` in a browser; until a sim pushes,
-the page shows step `0` and `_has_scene: false`.
+    `start()` returns `self` and prints the server command to run if none is
+    listening. Open `http://127.0.0.1:8080` in a browser; until a sim
+    pushes, the page shows step `0` and `_has_scene: false`.
 
-### In-process
+=== "In-process"
 
-```
-python examples/slam/slam_demo.py --headless --device cpu --dashboard 8080 [--dashboard-camera]
-```
+    One process, same five methods. Simpler to wire, but a camera frame is
+    encoded on the sim thread.
 
-```python
-from domo.dashboard import Dashboard
+    ```bash
+    python examples/slam/slam_demo.py --headless --device cpu         --dashboard 8080 --dashboard-camera
+    ```
 
-dash = Dashboard(port=8080, title="DOMO SLAM — arena").start()
-dash.set_scene(manifest, roots)
-dash.publish(snapshot_dict, frame=camera.render())   # frame optional; encoded here
-dash.poll_command()
-dash.stop()                                           # server.shutdown() + close
-```
+    ```python
+    from domo.dashboard import Dashboard
+
+    dash = Dashboard(port=8080, title="DOMO SLAM — arena").start()
+    dash.set_scene(manifest, roots)
+    dash.publish(snapshot_dict, frame=camera.render())   # frame optional; encoded here
+    dash.poll_command()
+    dash.stop()                                           # server.shutdown() + close
+    ```
 
 `serve(port=8080, title="DOMO twin")` is the blocking entry point behind
 `python -m domo.dashboard`; `make_server(port, hub, title)` builds an
@@ -188,11 +225,21 @@ is not strictly inside the registered root
 (`test_resolve_asset_guards_traversal`,
 `test_assets_route_serves_registered_root_only`).
 
+!!! danger "Loopback only, and no authentication whatsoever"
+
+    `BIND_HOST` is `127.0.0.1`, CORS is `*`, and any process that can reach
+    the port can read the telemetry, browse the registered asset roots and
+    press **stop** on a running simulation. That is acceptable for a local
+    viewer on your own machine and is not acceptable anywhere else — do not
+    put it behind a tunnel, a reverse proxy or a `0.0.0.0` bind without
+    adding authentication first.
+
 ## Telemetry payload
 
 The page reads whatever `/state` returns; every key is optional except
 `t`. The hub starts with `{"t": 0}`. `examples/slam/slam_viz.py::slam_snapshot(step, state, slam, lidar=None, cloud_pts=500, status="running")`
-builds a complete one from a `RobotState` and a `SlamSkill` (values
+builds a complete one from a [`RobotState`](robot.md#robotstate) and a
+[`SlamSkill`](control.md#slamskill) (values
 rounded, cloud subsampled to `cloud_pts` points, occupancy grid max-pooled
 to about 60 rows) and is cheap enough to call at a few Hz.
 
@@ -236,7 +283,7 @@ roots = {"robot": "/abs/path/to/go2"}       # the dir that contains urdf/ and me
 absolute directory. The URDF's mesh references are relative, so the root
 must be the directory the URDF resolves them against, i.e. the one
 holding both `urdf/` and `meshes/`. `slam_viz.go2_robot_manifest(spec)`
-returns `(robot_dict, root_dir)` for a `RobotSpec`, locating Genesis'
+returns `(robot_dict, root_dir)` for a [`RobotSpec`](robot.md#robotspec), locating Genesis'
 bundled asset directory when `spec.urdf_path` is relative. The example
 adds a ground plane and a grid itself; `boxes` is for obstacles and walls
 (`slam_demo.arena_manifest_boxes` mirrors `build_arena` box for box).
@@ -265,6 +312,15 @@ command, and `slam_demo.run` is the reference:
 A command is delivered once (`/cmd-poll` clears it) and only when the
 loop asks; a press while the loop is inside a long `scene.step()` is
 picked up at the next poll.
+
+!!! warning "Ctrl+C is a hard kill — the stop button is the graceful path"
+
+    `scene.build()` and `scene.step()` hold the GIL and defer
+    `KeyboardInterrupt`, so the dashboard examples set
+    `signal.signal(signal.SIGINT, signal.SIG_DFL)` at the top of `main()`.
+    Ctrl+C then kills the process outright and **nothing is flushed** — no
+    report, no PNG, no final snapshot. `⏹ stop` breaks the loop cleanly and
+    lets the example finish its reporting.
 
 **Panel chips:** `simulation`, `slam map`, `lidar`, `point cloud`,
 `velocity`, `height/coverage`, `raw telemetry`. All are on by default
@@ -306,19 +362,14 @@ layout, not WebGL.
   the module top to bottom; `make_server` reads the constant. Enforced by
   `test_html_constant_precedes_main_guard`, which also checks that the
   page contains no `"""` (it lives in an `r"""` literal).
-* **Ctrl+C is a hard kill in dashboard examples.** `scene.build()` and
-  `scene.step()` hold the GIL and defer `KeyboardInterrupt`, so the
-  examples set `signal.signal(signal.SIGINT, signal.SIG_DFL)` at the top
-  of `main()`. Nothing is flushed on Ctrl+C; the stop button is the
-  graceful path (report, PNG, final `stopped` snapshot).
+* **Ctrl+C is a hard kill in dashboard examples** ([above](#the-page)).
 * **The camera must be added before `scene.build()`.** `--dashboard-camera`
-  calls `scene.add_camera` in `build_world`; it is a build-time operation.
+  calls [`scene.add_camera`](sim.md#scene) in `build_world`; it is a
+  build-time operation.
 * **No history.** A reconnecting page sees the latest snapshot only;
   charts and the SLAM map fill in from that point. Log to disk in the
   example if you need a record.
-* **Loopback only, no authentication.** `BIND_HOST` is `127.0.0.1` and
-  CORS is `*`, which is fine for a local viewer and would not be for
-  anything else.
+* **Loopback only, no authentication** ([above](#routes)).
 * **Publish cadence is the caller's choice.** `slam_demo` publishes every
   10 control steps (about 5 Hz at 50 Hz control) and on every iteration
   while paused; `post_hz` only bounds the client's background thread.

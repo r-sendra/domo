@@ -9,9 +9,14 @@ This repository contains the `domo` library (the system being built, layer by
 layer) and `scripts/` (frozen standalone experiments the library is distilled
 from — do not import from them).
 
-**Documentation:** start with [docs/getting-started.md](docs/getting-started.md);
-the full guide (architecture, conventions, running, examples, API reference,
-extending, troubleshooting) is indexed in [docs/README.md](docs/README.md).
+**Documentation:** the full guide — install, architecture, conventions,
+running, examples, API reference, extending and troubleshooting — is a
+MkDocs site under [`docs/`](docs/index.md). To read it in a browser:
+
+```bash
+pip install -e '.[docs]'
+mkdocs serve          # http://127.0.0.1:8000
+```
 
 ## Library architecture
 
@@ -123,13 +128,14 @@ Dependency rule: `utils ← {sim, robot, control, tasks}`, `sim ← robot ← ta
 
 ```bash
 conda activate domo
-pip install -e '.[dev]'
+pip install -e '.[genesis,dev]'
 
-# Engine-free tests (a few seconds)
+# Engine-free tests (~10 s)
 pytest tests/
 
-# The digital twin on CPU: a compiled skill program drives the robot around a square
-python examples/basic_examples/skill_demo.py policies/walk.pt --headless --device cpu --steps 500
+# A compiled skill program drives the robot around a 2 m square (about 60 s on CPU).
+# Add --steps 500 for a 10 s smoke run that starts the route without finishing it.
+python examples/basic_examples/skill_demo.py policies/walk.pt --headless --device cpu
 
 # Train the CPG gait everything else uses (GPU), then evaluate it
 python examples/locomotion/go2_cpg_rl.py --n-envs 4096 --device cuda --headless

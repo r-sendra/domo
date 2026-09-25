@@ -24,6 +24,8 @@ langchain = ["langgraph", "langchain-core", "langchain-openai"]
 gemini-langchain = ["langchain-google-genai"]
 voice = ["openai-whisper", "sounddevice"]
 dev = ["pytest", "ruff"]
+# Documentation site (mkdocs build / mkdocs serve); see docs/.
+docs = ["mkdocs-material", "mkdocs-glightbox"]
 
 [tool.setuptools.packages.find]
 include = ["domo*"]

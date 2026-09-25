@@ -1,21 +1,22 @@
-# `domo.sim` — simulation interfaces and backends
+# domo.sim
 
 `domo.sim` is the bottom of the physics stack: the abstract contract every
-other layer codes against, plus the Genesis backend that implements it. It
-sits directly above `domo.utils` and below `domo.robot` (see
-[architecture.md](../architecture.md)).
+other layer codes against, plus the Genesis backend that implements it. The
+one rule it enforces is that **`domo/sim/genesis_backend.py` is the only
+module in the library that imports a physics engine.**
 
-The rule it enforces: **`domo/sim/genesis_backend.py` is the only module in
-the library that imports a physics engine.** Everything a backend returns to
-callers is a `torch.Tensor` of shape `[n_envs, ...]` on the simulation
-device or one of the handle types defined in `domo.sim.base`. Callers never
-see an engine object, so the engine can be swapped (or replaced by the real
-robot) without touching behaviour code.
+Everything a backend hands back is a `torch.Tensor` of shape `[n_envs, ...]`
+on the simulation device, or one of the handle types defined in
+`domo.sim.base`. Callers never see an engine object, so the engine can be
+swapped — or replaced by the real robot — without touching behaviour code.
+The package sits directly above `domo.utils` and below
+[`domo.robot`](robot.md); see
+[architecture](../concepts/architecture.md) for the whole stack.
 
-Conventions in force throughout (from [conventions.md](../conventions.md)):
-quaternions are `wxyz`; batched quantities are `[N, ...]` torch tensors on
-the sim device; world frame unless the name says otherwise; SI units, with
-degrees only in fields named `*_deg`.
+Conventions in force throughout (from
+[conventions](../concepts/conventions.md)): quaternions are `wxyz`; batched
+quantities are `[N, ...]` torch tensors on the sim device; world frame unless
+the name says otherwise; SI units, with degrees only in fields named `*_deg`.
 
 ## Module map
 
@@ -49,12 +50,29 @@ does not import `genesis`, so the control, skills and RL layers work on a
 machine without any physics engine installed. Only the call to
 `create_engine("genesis")` triggers the import.
 
-```python
-from domo.sim import create_engine, SimConfig
+=== "Genesis"
 
-engine = create_engine("genesis", device="cuda")   # falls back to CPU silently if no GPU
-scene = engine.create_scene(SimConfig(dt=0.02, headless=True))
-```
+    ```python
+    from domo.sim import create_engine, SimConfig
+
+    engine = create_engine("genesis", device="cuda")   # falls back to CPU silently if no GPU
+    scene = engine.create_scene(SimConfig(dt=0.02, headless=True))
+    ```
+
+=== "A custom backend"
+
+    ```python
+    from domo.sim import create_engine, register_backend, SimConfig
+
+    register_backend("fake", lambda **kw: FakeEngine(**kw))   # (1)!
+
+    engine = create_engine("fake", device="cpu")
+    scene = engine.create_scene(SimConfig(dt=0.02, headless=True))
+    ```
+
+    1.  `FakeEngine` is the in-memory template under
+        [Adding a backend](#adding-a-backend); nothing above `domo.sim`
+        changes.
 
 ### `register_backend`
 
@@ -141,7 +159,8 @@ def set_position(self, pos: torch.Tensor, envs_idx: torch.Tensor | None = None) 
 ```
 
 Teleports the body. `pos` is `[len(envs_idx), 3]` world positions (m);
-`envs_idx=None` writes all envs. This is how `ObstacleArena.randomise`
+`envs_idx=None` writes all envs. This is how
+[`ObstacleArena.randomise`](world-and-services.md#obstaclearena)
 re-scatters obstacles per env after build.
 
 ### `Articulation`
@@ -172,7 +191,8 @@ that order too.
 
 **Optional capabilities** — non-abstract, default implementation raises
 `NotImplementedError`. Callers probe them and degrade gracefully
-(`SimContactSensor.available`, `DomainRandomization.apply`) so the same
+([`SimContactSensor.available`](robot.md#simulated-proprioception),
+[`DomainRandomization.apply`](robot.md#domainrandomization)) so the same
 code runs on every backend.
 
 | Method | Meaning |
@@ -191,8 +211,8 @@ def set_joint_position_targets(self, targets: torch.Tensor, dof_idx: Sequence[in
 ```
 
 `set_pd_gains` sets per-DOF gains shared by all envs (called once by
-`PDJointPositionActuator`). `targets` is `[N, len(dof_idx)]` desired joint
-angles for the engine's PD loop.
+[`PDJointPositionActuator`](robot.md#actuators)). `targets` is
+`[N, len(dof_idx)]` desired joint angles for the engine's PD loop.
 
 **Resets** (abstract)
 
@@ -206,7 +226,7 @@ def zero_all_velocities(self, envs_idx: torch.Tensor) -> None
 * `set_base_pose` takes `pos [len(envs_idx), 3]` and `quat [len(envs_idx), 4]`
   wxyz and **does not zero velocities** — a pose write alone never hides a
   velocity reset (or the lack of one). Call `zero_all_velocities` explicitly;
-  `Robot.reset_idx` does.
+  [`Robot.reset_idx`](robot.md#refresh-set_joint_targets-reset_idx) does.
 * `set_joint_positions` writes `[len(envs_idx), len(dof_idx)]` angles and
   zeroes the joint velocities of those envs by default.
 * `zero_all_velocities` zeroes base and joint velocities of the given envs.
@@ -222,10 +242,14 @@ Has a `config: LidarConfig` attribute.
 | `read_ranges() -> Tensor` | `[N, n_vertical, n_horizontal]` raw beam ranges clamped to `max_range`; **channel 0 is the lowest-elevation beam**, azimuth 0 is the start of the horizontal FOV |
 | `read_points() -> (Tensor, Tensor)` | optional: world-frame hit points `[N, n_beams, 3]` and their ranges `[N, n_beams]`, `n_beams = n_horizontal × n_vertical`, flattened in the **backend's native beam order**. Default raises `NotImplementedError` |
 
-Rules for `read_points`: pair each point with its *own* returned range,
-never with `read_ranges()` (the two are laid out differently). Beams that
-did not hit anything within `max_range` are still present; mask them with
-`ranges >= max_range`.
+!!! danger "`read_ranges()` and `read_points()` are laid out differently"
+
+    `read_ranges()` is the normalised grid `[N, n_vertical, n_horizontal]`.
+    `read_points()` stays in the backend's native flattened beam order and
+    returns *its own* ranges. Pair each point with the range that came back
+    beside it; indexing the cloud with the grid silently mixes unrelated
+    beams. Beams that hit nothing within `max_range` are still present —
+    mask them with `ranges >= max_range`.
 
 Backends whose engine returns another layout must normalise `read_ranges`
 with `lidar_ranges_to_grid` — see [Lidar layout](#lidar-layout).
@@ -243,6 +267,24 @@ added first, then `build(n_envs)` is called exactly once; afterwards only
 `step()`, queries and per-env state writes are allowed. This mirrors
 Genesis/Isaac build semantics, and every scene builder in `domo.scenes`
 follows it (construct before build, randomise after).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Constructed: engine.create_scene(cfg)
+    Constructed --> Constructed: add_ground / add_terrain / add_box /<br/>add_mesh / add_urdf_prop / add_articulation /<br/>add_lidar / add_camera
+    Constructed --> Built: build(n_envs)<br/>exactly once
+    Built --> Built: step() · handle queries ·<br/>per-env writes (set_base_pose, set_position, …)
+    Built --> [*]
+
+    note right of Constructed
+        n_envs == 0
+        no state to read yet
+    end note
+    note right of Built
+        adding an entity here
+        is an error
+    end note
+```
 
 Attribute `n_envs: int` is `0` until `build`.
 
@@ -280,9 +322,14 @@ Entry point of a backend: initialises the engine and creates scenes.
 | `device -> torch.device` | property; the device simulation state tensors live on |
 | `create_scene(cfg: SimConfig) -> Scene` | a new, un-built scene |
 
-The device reported here is the one every handle returns tensors on;
-`World` and `Robot` read it from the engine rather than trusting the
-requested string (see the CPU fallback under [Gotchas](#gotchas)).
+!!! warning "`device=\"cuda\"` can silently give you CPU"
+
+    Genesis falls back to CPU without an error when no GPU is present, so
+    the string you asked for is not necessarily the device your tensors
+    live on. Read `engine.device` — that is what
+    [`World`](world-and-services.md#domoworld) and
+    [`Robot`](robot.md#robot) do, and it is the device every handle returns
+    tensors on.
 
 ## `lidar_ranges_to_grid`
 
@@ -326,6 +373,14 @@ through unconverted.
 | `GenesisRigidObject(entity)` | box/cylinder/sphere/mesh/URDF prop | `set_position` → `entity.set_pos` |
 | `GenesisLidar(sensor, cfg, device)` | `gs.sensors.Lidar` with `SphericalPattern` | normalises the azimuth-major buffer; `read_points` returns world-frame points (`return_world_frame=True`) |
 | `GenesisCamera(cam)` | `scene.add_camera(..., GUI=False)` | `render()` unpacks the `(rgb, depth, seg, normal)` tuple when several outputs are enabled |
+
+!!! warning "One Genesis per process, one `build()` per scene"
+
+    `gs.init` may only run once per process, so a job that needs a second
+    engine needs a second process — that is why
+    [`domo.eureka`](eureka.md#the-worker-protocol) trains every candidate in
+    its own subprocess. A scene likewise builds exactly once; adding
+    entities afterwards is an error.
 
 Domain-randomisation capabilities are implemented: friction ratio is
 broadcast over all links, mass and COM shifts target link index 0 (the
@@ -471,7 +526,7 @@ Checklist for a real backend:
 4. Report the real `device` (after any fallback) from `PhysicsEngine.device`.
 5. Keep engine knowledge (deprecated APIs, merged links, ...) in comments
    next to the code that depends on it, and in
-   [troubleshooting.md](../troubleshooting.md#genesis).
+   [troubleshooting](../guides/troubleshooting.md#genesis).
 
 ## Gotchas
 
@@ -521,4 +576,4 @@ remain paired; never index it with the `read_ranges()` grid.
 * `add_camera` renders offscreen (`GUI=False`) and costs frame time every
   `render()`; only the dashboard and evaluation scripts call it.
 
-See also [troubleshooting.md](../troubleshooting.md#genesis).
+See also [troubleshooting](../guides/troubleshooting.md#genesis).

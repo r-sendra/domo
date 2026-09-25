@@ -1,26 +1,47 @@
-# `domo.tasks` — vectorised, reward-bearing environments
+# domo.tasks
 
-A task is a temporary lens over the simulation: it builds a scene and a
-robot with the same builders the goal-free `World` uses, adds rewards,
-resets, termination and (optionally) a fixed success metric, and steps
-thousands of environments in lockstep behind a gym-like tensor API. It is
-the only thing `domo.rl` and `domo.eureka` ever see; it never imports a
-physics engine (only `domo.sim` interfaces through `domo.robot` and
-`domo.world`).
+A task is a temporary, reward-bearing lens over the simulation: it builds a
+scene and a robot with the same builders the goal-free
+[`World`](world-and-services.md#domoworld) uses, adds rewards, resets,
+termination and (optionally) a fixed success metric, and steps thousands of
+environments in lockstep behind a gym-like tensor API. The one rule it
+enforces is the **legged-gym step order**, in which finished envs are reset
+*before* rewards and observations are computed.
 
+`domo.tasks` is the only thing [`domo.rl`](rl.md) and
+[`domo.eureka`](eureka.md) ever see, and it never imports a physics engine —
+it reaches [`domo.sim`](sim.md) only through [`domo.robot`](robot.md) and
+`domo.world`.
+
+```mermaid
+flowchart TB
+    A["apply(actions)<br/><small>clip · scale · latency → robot.set_joint_targets</small>"]
+    B["engine step<br/><small>scene.step(), one control dt</small>"]
+    C["refresh<br/><small>sensors → RobotState, sensor.tick()</small>"]
+    D["termination<br/><small>fall / bounds / budget → reset_buf, extras['time_outs']</small>"]
+    E["reset_idx(finished)<br/><small>respawn, re-randomise, zero buffers</small>"]
+    F["compute_rewards()<br/><small>registry or injected override</small>"]
+    G["observations<br/><small>obs_buf for the NEXT action</small>"]
+    A --> B --> C --> D --> E --> F --> G
+    G -. "return obs, None, rew, reset_flags, extras" .-> A
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
+    class A,B,C,D,F,G box;
+    class E accent;
 ```
-domo.sim (engine handles) → domo.robot (sensors/actuators/state)
-    → domo.tasks (THIS: VecTask environments)
-        → domo.rl (PPO) / domo.eureka (reward injection) / examples
-```
 
-Every task follows the **legged-gym order** inside `step`: apply the action,
-step physics, refresh the state, decide which envs are finished, reset
-those envs *before* computing rewards and observations, then return. A
-finished env is therefore scored on its fresh spawn state and the policy's
-next observation already belongs to the new episode. The trainer sees the
-reset through `reset_flags` and the truncation-vs-failure distinction
-through `extras["time_outs"]`.
+!!! warning "Finished envs are reset before their reward is computed"
+
+    This is the legged-gym convention and it is load-bearing, not an
+    accident. A finished env is therefore **scored on its fresh spawn
+    state**, and the observation the policy receives already belongs to the
+    new episode. A reward term that reads the state directly (height,
+    tilt, velocity) will read the spawn pose on the step an episode ends,
+    so terminal penalties belong in the termination logic, not in a reward
+    that samples the state. The trainer sees the reset through
+    `reset_flags` and the truncation-vs-failure distinction through
+    `extras["time_outs"]`.
 
 Four tasks exist today. Two of them build their scene directly with
 `domo.sim.create_engine`; the other two sit on top of a `domo.world.World`
@@ -120,8 +141,8 @@ override installed, `compute_rewards` calls `fn(task)` and uses the returned
 `reward [N]` verbatim (**no dt scaling**), stores the components in
 `reward_components` and accumulates them in `episode_sums` under their own
 names; the registered terms are untouched. `None` restores the registry.
-This is the hook `domo.eureka` uses to inject an LLM-generated reward
-([eureka.md](eureka.md)).
+This is the hook [`domo.eureka`](eureka.md) uses to inject an LLM-generated
+reward.
 
 ### Success metric and bookkeeping
 
@@ -161,7 +182,7 @@ step count is a multiple of `int(resampling_time_s / dt)` (step 0 included;
 `reset_idx` resamples those itself). `fall_termination` tests
 `|euler[:, 1]| > pitch_limit`, `|euler[:, 0]| > roll_limit` and, when given,
 `base_pos[:, 2] < height_limit`; the angles are the intrinsic X-Y-Z Euler
-features of `RobotState` ([conventions.md](../conventions.md)).
+features of `RobotState` ([conventions](../concepts/conventions.md)).
 
 ---
 
@@ -254,12 +275,20 @@ when `n_envs` exceeds the tile count; the spawn height is
 
 ### Build and step
 
+!!! warning "`Go2WalkTask.reset()` returns the stale `obs_buf`"
+
+    Legged-gym behaviour, preserved on purpose: the first observation after
+    a full reset is whatever the last `step` produced — zeros on a fresh
+    task, the previous episode's last observation otherwise. It is not the
+    spawn state. The CPG, avoid and get-up tasks all return a fresh
+    observation instead, so do not generalise this one.
+
 ```python
 import torch
 from domo.tasks import Go2WalkConfig, Go2WalkTask
 
 task = Go2WalkTask(Go2WalkConfig(n_envs=4, device="cpu"))
-obs, _ = task.reset()                                    # stale obs_buf, see limitations
+obs, _ = task.reset()                                    # stale obs_buf, see above
 obs, _, rew, reset, extras = task.step(torch.zeros(4, 12))
 ```
 
@@ -270,8 +299,9 @@ obs, _, rew, reset, extras = task.step(torch.zeros(4, 12))
 Velocity tracking where the policy modulates per-leg oscillators
 (Bellegarda & Ijspeert, *CPG-RL*, RA-L 2022). The oscillators and the
 closed-form IK live in `domo.control` ([control.md](control.md#cpg)), so
-the same stack drives the frozen policy at deployment (`CPGLocomotionSkill`)
-and inside `Go2AvoidTask`. The 76-dim observation is the canonical
+the same stack drives the frozen policy at deployment
+([`CPGLocomotionSkill`](control.md#cpglocomotionskill)) and inside
+`Go2AvoidTask`. The 76-dim observation is the canonical
 interface of every CPG checkpoint (`policies/walk.pt`, `runs/go2_cpg/*`).
 
 ```python
@@ -366,16 +396,28 @@ obs, _, rew, reset, extras = task.step(torch.zeros(4, 12))
 ## `Go2AvoidTask`
 
 Learned velocity corrections around a frozen CPG locomotion policy. Two
-decoupled layers:
+decoupled layers — only the upper one learns:
 
-```
-lidar (36 sectors) → avoidance policy → (Δvx, Δvy, Δvyaw)
-base command + correction → FROZEN CPG policy (CPGLocomotionSkill) → joint targets
+```mermaid
+flowchart LR
+    L["SimulatedLidar<br/><small>36 sectors, normalised</small>"]
+    A["avoidance policy<br/><small>TRAINED · obs [N,36] → (Δvx, Δvy, Δvyaw)</small>"]
+    B["base_command<br/><small>(0.6, 0, 0)</small>"]
+    S["+ and clamp"]
+    W["CPGLocomotionSkill<br/><small>FROZEN policy + oscillators + IK</small>"]
+    J["joint targets [N, 12]"]
+    L --> A --> S
+    B --> S --> W --> J
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
+    class L,B,S,W,J box;
+    class A accent;
 ```
 
 The locomotion policy is a plain callable injected at construction; the
-task never loads checkpoints (that wiring is `domo.checkpoints` /
-`domo.policies`). The task does not own the simulation either: it is a
+task never loads checkpoints (that wiring is
+[`domo.checkpoints` / `domo.policies`](world-and-services.md#domocheckpoints)). The task does not own the simulation either: it is a
 reward-bearing lens over a `domo.world.World`, so
 `world_from_avoid_config(cfg)` spawns the twin in the identical environment
 ([world-and-services.md](world-and-services.md#domocheckpoints)).
@@ -390,7 +432,8 @@ class Go2AvoidTask(VecTask):
 ```
 
 After construction `task.world`, `task.scene`, `task.robot`, `task.lidar`
-(a `SimulatedLidar`) and `task.arena` (arena mode only) are exposed.
+(a [`SimulatedLidar`](robot.md#simulatedlidar)) and `task.arena`
+([arena mode](world-and-services.md#obstaclearena) only) are exposed.
 
 ### `Go2AvoidConfig`
 
@@ -444,6 +487,13 @@ produces the joint targets.
 | `smoothness` | `−0.05` | `‖correction_t − correction_{t−1}‖²` | no jitter |
 | `command_tracking` | `3.0` | `clamp((d − 0.9) / 0.5, 0, 1) · exp(−2 ‖correction‖²)` | prefer the base command when clear; gated so it never fights a needed turn |
 
+!!! note "The collision term is only ever paid once"
+
+    `d < d_collision` (0.25 m) is both the flat `2.0` collision penalty
+    and the termination condition, so an episode that triggers it ends on
+    the same step. The term is a terminal cost, not a gradient that pushes
+    the policy away from contact; the `danger` zone above it does that work.
+
 ### Termination
 
 Fall (tilt / height as above); in arena mode `|x|` or `|y|` beyond
@@ -475,11 +525,18 @@ obs, _, rew, reset, extras = task.step(torch.zeros(4, 3))
 
 ## `Go2GetUpTask`
 
-The reward-injection target for Eureka. The robot spawns fallen (random
-side, random yaw, scrambled joints) and must right itself and hold a
-standing pose. The task ships with **no reward**: `rew_buf` stays zero until
-`set_reward_override` installs one. What it does fix, outside the generated
-code's reach, is the success metric and a dense fitness proxy.
+The reward-injection target for [Eureka](eureka.md). The robot spawns
+fallen (random side, random yaw, scrambled joints) and must right itself and
+hold a standing pose.
+
+!!! danger "This task ships with no reward at all"
+
+    `rew_buf` stays zero until `set_reward_override` installs one, and
+    `step` calls `compute_rewards()` **only** when an override is present.
+    That is deliberate: a stray built-in term could leak into candidate
+    training and contaminate the search. What the task does fix, outside the
+    generated code's reach, is `compute_success` and the dense
+    `compute_fitness` proxy — the metrics a generated reward cannot game.
 
 ```python
 class Go2GetUpTask(VecTask):
@@ -602,22 +659,23 @@ print(task.compute_success(), extras["success"], task.episode_outcomes[-3:])
 
 ## Known limitations
 
-* **`Go2WalkTask.reset()` returns the stale `obs_buf`** (legged-gym
-  behaviour): the first observation after a full reset is whatever the last
-  `step` produced (zeros on a fresh task). The CPG, avoid and get-up tasks
-  return a fresh observation of the spawn state.
+* **`Go2WalkTask.reset()` returns the stale `obs_buf`**
+  ([above](#build-and-step)).
 * **`Go2GetUpTask.episode_outcomes` grows without bound.** Workers slice the
   tail; a long evaluation loop should clear it periodically.
-* **Rough terrain and the arena draw from numpy's global RNG** (Genesis'
-  terrain generator and `ObstacleArena.randomise` use `np.random`), so
-  `torch.manual_seed` alone does not make those runs reproducible; seed
-  `np.random.seed` too.
+* **Two different global RNGs drive scene randomisation.**
+  `ObstacleArena.randomise` draws through `torch.rand`, so obstacle layouts
+  follow `torch.manual_seed`. Rough terrain is generated inside Genesis,
+  which uses `np.random`, so heightfields follow `np.random.seed` (with
+  `TerrainConfig.randomize=False`, Genesis seeds numpy itself). Seed both to
+  make a run reproducible; see
+  [running.md](../guides/running.md#reproducibility).
 * **Time-outs are terminal for the trainer.** `extras["time_outs"]` is
   produced but `domo.rl`'s GAE does not bootstrap on it
   ([rl.md](rl.md#known-limitations)).
 * **Foot contacts are a phase proxy on the bundled Go2.** The URDF has no
   foot links, so `robot.contact_sensor` is `None` and `obs[48:52]` of the
   CPG observation is the oscillator stance mask
-  ([troubleshooting.md](../troubleshooting.md#genesis)).
+  ([troubleshooting](../guides/troubleshooting.md#genesis)).
 * **The locomotion tasks define no `compute_success`** and cannot be Eureka
   targets as they stand.

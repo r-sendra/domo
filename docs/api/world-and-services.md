@@ -1,24 +1,22 @@
-# `domo.world`, `domo.scenes`, `domo.policies`, `domo.checkpoints`, `domo.utils`
+# domo.world & services
 
 This page covers the packages that assemble the foundation into a running
-twin and the small services around it:
+twin and the small services around it. The one rule they enforce is that **a
+scene is built the same way by every consumer**: the `World`, the vectorised
+[training tasks](tasks.md) and any future LLM-generated layout call the same
+builders through the [`domo.sim.Scene`](sim.md#scene) contract, so a skill
+evaluated in the twin sees the world it was trained in (see
+[architecture](../concepts/architecture.md)).
 
-* `domo.utils` — pure-torch quaternion math, the bottom of the stack.
-* `domo.scenes` — engine-agnostic scene builders (obstacle arena, ReplicaCAD
-  houses), between `domo.robot` and `domo.tasks`.
-* `domo.world` — `World`: engine + scene + robot + sensors, goal-free; the
-  top of the stack and the resident entry point of the system.
-* `domo.checkpoints` — checkpoint I/O and config reconstruction for both
-  checkpoint formats.
-* `domo.policies` — the stable-policy registry: blessed checkpoints by name.
+| Package | Owns | Sits |
+|---------|------|------|
+| `domo.utils` | pure-torch quaternion math (`wxyz`) | the bottom of the stack, below `domo.sim` |
+| `domo.scenes` | engine-agnostic scene builders: obstacle arena, ReplicaCAD houses | between `domo.robot` and `domo.tasks` |
+| `domo.world` | `World`: engine + scene + robot + sensors, goal-free | the top of the stack, the resident entry point |
+| `domo.checkpoints` | checkpoint I/O and config reconstruction, both formats | beside `domo.rl`, engine-free |
+| `domo.policies` | the stable-policy registry: blessed checkpoints by name | above `domo.checkpoints` |
 
 `domo.dashboard` has its own page, [dashboard.md](dashboard.md).
-
-The rule these packages enforce: **a scene is built the same way by every
-consumer.** The `World`, the vectorised training tasks and any future
-LLM-generated layout call the same builders through the `domo.sim.Scene`
-contract, so a skill evaluated in the twin sees the world it was trained in
-(see [architecture.md](../architecture.md)).
 
 ## Module map
 
@@ -49,7 +47,7 @@ unconverted; a backend with `xyzw` must convert inside the backend.
 | `quat_mul` | `(u, v) -> Tensor` | Hamilton product `u ⊗ v`; applying it rotates **first by `v`, then by `u`** (`R_u @ R_v`) |
 | `quat_apply` | `(q [..., 4], v [..., 3]) -> [..., 3]` | rotate `v` by `q`: `v' = R(q) v` — **body → world** for a body-orientation `q` |
 | `quat_apply_inverse` | `(q, v) -> [..., 3]` | rotate by the inverse — **world → body** |
-| `quat_to_euler_xyz` | `(q) -> [..., 3]` | **intrinsic X-Y-Z** Euler angles `(roll, pitch, yaw)` (rad), `R = Rx · Ry · Rz`; matches Genesis `quat_to_xyz(rpy=False)` and fills `RobotState.base_euler` |
+| `quat_to_euler_xyz` | `(q) -> [..., 3]` | **intrinsic X-Y-Z** Euler angles `(roll, pitch, yaw)` (rad), `R = Rx · Ry · Rz`; matches Genesis `quat_to_xyz(rpy=False)` and fills [`RobotState.base_euler`](robot.md#robotstate) |
 | `quat_to_rpy` | `(q) -> [..., 3]` | aerospace roll-pitch-yaw, intrinsic Z-Y-X, `R = Rz · Ry · Rx` |
 
 The two Euler conventions agree for pure single-axis rotations and differ
@@ -109,10 +107,16 @@ class ObstacleArena:
 
 The constructor adds four wall boxes and every obstacle body to the
 un-built scene. All obstacles are **fixed** (the robot cannot push them)
-and exist in every env; they are created **parked at `(99, 99)`**, far
-outside the arena, so a fresh build has an empty arena until the first
-`randomise()`. Per-env variety comes purely from teleporting them, since
-entity counts are fixed at build time.
+and exist in every env.
+
+!!! warning "A freshly built arena is empty until you randomise it"
+
+    Entity counts are fixed at build time, so every obstacle is created
+    **parked at `(99, 99)`**, far outside the arena, and per-env variety
+    comes purely from teleporting them afterwards. Call
+    `arena.randomise(...)` — or [`World.randomise_obstacles()`](#domoworld)
+    — after `scene.build()`, or the robot walks through an empty room and
+    the lidar sees nothing.
 
 `randomise(envs_idx, device)` re-scatters every obstacle for the given envs:
 an independent polar position per obstacle and env (uniform angle, uniform
@@ -207,7 +211,7 @@ training tasks build their own `WorldConfig` from their task config.
 | `kp` / `kd` | `100.0` / `2.0` | joint PD gains passed to `Robot` |
 | `base_init_pos` | `(0.0, 0.0, 0.35)` | spawn position (m); its xy is the arena ring centre |
 | `base_init_yaw_deg` | `0.0` | spawn yaw, converted to a `wxyz` quaternion about z |
-| `lidar_model` | `generic_sector_lidar()` | `LidarModelConfig`; **`None` → no lidar** |
+| `lidar_model` | `generic_sector_lidar()` | [`LidarModelConfig`](robot.md#lidarmodelconfig); **`None` → no lidar** |
 | `lidar_sectors` | `36` | sectors exposed by `World.lidar.read()` |
 | `camera_res` | `None` | `(w, h)` of an optional offscreen camera; `None` → none |
 | `camera_pos` / `camera_lookat` | `(4, -4, 3)` / `(0, 0, 0.3)` | camera placement; FOV is `viewer.camera_fov` |
@@ -219,18 +223,26 @@ class World:
     def __init__(self, cfg: WorldConfig, n_envs: int = 1, spec: RobotSpec = GO2)
 ```
 
-Construction order is fixed and mirrors engine build semantics:
+Construction order is fixed and mirrors engine build semantics — everything
+before `build()` adds entities, everything after binds to them:
 
-```
-create_engine(cfg.engine, device=cfg.device)
-  → engine.create_scene(SimConfig(...))
-  → environment entities for cfg.scene_kind      (_build_environment)
-  → Robot(spec, scene, device, kp, kd, base_init_pos, yaw quaternion)
-  → scene.add_lidar(...)  if cfg.lidar_model     (must precede build)
-  → scene.add_camera(...) if cfg.camera_res
-  → scene.build(n_envs)
-  → robot.bind(n_envs)
-  → SimulatedLidar(handle, cfg.lidar_model, n_envs, cfg.lidar_sectors, device, cfg.dt)
+```mermaid
+flowchart TB
+    E["create_engine(cfg.engine, device=cfg.device)"]
+    SC["engine.create_scene(SimConfig(…))"]
+    ENV["_build_environment(cfg.scene_kind)<br/><small>flat · rough · arena · replica</small>"]
+    RB["Robot(spec, scene, device, kp, kd,<br/>base_init_pos, yaw quaternion)"]
+    LD["scene.add_lidar(…)<br/><small>if cfg.lidar_model</small>"]
+    CAM["scene.add_camera(…)<br/><small>if cfg.camera_res</small>"]
+    B["scene.build(n_envs)"]
+    BIND["robot.bind(n_envs)"]
+    SL["SimulatedLidar(handle, model, n_envs,<br/>cfg.lidar_sectors, device, cfg.dt)"]
+    E --> SC --> ENV --> RB --> LD --> CAM --> B --> BIND --> SL
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
+    class E,SC,ENV,RB,LD,CAM,BIND,SL box;
+    class B accent;
 ```
 
 An unknown `scene_kind` raises `ValueError("unknown scene_kind ...")`.
@@ -247,6 +259,14 @@ An unknown `scene_kind` raises `ValueError("unknown scene_kind ...")`.
 | `lidar` | `SimulatedLidar \| None` | when a lidar model is configured |
 | `camera` | `CameraHandle \| None` | when `camera_res` is set |
 | `sensors` | `list[SimulatedLidar]` | property: exteroceptive sensors the control loop must tick (`[lidar]` or `[]`) |
+
+!!! warning "Use `World.device`, not `cfg.device`"
+
+    `cfg.device` is what you *asked* for; `World.device` is what the engine
+    gave you, after Genesis' silent CPU fallback
+    ([sim.md](sim.md#physicsengine)). Every tensor handed to the robot, a
+    skill or a control loop must be built on `World.device`, or the first
+    op that mixes them raises a device mismatch deep inside a skill.
 
 Methods:
 
@@ -291,7 +311,7 @@ with the 76-dim CPG observation loads regardless of provenance.
 | `pick_device` | `(requested: str) -> str` | `"cpu"` when `"cuda"` is requested but unavailable |
 | `load_checkpoint` | `(path: str, device: str) -> dict` | `torch.load(..., weights_only=False, map_location=device)` — checkpoints carry pickled dataclasses |
 | `load_locomotion_policy` | `(path: str, device: str) -> (policy_fn, net)` | frozen CPG velocity-tracking policy from either format; `policy_fn(obs) -> action` is deterministic, `net` has `requires_grad=False` everywhere |
-| `configs_from_checkpoint` | `(ckpt: dict, kind: str) -> (task_cfg, PPOConfig)` | `kind` is `"cpg_walk"` or `"avoid"`; see formats below |
+| `configs_from_checkpoint` | `(ckpt: dict, kind: str) -> (task_cfg, PPOConfig)` | `kind` is `"cpg_walk"` or `"avoid"`; see formats below, and [rl.md](rl.md#checkpoints) for what a checkpoint holds |
 | `cpg_walk_config_from_dict` | `(d: dict) -> Go2CPGWalkConfig` | nested `cpg` dict → `CPGConfig`, lists → tuples |
 | `avoid_config_from_dict` | `(d: dict) -> Go2AvoidConfig` | nested `arena` / `lidar_model` / `cpg` dicts rebuilt; legacy lidar keys migrated |
 | `world_from_avoid_config` | `(task_cfg: Go2AvoidConfig, headless: bool = True) -> World` | the goal-free twin in the environment an avoidance checkpoint was trained in (arena or ReplicaCAD), `n_envs=1` |
@@ -330,7 +350,7 @@ loaders, so `stable_policy` stays import-light.
 | `stable_policy(name: str) -> str` | absolute path; `KeyError` for an unknown name, `FileNotFoundError` when the file has not been copied in yet |
 | `load_stable_locomotion(device: str = "cpu") -> (policy_fn, net)` | `load_locomotion_policy(stable_policy("walk"), device)` |
 | `load_stable_avoid(device: str = "cpu") -> Callable` | `obs → Δv`, deterministic, from the avoidance net (`clean_state_dict` applied) |
-| `stable_go2_library(lidar=None, device: str = "cpu", avoid_deltas=None) -> SkillLibrary` | `make_go2_library(walk_fn, avoid_fn, lidar, ...)`: walk always, avoid (plus the blocked/clear conditions) when a `lidar` with `read() -> [N, n_sectors]` is given, e.g. `World.lidar` |
+| `stable_go2_library(lidar=None, device: str = "cpu", avoid_deltas=None) -> SkillLibrary` | [`make_go2_library`](skills.md#built-in-cards-and-make_go2_library)`(walk_fn, avoid_fn, lidar, ...)`: walk always, avoid (plus the blocked/clear conditions) when a `lidar` with `read() -> [N, n_sectors]` is given, e.g. `World.lidar` |
 
 ```python
 from domo.policies import stable_go2_library
@@ -396,14 +416,20 @@ with `Go2CPGWalkConfig` / `Go2AvoidConfig` defaults for the rest, and the
 (`total_steps=80_000_000`, `rollout_steps=24`, `minibatch_size=8192`,
 `hidden_size=512`, ...). `lr_schedule` is `"linear"` only when the flat dict
 contains `lr_floor_frac`, `"constant"` otherwise; `run_dir` defaults to
-`runs/legacy`. `load_checkpoint` uses `weights_only=False` because
-checkpoints pickle dataclasses — load only files you trust.
+`runs/legacy`.
+
+!!! danger "`load_checkpoint` unpickles arbitrary objects"
+
+    It calls `torch.load(..., weights_only=False)` because DOMO checkpoints
+    store pickled dataclasses (`Go2AvoidConfig`, `CPGConfig`,
+    `LidarModelConfig`) in `extra` and `config`. Loading a checkpoint is
+    therefore equivalent to running its author's code. Load only files you
+    produced or trust.
 
 ### World
 
 * `World.device` is the engine's device, which may be CPU although
-  `cfg.device == "cuda"` (Genesis falls back silently). Use it for every
-  tensor you hand to the robot.
+  `cfg.device == "cuda"` ([above](#world)).
 * The default `WorldConfig` opens a viewer (`headless=False`) and adds a
   generic lidar; pass `headless=True` / `lidar_model=None` explicitly for
   headless or lidar-free runs.
@@ -412,7 +438,7 @@ checkpoints pickle dataclasses — load only files you trust.
 * `scene_kind="replica"` also adds a ground plane at `ground_height` after
   the house; the stage mesh is nudged −5 cm to avoid z-fighting with it.
 * `randomise_obstacles` must be called after construction to populate an
-  arena — obstacles are parked at `(99, 99)` until then.
+  arena ([above](#obstaclearena)).
 
 ### Scenes
 

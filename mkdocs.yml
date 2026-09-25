@@ -1,0 +1,170 @@
+site_name: DOMO
+site_description: >-
+  Developmental Orchestration of Motor-skill Onset — an LLM as a lifelong
+  developmental supervisor for a legged robot.
+site_author: DOMO project
+docs_dir: docs
+site_dir: site
+use_directory_urls: true
+
+theme:
+  name: material
+  language: en
+  font:
+    text: IBM Plex Sans
+    code: IBM Plex Mono
+  icon:
+    logo: material/robot-industrial
+    repo: fontawesome/brands/git-alt
+    annotation: material/plus-circle
+  favicon: assets/favicon.svg
+  palette:
+    # `primary`/`accent` are set to "custom" so Material emits no built-in
+    # colour rules; every value comes from docs/stylesheets/domo.css.
+    # The auto entry carries scheme: domo-light so the server-rendered page
+    # is already themed and nothing flashes before the palette JS runs.
+    - media: "(prefers-color-scheme)"
+      scheme: domo-light
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-auto
+        name: Follow system theme
+    - media: "(prefers-color-scheme: light)"
+      scheme: domo-light
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: domo-dark
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.tooltips
+    - announce.dismiss
+
+extra_css:
+  - stylesheets/domo.css
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: "#"
+      permalink_title: Link to this section
+      toc_depth: 3
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+plugins:
+  - search:
+      separator: '[\s​\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  - glightbox:
+      touchNavigation: true
+      effect: fade
+      zoomable: true
+
+extra:
+  generator: false
+  social:
+    - icon: material/robot-industrial
+      link: https://github.com/
+      name: Unitree Go2 · Genesis · PyTorch
+
+nav:
+  - Home: index.md
+  - Start here:
+      - start/index.md
+      - Install: start/install.md
+      - First run: start/first-run.md
+      - Glossary: start/glossary.md
+  - Concepts:
+      - concepts/index.md
+      - The project: concepts/project.md
+      - Architecture: concepts/architecture.md
+      - Control hierarchy: concepts/control-hierarchy.md
+      - Skill grammar: concepts/grammar.md
+      - Conventions: concepts/conventions.md
+  - Guides:
+      - guides/index.md
+      - Running & training: guides/running.md
+      - Extending DOMO: guides/extending.md
+      - Troubleshooting: guides/troubleshooting.md
+  - Examples:
+      - examples/index.md
+      - Skill demo: examples/skill-demo.md
+      - Digital twin: examples/twin-demo.md
+      - Locomotion (CPG-RL): examples/locomotion.md
+      - Obstacle avoidance: examples/avoidance.md
+      - Avoidance in a house: examples/avoid-house.md
+      - LLM level designer: examples/gemini-design-nav.md
+      - Waypoint navigation: examples/evaluate-nav.md
+      - SLAM in an arena: examples/slam-demo.md
+      - SLAM in an apartment: examples/slam-house.md
+      - Voice commands: examples/voice.md
+      - Eureka get-up: examples/eureka-getup.md
+  - API reference:
+      - api/index.md
+      - domo.sim: api/sim.md
+      - domo.robot: api/robot.md
+      - domo.control: api/control.md
+      - domo.skills: api/skills.md
+      - domo.tasks: api/tasks.md
+      - domo.rl: api/rl.md
+      - domo.eureka: api/eureka.md
+      - domo.llm & domo.hri: api/llm-hri.md
+      - domo.world & services: api/world-and-services.md
+      - domo.dashboard: api/dashboard.md

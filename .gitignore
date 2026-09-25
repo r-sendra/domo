@@ -101,3 +101,6 @@ htmlcov/
 /*.png
 /*.gif
 /*.mp4
+
+# ── Built documentation site ──────────────────────────────────
+/site/

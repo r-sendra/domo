@@ -1,10 +1,15 @@
-# `domo.eureka` — LLM-driven skill learning (Eureka + DrEureka)
+# domo.eureka
 
-`domo.eureka` is the M2 + M3 routine: given a natural-language description
-of a skill and a simulation task with a fixed success metric, an LLM writes
-candidate reward functions, each candidate trains a PPO policy in its own
-subprocess, candidates are ranked on the metric they cannot game, and a
-textual "reward reflection" feeds the next round. Optionally the winner is
+`domo.eureka` is the M2 + M3 routine: given a natural-language description of
+a skill and a [`VecTask`](tasks.md#vectask) with a fixed success metric, an
+LLM writes candidate reward functions, each candidate trains a PPO policy in
+its own subprocess, and candidates are ranked on the metric they cannot game.
+The one rule it enforces is that **the parent process never touches
+physics** — only `worker.py` imports a task, a trainer or an engine, so the
+routine can be driven from the digital twin, a CLI, or a supervisor running
+next to the real robot.
+
+A textual "reward reflection" feeds the next round. Optionally the winner is
 hardened by DrEureka: single-parameter physics sweeps measure how far the
 policy tolerates perturbation, the LLM proposes domain-randomisation ranges
 inside those limits, every proposal is retrained and the best is kept.
@@ -17,117 +22,13 @@ search over reward code, reward reflection from per-component training
 statistics, reward-aware physics prior, train-all-select-best DR) and
 smaller in default budget.
 
-The package sits above `domo.tasks` and `domo.rl` and beside `domo.llm`
-(see [architecture.md](../architecture.md)). It drives tasks through the
+The package sits above [`domo.tasks`](tasks.md) and [`domo.rl`](rl.md) and
+beside [`domo.llm`](llm-hri.md) (see
+[architecture](../concepts/architecture.md)). It drives tasks through the
 `VecTask` API plus two hooks: `set_reward_override` (inject the generated
 reward) and `compute_success` / `compute_fitness` (the fixed metrics).
-Only `worker.py` imports a task, the trainer or an engine; the parent
-process that calls `learn_skill` never touches physics, so the routine can
-be invoked from the digital twin, a CLI, or a supervisor running next to
-the real robot. Everything except the worker runs, and is unit-tested,
-on a machine without Genesis (`tests/test_eureka.py`,
-`tests/test_eureka_routine.py`).
-
-## Quick start
-
-Offline, no API key, a hand-written reward replayed by a scripted client
-(this is what `examples/eureka/eureka_getup.py --llm scripted` does):
-
-```python
-from domo.eureka import EurekaConfig, SkillLearningRequest, learn_skill
-from domo.llm.client import ScriptedClient
-
-REWARD = '''```python
-def compute_reward(task):
-    state = task.robot.state
-    up = torch.clamp(-state.projected_gravity[:, 2], 0.0, 1.0)
-    height = torch.clamp(state.base_pos[:, 2] / 0.30, 0.0, 1.0)
-    energy = -0.0005 * (task.actions - task.last_actions).pow(2).sum(-1)
-    return up * height + energy, {"up": up, "height": height, "energy": energy}
-```'''
-
-request = SkillLearningRequest(
-    skill_name="getup",
-    description="Right itself from a fall and hold a standing posture.",
-    task="go2_getup",
-    eureka=EurekaConfig(iterations=1, samples=1, n_envs=8,
-                        train_steps=2_000, device="cpu"),
-    run_root="runs/eureka")
-skill = learn_skill(request, llm=ScriptedClient([REWARD]))
-print(skill.checkpoint, skill.success_rate)
-```
-
-With a real provider the client is built from the request (Gemini free tier
-needs `GEMINI_API_KEY`; providers are listed in
-[llm-hri.md](llm-hri.md)):
-
-```python
-request = SkillLearningRequest(
-    skill_name="getup",
-    description="Right itself from a fall and hold a standing posture.",
-    eureka=EurekaConfig(iterations=3, samples=4, train_steps=5_000_000),
-    run_dr=True,
-    llm="gemini")                       # or "vllm", llm_kwargs={"model": ...}
-skill = learn_skill(request)
-```
-
-The same two paths from the command line:
-
-```
-# Gemini, GPU, DrEureka stage on the winner
-python examples/eureka/eureka_getup.py --samples 4 --iterations 3 \
-    --train-steps 5000000 --device cuda --dr --dr-samples 8
-
-# CPU smoke run, no key
-python examples/eureka/eureka_getup.py --llm scripted --device cpu \
-    --n-envs 8 --train-steps 2000 --samples 1 --iterations 1
-
-# Watch the result in the twin
-python examples/eureka/eureka_getup.py --demo runs/eureka/getup/iter_2/train_1/checkpoint_final.pt
-```
-
-The example wraps `ScriptedClient` in an `OfflineClient` that answers a
-reward request with the hand-written reward and a DR request with a canned
-JSON block, so `--llm scripted --dr` exercises the whole pipeline offline.
-
-## Pipeline
-
-```
-SkillLearningRequest ──▶ learn_skill(request, llm=None)
-                              │  validate task key; llm = llm or make_client(request)
-                              │  LangGraph driver if use_graph and langgraph imports,
-                              │  else the imperative loop — same stage functions
-                              ▼
-        ┌──── iteration k  (run_iteration → iter_k/) ────────────────────────┐
-        │  prompts.reward_prompt(request, task_spec, reflection, safety)      │
-        │        → prompt.txt                                                 │
-        │  samples × llm.generate(prompt, temperature)                        │
-        │        → extract_reward_code → validate_reward_code                 │
-        │        → candidate_i.py   (rejected replies: CandidateResult.error) │
-        │  train_candidate for each valid candidate                           │
-        │        → build_train_spec → run_worker                              │
-        │        → python -m domo.eureka.worker train_i/spec.json             │
-        │        → train_i/results.json  {success_rate, fitness, snapshots…}  │
-        │  prompts.reflection_block(candidates) → reflection.txt              │
-        └──────────────────────────── repeat cfg.iterations times ────────────┘
-                              │
-                              ▼
-                 select_global_best(history)  by CandidateResult.rank_key
-                 build_learned_skill           (RuntimeError if none ran)
-                              │
-                   run_dr? ───┴──▶ dr.run_dr_eureka(request, skill, llm)   (dr/)
-                                     1. physics_prior   one "dr_eval" worker
-                                     2. propose_dr_configs  LLM × dr.samples
-                                     3. retrain each config, keep best
-                              │
-                              ▼
-                 finalize_skill → <run_root>/<skill>/result.json → LearnedSkill
-```
-
-Each box on the left is one of the shared stage functions in `routine.py`.
-The LangGraph driver (`graph.py`) and the imperative loop call exactly the
-same functions in the same order; `tests/test_eureka_routine.py` asserts
-that both produce identical prompts, worker specs, files and results.
+Everything except the worker runs, and is unit-tested, on a machine without
+Genesis (`tests/test_eureka.py`, `tests/test_eureka_routine.py`).
 
 ## Module map
 
@@ -146,6 +47,116 @@ that both produce identical prompts, worker specs, files and results.
 `SkillLearningRequest`, `CandidateResult`, `IterationResult` and
 `LearnedSkill`. Stage functions, prompts, reward helpers and the DR
 functions are imported from their modules.
+
+## Quick start
+
+=== "Offline (no API key)"
+
+    A hand-written reward replayed by a scripted client — what
+    `examples/eureka/eureka_getup.py --llm scripted` does.
+
+    ```python
+    from domo.eureka import EurekaConfig, SkillLearningRequest, learn_skill
+    from domo.llm.client import ScriptedClient
+
+    REWARD = '''```python
+    def compute_reward(task):
+        state = task.robot.state
+        up = torch.clamp(-state.projected_gravity[:, 2], 0.0, 1.0)
+        height = torch.clamp(state.base_pos[:, 2] / 0.30, 0.0, 1.0)
+        energy = -0.0005 * (task.actions - task.last_actions).pow(2).sum(-1)
+        return up * height + energy, {"up": up, "height": height, "energy": energy}
+    ```'''
+
+    request = SkillLearningRequest(
+        skill_name="getup",
+        description="Right itself from a fall and hold a standing posture.",
+        task="go2_getup",
+        eureka=EurekaConfig(iterations=1, samples=1, n_envs=8,
+                            train_steps=2_000, device="cpu"),
+        run_root="runs/eureka")
+    skill = learn_skill(request, llm=ScriptedClient([REWARD]))
+    print(skill.checkpoint, skill.success_rate)
+    ```
+
+    ```bash
+    python examples/eureka/eureka_getup.py --llm scripted --device cpu \
+        --n-envs 8 --train-steps 2000 --samples 1 --iterations 1
+    ```
+
+=== "Gemini (a real search)"
+
+    The client is built from the request; the free tier needs
+    `GEMINI_API_KEY`. Providers are listed in [llm-hri.md](llm-hri.md).
+
+    ```python
+    request = SkillLearningRequest(
+        skill_name="getup",
+        description="Right itself from a fall and hold a standing posture.",
+        eureka=EurekaConfig(iterations=3, samples=4, train_steps=5_000_000),
+        run_dr=True,
+        llm="gemini")                       # or "vllm", llm_kwargs={"model": ...}
+    skill = learn_skill(request)
+    ```
+
+    ```bash
+    python examples/eureka/eureka_getup.py --samples 4 --iterations 3 \
+        --train-steps 5000000 --device cuda --dr --dr-samples 8
+    ```
+
+Either way, watch the result in the twin:
+
+```bash
+python examples/eureka/eureka_getup.py --demo runs/eureka/getup/iter_2/train_1/checkpoint_final.pt
+```
+
+The example wraps `ScriptedClient` in an `OfflineClient` that answers a
+reward request with the hand-written reward and a DR request with a canned
+JSON block, so `--llm scripted --dr` exercises the whole pipeline offline.
+
+## Pipeline
+
+`learn_skill` validates the task key, builds a client if none was passed,
+and then runs `cfg.iterations` rounds of this:
+
+```mermaid
+flowchart TB
+    PR["reward_prompt(request, task_spec, reflection, safety)<br/><small>→ iter_k/prompt.txt</small>"]
+    GEN["samples × llm.generate(prompt, temperature)"]
+    EX["extract_reward_code → validate_reward_code<br/><small>→ iter_k/candidate_i.py</small>"]
+    BAD["CandidateResult.error<br/><small>no code block · disallowed import · SyntaxError</small>"]
+    TR["train_candidate → build_train_spec → run_worker<br/><small>iter_k/train_i/ · one subprocess each</small>"]
+    RES["results.json<br/><small>success_rate · fitness · snapshots</small>"]
+    RF["reflection_block(candidates)<br/><small>→ iter_k/reflection.txt</small>"]
+    NEXT["next round<br/><small>reflection becomes the feedback section</small>"]
+    SEL["select_global_best(history)<br/><small>by rank_key</small>"]
+    DR["run_dr_eureka<br/><small>optional, on the winner</small>"]
+    FIN["finalize_skill → result.json → LearnedSkill"]
+
+    PR --> GEN --> EX
+    EX -- "rejected" --> BAD --> RF
+    EX -- "valid" --> TR --> RES --> RF
+    RF --> NEXT
+    NEXT -. "after cfg.iterations rounds" .-> SEL
+    SEL --> DR --> FIN
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
+    class PR,GEN,EX,BAD,RES,RF,NEXT,SEL,DR,FIN box;
+    class TR accent;
+```
+
+A rejected reply is never trained but **is** still reported in the
+reflection, so the LLM learns from its own broken code. After the last
+round, `select_global_best(history)` picks by `CandidateResult.rank_key`,
+`build_learned_skill` wraps it (`RuntimeError` if nothing ever ran), the
+optional DrEureka stage runs under `dr/`, and `finalize_skill` writes
+`<run_root>/<skill>/result.json`.
+
+Each box is one of the shared stage functions in `routine.py`. The LangGraph
+driver (`graph.py`) and the imperative loop call exactly the same functions
+in the same order; `tests/test_eureka_routine.py` asserts that both produce
+identical prompts, worker specs, files and results.
 
 ## The request
 
@@ -219,23 +230,34 @@ class EurekaConfig:
 | `worker_timeout_s` | 3600 | wall-clock limit per worker subprocess; expiry becomes a failed candidate | bound this by `train_steps` |
 | `snapshots` | 4 | reward-reflection sample points per training (component means at ~equal intervals) | negligible |
 
-The search costs `iterations × samples` trainings of `train_steps` env-steps
-each, sequentially. A candidate that fails validation is not trained, so
-the real number is usually lower. The PPO block derived from this config
-also fixes `minibatch_size = max(n_envs × rollout_steps // 4, 64)`,
-`guard_nonfinite = True` and `lr_schedule = "linear"`; everything else is
-`PPOConfig`'s default ([rl.md](rl.md)).
+!!! warning "Every knob above multiplies wall-clock"
+
+    The search costs `iterations × samples` trainings of `train_steps`
+    env-steps each, run **sequentially** — a 3 × 4 search at 5 M steps is an
+    hour-scale job on a workstation GPU, and DrEureka with 16 samples
+    doubles it. A candidate that fails validation is not trained, so the
+    real number is usually lower. Set `worker_timeout_s` above one
+    training's wall-clock plus scene build time, or healthy candidates are
+    killed and reported as failures. See
+    [Budget guidance](#budget-guidance).
+
+The PPO block derived from this config also fixes `minibatch_size =
+max(n_envs × rollout_steps // 4, 64)`, `guard_nonfinite = True` and
+`lr_schedule = "linear"`; everything else is
+[`PPOConfig`'s defaults](rl.md#ppoconfig).
 
 ### `DrEurekaConfig`
 
 ```python
 @dataclass
 class DrEurekaConfig:
-    friction_values: list[float] = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0]
-    base_mass_values: list[float] = [-1.0, 0.0, 1.0, 2.0, 3.0, 5.0]
-    com_shift_values: list[float] = [0.0, 0.02, 0.05, 0.1, 0.15]
-    kp_scale_values: list[float] = [0.5, 0.7, 0.85, 1.0, 1.15, 1.3, 1.5]
-    obs_noise_values: list[float] = [0.0, 0.02, 0.05, 0.1]
+    # Mutable defaults are supplied through field(default_factory=...);
+    # the values below are what each factory returns.
+    friction_values:   list[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 1.5, 2.0, 4.0])
+    base_mass_values:  list[float] = field(default_factory=lambda: [-1.0, 0.0, 1.0, 2.0, 3.0, 5.0])
+    com_shift_values:  list[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1, 0.15])
+    kp_scale_values:   list[float] = field(default_factory=lambda: [0.5, 0.7, 0.85, 1.0, 1.15, 1.3, 1.5])
+    obs_noise_values:  list[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1])
     feasible_ratio: float = 0.5
     feasible_floor: float = 0.1
     eval_episodes: int = 32
@@ -264,6 +286,17 @@ class TaskSpec:
 
 TASK_REGISTRY: dict[str, TaskSpec]
 ```
+
+!!! warning "The prompt and the task can drift apart — `go2_getup` already has"
+
+    `TASK_REGISTRY["go2_getup"].success_description` tells the LLM the pose
+    must be held "for 50 consecutive control steps (1 s), within a 5 s
+    episode", while [`Go2GetUpConfig`](tasks.md#go2getupconfig) uses
+    `success_hold_steps = 25` (0.5 s) and `max_episode_steps = 400` (8 s).
+    Nothing checks the two against each other, and a mismatch between
+    `env_interface` and the real task is the commonest cause of rewards
+    that die in the worker's sanity step. Re-read both whenever the task
+    changes.
 
 A `TaskSpec` tells the worker how to build the task
 (`importlib.import_module(module)`, then
@@ -346,8 +379,10 @@ best DR-retrained policy and `dr_config` / `dr_success_rate` describe it;
 physics. `history` holds every round. `summary()` is the multi-line report
 printed at the end of a run (checkpoint, success, DR config, and per-round
 success rates with `ERR` for failed candidates). To deploy, load the
-checkpoint with `ActorCritic.from_state_dict` and wrap it in a
-`LearnedJointSkill` as `examples/eureka/eureka_getup.py --demo` does.
+checkpoint with [`ActorCritic.from_state_dict`](rl.md#actorcritic) and wrap
+it in a [`LearnedJointSkill`](control.md#learnedjointskill) as
+`examples/eureka/eureka_getup.py --demo` does — that is how an M3 output
+enters the [M5 library](skills.md#add-a-card-to-the-library).
 
 ## Entry points and stage functions
 
@@ -491,23 +526,58 @@ def load_reward_fn(code: str) -> Callable                # fn(task) -> (reward [
   in the worker's sanity step and lands in the reflection instead of
   silently corrupting training.
 
-The `exec` is deliberate. The namespace restriction and the static guard
-protect against accidents (an LLM that writes `open()` or `import numpy`
-out of habit), not against an adversary: Python builtins remain reachable.
-The design relies on three facts instead of isolation: generated code only
-ever runs inside the worker subprocess, never in the caller's process; the
-validator rejects the constructs an accidental escape would need; and the
-wrapper type-checks every output. If untrusted LLM providers are ever used,
-run the worker in a container.
+The `exec` is deliberate; see
+[the warning under the worker protocol](#the-worker-protocol) for what the
+guard does and does not cover.
 
 ## The worker protocol
 
 The parent writes a spec, spawns `python -m domo.eureka.worker
-<run_dir>/spec.json` and reads `<run_dir>/results.json`. One process per
-job because Genesis initialises once per process. The worker always writes
-`results.json`: on any exception it is `{"error": "<traceback>"}`, and the
-traceback is the payload the reflection shows the LLM (an undefined task
-field, a shape error).
+<run_dir>/spec.json` and reads `<run_dir>/results.json`. One process per job
+because [Genesis initialises once per process](sim.md#the-genesis-backend).
+Two JSON files on disk are the entire protocol — there is no pipe, no
+shared memory and no return code.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as parent (routine.py)
+    participant FS as run_dir on disk
+    participant W as worker subprocess
+
+    P->>FS: write spec.json
+    P->>W: sys.executable -m domo.eureka.worker spec.json
+    Note over P,W: timeout = cfg.worker_timeout_s
+    W->>FS: read spec.json
+    W->>W: load_reward_fn(reward_code_file)
+    W->>W: build task · set_reward_override(fn)
+    W->>W: one sanity step with zero actions
+    W->>W: PPOTrainer(...).train()<br/>snapshots via update_callback
+    W->>W: deterministic evaluation, eval_episodes
+    W->>FS: write results.json
+    W-->>P: exit (code ignored)
+    P->>FS: read results.json
+
+    alt worker crashed or timed out
+        P->>P: {"error": "worker timeout after Ns"} or output tail
+        Note right of P: a failed candidate,<br/>never an exception
+    end
+```
+
+The worker always tries to write `results.json`: on any exception it is
+`{"error": "<traceback>"}`, and that traceback is the payload the reflection
+shows the LLM (an undefined task field, a shape error). `results.json` is
+the contract; the exit code is ignored.
+
+!!! danger "Generated code is `exec`'d — the guard is against accidents, not adversaries"
+
+    `load_reward_fn` rejects `__`, `open(`, `exec(`, `eval(` and
+    `subprocess`, allows only `torch` and `math` as imports, and
+    type-checks every call's output. Python builtins remain reachable, so
+    this stops an LLM that writes `import os` out of habit, not a hostile
+    one. The design relies on the generated code running **only inside the
+    worker subprocess**, never in the caller's process. If you point the
+    routine at an untrusted provider, run the worker in a container.
 
 ### Spec, mode `"train"` (from `build_train_spec`)
 
@@ -726,7 +796,7 @@ and samples it `dr.samples` times at temperature 0.8. Each reply goes
 through `extract_json_block`, `json.loads`, clamping into the feasible
 bounds (ranges clipped inward, `obs_noise_std` capped at its feasible
 maximum, unswept keys such as `kd_scale_range` passed through) and
-`DomainRandomization.from_dict`. Unparseable replies are skipped. If
+[`DomainRandomization.from_dict`](robot.md#domainrandomization). Unparseable replies are skipped. If
 nothing parsed, the feasible bounds themselves become the single fallback
 config (zero-width ranges dropped, `obs_noise_std` set to its maximum), with
 a console note.
@@ -780,20 +850,17 @@ TASK_REGISTRY["go2_jump"] = TaskSpec(
 it; `env_interface` lists every `task` attribute the generated code may
 read, with shapes and units. Both are pasted verbatim into the prompt, and
 a mismatch between them and the task is the most common cause of rewards
-that fail in the sanity step. `domo.tasks.go2_getup` is the reference
-implementation ([tasks.md](tasks.md)).
+that fail in the sanity step. [`domo.tasks.go2_getup`](tasks.md#go2getuptask) is the reference
+implementation.
 
 ## Known limitations
 
 These are documented, not fixed:
 
-* **Prompt / metric drift on the get-up task.**
-  `TASK_REGISTRY["go2_getup"].success_description` tells the LLM the pose
-  must be held "for 50 consecutive control steps (1 s), within a 5 s
-  episode", while `Go2GetUpConfig` uses `success_hold_steps = 25` (0.5 s)
-  and `max_episode_steps = 400` (8 s). The reflection's hold diagnosis
-  ("needs ~25") and the console line use 25. The docstring of
-  `examples/eureka/eureka_getup.py` also still says "held 1 s".
+* **Prompt / metric drift on the get-up task**
+  ([above](#taskspec-and-task_registry)). The reflection's hold diagnosis
+  ("needs ~25") and the console line use 25; the docstring of
+  `examples/eureka/eureka_getup.py` still says "held 1 s".
 * **The DR fallback is never empty.** `propose_dr_configs` always adds
   `obs_noise_std` to the fallback (its feasible maximum, possibly 0.0), so
   even when nothing is randomisable Stage 3 retrains once with an effective
@@ -837,5 +904,5 @@ the spawn pose. Use it to check prompts, run-dir layout and a new
 a workstation GPU; a 3 × 4 search is therefore an hour-scale job and
 DrEureka with 16 samples doubles it. The LLM cost is `iterations × samples`
 reward calls plus `dr.samples` DR calls, each with a 16 384-token output
-budget; see [troubleshooting.md](../troubleshooting.md#llm-providers) for
+budget; see [troubleshooting](../guides/troubleshooting.md#llm-providers) for
 truncated Gemini replies.

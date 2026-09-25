@@ -1,0 +1,596 @@
+/* ==========================================================================
+   DOMO documentation theme
+   Steel-blue structure, safety-orange accent, squared engineering shapes.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Colour schemes
+   -------------------------------------------------------------------------- */
+
+[data-md-color-scheme="domo-light"] {
+  --domo-steel: #33566f;
+  --domo-steel-deep: #26404f;
+  --domo-orange: #c4511d;
+  --domo-orange-soft: #fbeee7;
+  --domo-rule: #d8dce1;
+  --domo-rule-soft: #e6e9ed;
+  --domo-paper: #f4f5f7;
+  --domo-surface: #ffffff;
+  --domo-ink: #1b1f24;
+  --domo-ink-soft: #55606c;
+
+  --md-default-fg-color: #1b1f24;
+  --md-default-fg-color--light: #55606c;
+  --md-default-fg-color--lighter: #8b95a1;
+  --md-default-fg-color--lightest: #e6e9ed;
+  --md-default-bg-color: #ffffff;
+
+  --md-primary-fg-color: var(--domo-steel-deep);
+  --md-primary-fg-color--light: var(--domo-steel);
+  --md-primary-fg-color--dark: #1d3240;
+  --md-primary-bg-color: #f2f5f7;
+  --md-primary-bg-color--light: #c8d4dc;
+
+  --md-accent-fg-color: var(--domo-orange);
+  --md-accent-fg-color--transparent: rgba(196, 81, 29, 0.1);
+
+  --md-typeset-color: #1b1f24;
+  --md-typeset-a-color: #2f5570;
+
+  --md-code-bg-color: #f1f3f5;
+  --md-code-fg-color: #24292f;
+  --md-code-hl-comment-color: #7b8794;
+  --md-code-hl-keyword-color: #8a3a12;
+  --md-code-hl-string-color: #2d6a4f;
+  --md-code-hl-number-color: #9a3b6b;
+  --md-code-hl-function-color: #2f5570;
+
+  --md-footer-bg-color: #26404f;
+  --md-footer-bg-color--dark: #1d3240;
+
+  --md-shadow-z1: 0 1px 2px rgba(27, 31, 36, 0.07);
+  --md-shadow-z2: 0 2px 8px rgba(27, 31, 36, 0.1);
+
+  /* Material defines these on :root; a custom scheme must redefine every one
+     of them or the unset ones leak the stock palette into the other theme. */
+  --md-default-bg-color--light: rgba(255, 255, 255, 0.7);
+  --md-default-bg-color--lighter: rgba(255, 255, 255, 0.3);
+  --md-default-bg-color--lightest: rgba(255, 255, 255, 0.12);
+  --md-code-bg-color--light: rgba(241, 243, 245, 0.7);
+  --md-code-bg-color--lighter: rgba(241, 243, 245, 0.3);
+  --md-code-hl-color: #4287ff;
+  --md-code-hl-color--light: rgba(66, 135, 255, 0.1);
+  --md-code-hl-name-color: var(--md-code-fg-color);
+  --md-code-hl-constant-color: #6e59d9;
+  --md-code-hl-special-color: #db1457;
+  --md-code-hl-operator-color: var(--md-default-fg-color--light);
+  --md-code-hl-punctuation-color: var(--md-default-fg-color--light);
+  --md-code-hl-generic-color: var(--md-default-fg-color--light);
+  --md-code-hl-variable-color: var(--md-default-fg-color--light);
+  --md-admonition-fg-color: var(--md-default-fg-color);
+  --md-admonition-bg-color: var(--md-default-bg-color);
+  --md-warning-fg-color: #1b1f24;
+  --md-warning-bg-color: #fff3cd;
+  --md-typeset-table-color: rgba(27, 31, 36, 0.12);
+  --md-typeset-table-color--light: rgba(27, 31, 36, 0.035);
+  --md-typeset-kbd-color: #fafafa;
+  --md-typeset-kbd-accent-color: #ffffff;
+  --md-typeset-kbd-border-color: #b8b8b8;
+  --md-typeset-mark-color: rgba(229, 121, 63, 0.28);
+  --md-typeset-del-color: rgba(245, 80, 61, 0.15);
+  --md-typeset-ins-color: rgba(11, 213, 112, 0.15);
+  --md-footer-fg-color: #f2f5f7;
+  --md-footer-fg-color--light: rgba(242, 245, 247, 0.7);
+  --md-footer-fg-color--lighter: rgba(242, 245, 247, 0.45);
+  --md-shadow-z3: 0 4px 14px rgba(27, 31, 36, 0.16);
+}
+
+[data-md-color-scheme="domo-dark"] {
+  color-scheme: dark;
+
+  --domo-steel: #7fa8c6;
+  --domo-steel-deep: #12161a;
+  --domo-orange: #e5793f;
+  --domo-orange-soft: #31241d;
+  --domo-rule: #2f363e;
+  --domo-rule-soft: #262c33;
+  --domo-paper: #15181c;
+  --domo-surface: #1b1f24;
+  --domo-ink: #e3e6ea;
+  --domo-ink-soft: #a9b2bc;
+
+  --md-default-fg-color: #e3e6ea;
+  --md-default-fg-color--light: #a9b2bc;
+  --md-default-fg-color--lighter: #78828d;
+  --md-default-fg-color--lightest: #2f363e;
+  --md-default-bg-color: #15181c;
+
+  --md-primary-fg-color: #12161a;
+  --md-primary-fg-color--light: #1b1f24;
+  --md-primary-fg-color--dark: #0e1114;
+  --md-primary-bg-color: #e3e6ea;
+  --md-primary-bg-color--light: #a9b2bc;
+
+  --md-accent-fg-color: var(--domo-orange);
+  --md-accent-fg-color--transparent: rgba(229, 121, 63, 0.14);
+
+  --md-typeset-color: #e3e6ea;
+  --md-typeset-a-color: #8fb4d2;
+
+  --md-code-bg-color: #1d2228;
+  --md-code-fg-color: #dbe0e6;
+  --md-code-hl-comment-color: #7b8794;
+  --md-code-hl-keyword-color: #e5934f;
+  --md-code-hl-string-color: #8fc9a5;
+  --md-code-hl-number-color: #d98cb3;
+  --md-code-hl-function-color: #8fb4d2;
+
+  --md-footer-bg-color: #0e1114;
+  --md-footer-bg-color--dark: #0b0e10;
+
+  /* Same completeness requirement as the light scheme: every Material
+     variable that is not redefined here falls back to the stock LIGHT
+     value on :root, which is how a light admonition ends up on a dark page. */
+  --md-default-bg-color--light: rgba(21, 24, 28, 0.7);
+  --md-default-bg-color--lighter: rgba(21, 24, 28, 0.3);
+  --md-default-bg-color--lightest: rgba(21, 24, 28, 0.12);
+  --md-code-bg-color--light: rgba(29, 34, 40, 0.7);
+  --md-code-bg-color--lighter: rgba(29, 34, 40, 0.3);
+  --md-code-hl-color: #8fb4d2;
+  --md-code-hl-color--light: rgba(143, 180, 210, 0.14);
+  --md-code-hl-name-color: var(--md-code-fg-color);
+  --md-code-hl-constant-color: #b9a2ef;
+  --md-code-hl-special-color: #e58fb0;
+  --md-code-hl-operator-color: var(--md-default-fg-color--light);
+  --md-code-hl-punctuation-color: var(--md-default-fg-color--light);
+  --md-code-hl-generic-color: var(--md-default-fg-color--light);
+  --md-code-hl-variable-color: var(--md-default-fg-color--light);
+  --md-admonition-fg-color: var(--md-default-fg-color);
+  --md-admonition-bg-color: var(--md-default-bg-color);
+  --md-warning-fg-color: #e3e6ea;
+  --md-warning-bg-color: #3a3220;
+  --md-typeset-table-color: rgba(227, 230, 234, 0.14);
+  --md-typeset-table-color--light: rgba(227, 230, 234, 0.04);
+  --md-typeset-kbd-color: #262c33;
+  --md-typeset-kbd-accent-color: #2f363e;
+  --md-typeset-kbd-border-color: #171a1e;
+  --md-typeset-mark-color: rgba(229, 121, 63, 0.35);
+  --md-typeset-del-color: rgba(245, 80, 61, 0.2);
+  --md-typeset-ins-color: rgba(11, 213, 112, 0.2);
+  --md-footer-fg-color: #e3e6ea;
+  --md-footer-fg-color--light: rgba(227, 230, 234, 0.7);
+  --md-footer-fg-color--lighter: rgba(227, 230, 234, 0.45);
+  --md-shadow-z1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --md-shadow-z2: 0 2px 8px rgba(0, 0, 0, 0.5);
+  --md-shadow-z3: 0 4px 14px rgba(0, 0, 0, 0.6);
+}
+
+/* --------------------------------------------------------------------------
+   Typography
+   -------------------------------------------------------------------------- */
+
+.md-typeset {
+  font-size: 0.79rem;
+  line-height: 1.68;
+}
+
+.md-typeset h1 {
+  font-weight: 600;
+  font-size: 1.85rem;
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+  color: var(--md-default-fg-color);
+  text-wrap: balance;
+  margin-bottom: 0.6em;
+}
+
+.md-typeset h2 {
+  font-weight: 600;
+  font-size: 1.28rem;
+  letter-spacing: -0.008em;
+  margin-top: 2.2em;
+  padding-top: 0.6em;
+  border-top: 1px solid var(--domo-rule-soft);
+  text-wrap: balance;
+}
+
+.md-typeset h3 {
+  font-weight: 600;
+  font-size: 1.02rem;
+  margin-top: 1.7em;
+}
+
+.md-typeset h4 {
+  font-weight: 600;
+  font-size: 0.86rem;
+  color: var(--md-default-fg-color--light);
+  text-transform: none;
+}
+
+.md-typeset h1 code,
+.md-typeset h2 code,
+.md-typeset h3 code {
+  font-size: 0.92em;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+/* Lede: the first paragraph after the page title reads as a stand-first. */
+.md-typeset h1 + p {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--md-default-fg-color--light);
+}
+
+.md-typeset strong {
+  font-weight: 600;
+  color: var(--md-default-fg-color);
+}
+
+/* --------------------------------------------------------------------------
+   Header, tabs, navigation
+   -------------------------------------------------------------------------- */
+
+.md-header {
+  box-shadow: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.md-header__title {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.md-tabs {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.md-tabs__link {
+  opacity: 0.78;
+  font-size: 0.72rem;
+  letter-spacing: 0.01em;
+}
+
+.md-tabs__link--active,
+.md-tabs__link:hover {
+  opacity: 1;
+}
+
+.md-nav {
+  font-size: 0.7rem;
+}
+
+.md-nav__title {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 0.62rem;
+  color: var(--md-default-fg-color--light);
+}
+
+.md-nav__link--active,
+.md-nav__item .md-nav__link--active {
+  font-weight: 600;
+  color: var(--md-accent-fg-color);
+}
+
+/* Section labels in the left sidebar read as small caps rules. */
+.md-nav--secondary .md-nav__title {
+  box-shadow: none;
+  border-bottom: 1px solid var(--domo-rule-soft);
+}
+
+/* --------------------------------------------------------------------------
+   Links
+   -------------------------------------------------------------------------- */
+
+.md-typeset a {
+  text-decoration-color: color-mix(in srgb, currentColor 35%, transparent);
+  text-underline-offset: 0.18em;
+}
+
+.md-typeset a:hover,
+.md-typeset a:focus {
+  color: var(--md-accent-fg-color);
+  text-decoration-color: currentColor;
+}
+
+/* --------------------------------------------------------------------------
+   Code
+   -------------------------------------------------------------------------- */
+
+.md-typeset code {
+  border-radius: 2px;
+  padding: 0.1em 0.34em;
+  font-size: 0.84em;
+}
+
+.md-typeset pre > code {
+  border-radius: 0;
+  border: 1px solid var(--domo-rule);
+  border-left: 3px solid var(--domo-steel);
+  font-size: 0.76rem;
+  line-height: 1.6;
+}
+
+[data-md-color-scheme="domo-dark"] .md-typeset pre > code {
+  border-color: var(--domo-rule);
+  border-left-color: var(--domo-steel);
+}
+
+.md-typeset .highlighttable .linenos {
+  border-radius: 0;
+}
+
+.md-clipboard {
+  color: var(--md-default-fg-color--lighter);
+}
+
+.md-clipboard:hover {
+  color: var(--md-accent-fg-color);
+}
+
+/* --------------------------------------------------------------------------
+   Tables — technical data, so: hairlines, tabular figures, no zebra
+   -------------------------------------------------------------------------- */
+
+.md-typeset table:not([class]) {
+  border: 1px solid var(--domo-rule);
+  border-radius: 0;
+  box-shadow: none;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.md-typeset table:not([class]) th {
+  background: var(--domo-paper);
+  color: var(--md-default-fg-color);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border-bottom: 1px solid var(--domo-rule);
+  white-space: nowrap;
+}
+
+.md-typeset table:not([class]) td {
+  border-top: 1px solid var(--domo-rule-soft);
+  vertical-align: top;
+}
+
+.md-typeset table:not([class]) tr:hover {
+  background: var(--md-accent-fg-color--transparent);
+}
+
+.md-typeset table:not([class]) code {
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------------------
+   Admonitions — squared, quieter, one accent stripe
+   -------------------------------------------------------------------------- */
+
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: 0;
+  border: 1px solid var(--domo-rule);
+  border-left-width: 3px;
+  box-shadow: none;
+  font-size: 0.74rem;
+}
+
+.md-typeset .admonition-title,
+.md-typeset summary {
+  border-radius: 0;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.md-typeset .admonition.note,
+.md-typeset details.note {
+  border-left-color: var(--domo-steel);
+}
+
+.md-typeset .admonition.warning,
+.md-typeset details.warning,
+.md-typeset .admonition.danger,
+.md-typeset details.danger {
+  border-left-color: var(--domo-orange);
+}
+
+/* --------------------------------------------------------------------------
+   Tabs (CPU / GPU command variants)
+   -------------------------------------------------------------------------- */
+
+.md-typeset .tabbed-labels > label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.md-typeset .tabbed-set > input:checked + label {
+  color: var(--md-accent-fg-color);
+  border-color: var(--md-accent-fg-color);
+}
+
+/* --------------------------------------------------------------------------
+   Landing page: hero + grid cards
+   -------------------------------------------------------------------------- */
+
+.domo-hero {
+  border: 1px solid var(--domo-rule);
+  border-top: 3px solid var(--domo-orange);
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--domo-steel) 6%, transparent) 0%,
+      transparent 55%
+    ),
+    var(--md-default-bg-color);
+  padding: 2rem 1.9rem 1.7rem;
+  margin-bottom: 2.4rem;
+}
+
+.domo-hero .domo-eyebrow {
+  display: block;
+  font-family: var(--md-code-font-family, monospace);
+  font-size: 0.64rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--domo-orange);
+  margin-bottom: 0.7rem;
+}
+
+.md-typeset .domo-hero h1 {
+  font-size: 2.05rem;
+  margin: 0 0 0.5rem;
+  border: none;
+  padding: 0;
+}
+
+.md-typeset .domo-hero p {
+  max-width: 62ch;
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--md-default-fg-color--light);
+}
+
+.md-typeset .domo-hero .md-button {
+  border-radius: 0;
+  border-width: 1px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.42em 1.1em;
+  margin: 0.6rem 0.5rem 0 0;
+}
+
+.md-typeset .domo-hero .md-button--primary {
+  background: var(--domo-orange);
+  border-color: var(--domo-orange);
+  color: #fff;
+}
+
+.md-typeset .domo-hero .md-button--primary:hover {
+  background: color-mix(in srgb, var(--domo-orange) 85%, black);
+  border-color: color-mix(in srgb, var(--domo-orange) 85%, black);
+  color: #fff;
+}
+
+/* Stat strip under the hero */
+.domo-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 1px;
+  background: var(--domo-rule);
+  border: 1px solid var(--domo-rule);
+  margin: -1.6rem 0 2.4rem;
+}
+
+.domo-stats > div {
+  background: var(--md-default-bg-color);
+  padding: 0.85rem 1rem;
+}
+
+.domo-stats .domo-stat-value {
+  display: block;
+  font-size: 1.18rem;
+  font-weight: 600;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  color: var(--domo-steel);
+}
+
+[data-md-color-scheme="domo-dark"] .domo-stats .domo-stat-value {
+  color: var(--domo-steel);
+}
+
+.domo-stats .domo-stat-label {
+  display: block;
+  font-size: 0.66rem;
+  color: var(--md-default-fg-color--light);
+  margin-top: 0.15rem;
+}
+
+/* Grid cards: squared, hairline, accent on hover */
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid > .card {
+  border-radius: 0;
+  border: 1px solid var(--domo-rule);
+  box-shadow: none;
+  padding: 1rem 1.1rem;
+  transition: border-color 120ms, transform 120ms;
+}
+
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--domo-orange);
+  box-shadow: none;
+  transform: translateY(-1px);
+}
+
+.md-typeset .grid.cards > ul > li > hr {
+  margin: 0.6em 0;
+  border-color: var(--domo-rule-soft);
+}
+
+.md-typeset .grid.cards .twemoji,
+.md-typeset .grid.cards .md-icon svg {
+  fill: var(--domo-orange);
+}
+
+/* --------------------------------------------------------------------------
+   Mermaid diagrams
+   -------------------------------------------------------------------------- */
+
+.md-typeset .mermaid {
+  margin: 1.4em 0;
+  padding: 0.8rem;
+  border: 1px solid var(--domo-rule-soft);
+  background: var(--md-default-bg-color);
+  overflow-x: auto;
+}
+
+/* --------------------------------------------------------------------------
+   Footer
+   -------------------------------------------------------------------------- */
+
+.md-footer-meta {
+  font-size: 0.68rem;
+}
+
+.md-footer__link {
+  opacity: 0.85;
+}
+
+/* --------------------------------------------------------------------------
+   Small screens
+   -------------------------------------------------------------------------- */
+
+@media screen and (max-width: 44.9375em) {
+  .domo-hero {
+    padding: 1.4rem 1.1rem 1.2rem;
+  }
+
+  .md-typeset .domo-hero h1 {
+    font-size: 1.55rem;
+  }
+
+  .domo-stats {
+    margin-top: -1.2rem;
+  }
+}
+
+/* Print: drop the chrome, keep the content readable. */
+@media print {
+  .domo-hero,
+  .domo-stats {
+    border: none;
+    padding: 0;
+  }
+}
+
+/* Four-card blocks: force a 2x2 grid on wide screens so no card is orphaned
+   on a row of its own. Narrow screens keep Material's auto-fit behaviour. */
+@media screen and (min-width: 60em) {
+  .md-typeset .grid.cards.domo-2up > ul {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}

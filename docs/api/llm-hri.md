@@ -1,23 +1,23 @@
-# `domo.llm` and `domo.hri` — LLM clients and the voice interface
+# domo.llm & domo.hri
 
-Two small packages that sit beside `domo.eureka` in the layer stack (see
-[architecture.md](../architecture.md)). `domo.llm` is the only place the
-library talks to a language model: one interface, several providers, two
-parsing helpers. `domo.hri` is the M6 precursor, the human side of the
-loop: a microphone thread that turns speech into a velocity command the
-control loop reads every step.
+Two small packages that sit beside [`domo.eureka`](eureka.md) in the layer
+stack. `domo.llm` is the only place the library talks to a language model:
+one interface, several providers, two parsing helpers. `domo.hri` is the M6
+precursor, the human side of the loop: a microphone thread that turns speech
+into a velocity command the control loop reads every step. The one rule they
+enforce is that **every SDK is imported lazily** — `import domo.llm` and
+`import domo.hri` succeed on a bare install, and nothing in the core library
+needs either package.
 
-Neither package is needed by the core library. Every SDK (`google-genai`,
-LangChain, Whisper, `sounddevice`) is imported inside a constructor or a
-function body, so `import domo.llm` and `import domo.hri` succeed on a bare
-install and the tests in `tests/test_llm_client.py` run without a key or a
-network.
-
-How Eureka drives a client (prompts, retries around candidate generation,
+`google-genai`, LangChain, Whisper and `sounddevice` are all imported inside
+a constructor or a function body, which is why the tests in
+`tests/test_llm_client.py` run without a key or a network. How Eureka drives
+a client (prompts, retries around candidate generation,
 `SkillLearningRequest.llm` / `llm_kwargs`) is documented in
-[eureka.md](eureka.md) and not repeated here. Provider-specific failures
+[eureka.md](eureka.md) and not repeated here; provider-specific failures
 (empty Gemini replies, unreachable vLLM) are in
-[troubleshooting.md, LLM providers](../troubleshooting.md#llm-providers).
+[troubleshooting](../guides/troubleshooting.md#llm-providers). See
+[architecture](../concepts/architecture.md) for where these sit.
 
 ## Module map
 
@@ -57,7 +57,7 @@ constructor listed below. An unknown name raises `ValueError`.
 | `vllm` | `vllm_client` | vLLM's OpenAI-compatible server through `langchain_openai.ChatOpenAI` | `VLLM_BASE_URL` (default `http://localhost:8000/v1`) | `model` required, `api_key="EMPTY"` (ignored by vLLM), `max_tokens=16384`, 600 s request timeout | `pip install -e ".[langchain]"` |
 | `openai` | `openai_client` | OpenAI or any OpenAI-compatible gateway (`base_url`) through `ChatOpenAI` | `OPENAI_API_KEY` | `model="gpt-4o-mini"`, `max_tokens=16384`, 600 s timeout | `pip install -e ".[langchain]"` |
 | `gemini-lc` (alias `gemini_langchain`) | `gemini_langchain_client` | `langchain_google_genai.ChatGoogleGenerativeAI` | `GEMINI_API_KEY` | `model="gemini-2.5-flash"`, `max_tokens=16384` | `pip install -e ".[langchain,gemini-langchain]"` |
-| `scripted` | `ScriptedClient` | none | — | `responses=[...]`; without the kwarg a single `"-"` reply | — |
+| `scripted` | `ScriptedClient` | none | — | `responses=[...]`; `make_llm` substitutes `["-"]` when the kwarg is missing, so the client itself never sees an empty list | — |
 
 ```python
 from domo.llm import make_llm
@@ -85,13 +85,18 @@ exception (free-tier 429s and transport errors surface as different
 classes across SDK versions) with a 5 s wait that doubles per attempt; the
 last attempt's exception propagates.
 
-`gemini-2.5-flash` is a thinking model: reasoning tokens count against
-`max_output_tokens`, which is why the default is 16 384 rather than the
-8 192 that produced empty replies. The reply text is extracted defensively
-(`response.text`, then the concatenated candidate parts, then `""`), and
-when the finish reason is `MAX_TOKENS` a warning is printed naming the
-budget. The remedy is a larger `max_output_tokens` (the model caps at
-65 536), not a retry.
+!!! warning "Reasoning tokens count against `max_output_tokens`"
+
+    `gemini-2.5-flash` is a thinking model, so a budget that looks generous
+    can be consumed entirely by reasoning and return an **empty reply** —
+    which is why the default is 16 384 rather than the 8 192 that produced
+    exactly that. When the finish reason is `MAX_TOKENS` a warning is
+    printed naming the budget. The remedy is a larger `max_output_tokens`
+    (the model caps at 65 536), not a retry: retrying spends quota to
+    reproduce the same truncation.
+
+The reply text is extracted defensively (`response.text`, then the
+concatenated candidate parts, then `""`).
 
 ### `LangChainClient`
 
@@ -176,8 +181,8 @@ ScriptedClient.calls        # every prompt received, in order
 Replays `responses` in order and cycles when exhausted; an empty list
 raises `ValueError`. `calls` records each prompt so a test can assert on
 what the routine asked. This is how `tests/test_eureka*.py` and
-`examples/eureka/eureka_getup.py --llm scripted` run the full pipeline
-with no key and no network.
+[`examples/eureka/eureka_getup.py --llm scripted`](eureka.md#quick-start)
+run the full pipeline with no key and no network.
 
 When one canned list is not enough, subclass and answer by prompt kind.
 The Eureka example does exactly this to serve a reward for reward prompts
@@ -221,20 +226,25 @@ A port of `scripts/house_scene/voice_commander.py`. One daemon thread
 listens to the microphone; the only object it shares with the control loop
 is a `CommandState`.
 
-```
-microphone ──record_audio──▶ 3 s mono float32 @ 16 kHz
-                                  │
-                                  ▼  RMS < silence_threshold → skip
-                              transcribe (Whisper, local, fp16=False)
-                                  │
-                                  ▼  fewer than 3 characters → skip
-                       parse_with_gemini(text, current)
-                       gemini-2.5-flash, T=0.1, 200 tokens, SYSTEM_PROMPT
-                                  │
-                                  ▼  description == "no change" → keep current
-                       CommandState.set(vx, vy, vyaw)   clipped, marks changed
-                                  │
-          control loop, every step: vx, vy, vyaw = state.get()
+```mermaid
+flowchart TB
+    M["microphone<br/><small>record_audio → 3 s mono float32 @ 16 kHz</small>"]
+    W["transcribe<br/><small>Whisper, local, fp16=False</small>"]
+    G["parse_with_gemini(text, current)<br/><small>gemini-2.5-flash · T=0.1 · 200 tokens · SYSTEM_PROMPT</small>"]
+    S["CommandState.set(vx, vy, vyaw)<br/><small>clipped to the class bounds, marks changed</small>"]
+    L["control loop, every step<br/><small>vx, vy, vyaw = state.get()</small>"]
+    M -- "RMS ≥ silence_threshold" --> W
+    M -. "too quiet — skip" .-> M
+    W -- "≥ 3 characters" --> G
+    W -. "too short — skip" .-> M
+    G -- "a locomotion command" --> S
+    G -. "description == 'no change'<br/>keep current" .-> M
+    S --> L
+
+    classDef box fill:none,stroke:#33566f,stroke-width:1px;
+    classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
+    class M,W,G,L box;
+    class S accent;
 ```
 
 Transient errors (a mic hiccup, a network fault, non-JSON from the model)
@@ -256,7 +266,8 @@ class CommandState:
 ```
 
 `set` clips to the class bounds before storing, so a mis-parsed command can
-never exceed what the locomotion policy was trained for. `pop_changed` is
+never exceed what [the locomotion policy](tasks.md#go2cpgwalktask) was
+trained for. `pop_changed` is
 a one-shot flag for control loops that want to react only on a new
 command (log it, re-plan) rather than on every step; `get` is what a loop
 that simply forwards the command calls. All three take the same lock.
@@ -305,9 +316,18 @@ export GEMINI_API_KEY=<key from aistudio.google.com/app/apikey>
 ```
 
 All three are imported lazily; a missing one raises `ImportError` with the
-`pip install` hint at the first call that needs it (Whisper when the
-thread starts, `sounddevice` at the first recording, `google-genai` at the
-first parse). A microphone and internet access are required.
+`pip install` hint at the first call that needs it (Whisper when the thread
+starts, `sounddevice` at the first recording, `google-genai` at the first
+parse).
+
+!!! note "`domo.hri` cannot be smoke-tested"
+
+    The voice path needs a real microphone, a local Whisper model and
+    network access to Gemini, so no test covers it end to end and
+    `examples/hri/go2_cpg_rl_voice.py` is the only way to exercise it. The
+    three stage functions (`record_audio`, `transcribe`,
+    `parse_with_gemini`) are plain functions precisely so a text-only or
+    pre-recorded pipeline can be built without the thread.
 
 ### Example
 
@@ -319,8 +339,9 @@ python examples/hri/go2_cpg_rl_voice.py --eval policies/walk.pt --whisper-model 
 python examples/hri/go2_cpg_rl_voice.py --eval policies/walk.pt --headless
 ```
 
-It builds a single-env `Go2CPGWalkTask` as a stepping harness, starts a
-`VoiceCommander` on a `CommandState(vx=--vx)`, and every step copies
+It builds a single-env [`Go2CPGWalkTask`](tasks.md#go2cpgwalktask) as a
+stepping harness, starts a `VoiceCommander` on a `CommandState(vx=--vx)`,
+and every step copies
 `state.get()` into `env.commands` before calling the policy. It runs until
 Ctrl+C, prints the command and measured speed every 250 steps, resets on a
 fall and saves nothing. It cannot be smoke-tested: it needs a microphone

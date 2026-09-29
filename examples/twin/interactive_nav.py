@@ -1,19 +1,23 @@
 """
-Click a point on the dashboard map, the robot walks there.
+Click a point — on the dashboard map or in the viewer — the robot walks there.
 
 The twin stands still until someone clicks. The dashboard's top-down panel
 turns a click into a world (x, y) and posts it on the command channel as
-`goto:<x>,<y>`; the loop hands that goal to a `PlanningController`, which
-AUTHORS the program that walks there — `avoid @ goto(x, y) @ walk` — reports
-whether it arrived, and goes back to idling. The point of the example is that
-seat: the goal arrives as data, the *program* is written inside `plan()`,
-which is exactly where the M1 supervisor will sit.
+`goto:<x>,<y>`; with `--click-viewer` the Genesis window is a second click
+surface, where a left-click on the floor is raycast to the same world (x, y).
+Either way the loop hands that goal to a `PlanningController`, which AUTHORS
+the program that walks there — `avoid @ goto(x, y) @ walk` — reports whether
+it arrived, and goes back to idling. The point of the example is that seat:
+the goal arrives as data, the *program* is written inside `plan()`, which is
+exactly where the M1 supervisor will sit.
 
 Library pieces exercised: domo.world (goal-free World, scene_kind="arena",
 36-sector lidar), domo.policies (stable 'walk' + 'avoid' through
 stable_go2_library), domo.skills (PlanningController, make_go2_library, the
-'goto' nav card), domo.dashboard (the command channel; imported LAZILY, only
-when --dashboard/--dashboard-url is given). No frozen-script counterpart.
+'goto' nav card), domo.sim (`Scene.on_ground_click` — viewer picking behind
+the engine-agnostic contract, so the click path never touches genesis),
+domo.dashboard (the command channel; imported LAZILY, only when
+--dashboard/--dashboard-url is given). No frozen-script counterpart.
 
     # decoupled (recommended): the server in one shell ...
     python -m domo.dashboard --port 8080
@@ -23,20 +27,23 @@ when --dashboard/--dashboard-url is given). No frozen-script counterpart.
 
     # in-process server instead; open http://127.0.0.1:8080
     python examples/twin/interactive_nav.py --headless --device cpu --dashboard 8080
+    # no web at all: click the floor in the Genesis window (needs a display)
+    python examples/twin/interactive_nav.py --device cpu --click-viewer
     # plain 'goto(...) @ walk', without the conservative avoid layer
     python examples/twin/interactive_nav.py --headless --device cpu \\
         --dashboard 8080 --no-avoid
 
 Prints every goal it accepts, every arrival or abandonment, a position line
 every 250 steps, and the goal history at the end. Saves nothing. Without a
-dashboard flag there is no way to send a goal, so the robot just stands
-there — and no web code is imported at all.
+dashboard flag and without --click-viewer there is no way to send a goal, so
+the robot just stands there — and no web code is imported at all.
 """
 
 import argparse
 import contextlib
 import os
 import signal
+import threading
 import time
 from collections import deque
 
@@ -178,6 +185,33 @@ class ClickToGoController(PlanningController):
         self.program = None
         self.active_goal = None
         self.activate(self.IDLE)
+
+
+class GoalSlot:
+    """
+    One-slot mailbox for goals clicked in the viewer window.
+
+    `Scene.on_ground_click` fires on the viewer's UI thread, mid-frame, so the
+    callback must not reach into the controller (its `plan()` runs on the sim
+    thread). It only drops the newest (x, y) here; the control loop `take()`s
+    it and calls `set_goal` itself, exactly as it does for a dashboard goal.
+    A second click before the loop looks simply overwrites the first.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._goal: tuple[float, float] | None = None
+
+    def set(self, x: float, y: float) -> None:
+        """The viewer callback: cheap, thread-safe, never blocks the UI."""
+        with self._lock:
+            self._goal = (float(x), float(y))
+
+    def take(self) -> tuple[float, float] | None:
+        """Pop the pending goal (None if nobody clicked since the last call)."""
+        with self._lock:
+            goal, self._goal = self._goal, None
+            return goal
 
 
 # ---------------------------------------------------------------------------
@@ -324,18 +358,23 @@ def snapshot(step, state, controller, lidar, cloud, status):
 # Run
 # ---------------------------------------------------------------------------
 
-def run(args, world, loop, controller, dash):
+def run(args, world, loop, controller, dash, viewer_goal=None):
     """
-    Idle, walk where the page points, report. Dashboard commands: `goto:x,y`
+    Idle, walk where someone clicked, report. Dashboard commands: `goto:x,y`
     sets a goal (a new one re-targets), `clear` cancels it, `pause` toggles
     (the sim freezes but keeps publishing), `reset` teleports back to spawn,
-    `stop` ends the run.
+    `stop` ends the run. `viewer_goal` is the mailbox the viewer's ground
+    clicks land in — both surfaces feed the same `set_goal`.
     """
-    from domo.dashboard import parse_goto  # LAZY: only reached with a dashboard
+    parse_goto = None
+    if dash is not None:
+        from domo.dashboard import parse_goto  # LAZY: only with a dashboard
     state = loop.reset()
     cloud: deque = deque(maxlen=CLOUD_MAX)
 
     def publish(i, forced=None):
+        if dash is None:
+            return
         if i % PUBLISH_EVERY == 0 or forced:
             frame = world.camera.render() if world.camera is not None else None
             dash.publish(snapshot(i, state, controller, world.lidar, cloud,
@@ -343,8 +382,8 @@ def run(args, world, loop, controller, dash):
 
     i, paused = 0, False
     while i < args.steps:
-        c = dash.poll_command()
-        goal = parse_goto(c)
+        c = dash.poll_command() if dash is not None else None
+        goal = parse_goto(c) if parse_goto is not None else None
         if goal is not None:
             print(f"  [dashboard] goal ({goal[0]:+.2f}, {goal[1]:+.2f})")
             controller.set_goal(*goal)
@@ -362,6 +401,11 @@ def run(args, world, loop, controller, dash):
             state = loop.reset()
             cloud.clear()
             i = 0
+        if viewer_goal is not None:
+            clicked = viewer_goal.take()
+            if clicked is not None:
+                print(f"  [viewer] goal ({clicked[0]:+.2f}, {clicked[1]:+.2f})")
+                controller.set_goal(*clicked)
         if paused:
             publish(i, "paused")
             time.sleep(PAUSE_IDLE_S)
@@ -379,10 +423,11 @@ def run(args, world, loop, controller, dash):
 
 
 def stand_still(args, loop, controller) -> None:
-    """No dashboard, no goal channel: hold the stand pose briefly and say so."""
-    print("  no dashboard flag — nothing can send a goal, so the robot idles. "
+    """No click surface at all: hold the stand pose briefly and say so."""
+    print("  no click surface — nothing can send a goal, so the robot idles. "
           "Re-run with --dashboard PORT (or --dashboard-url URL) and click the "
-          "point-cloud panel.")
+          "point-cloud panel, or with --click-viewer and click the floor in "
+          "the Genesis window.")
     steps = min(args.steps, IDLE_STEPS_NO_DASH)
     loop.reset()
     for _ in range(steps):
@@ -417,9 +462,17 @@ def parse_args():
     p.add_argument("--dashboard-camera", action="store_true", default=False,
                    help="add the Genesis camera panel (renders a frame — small "
                         "sim-thread cost; off by default)")
+    p.add_argument("--click-viewer", action="store_true", default=False,
+                   help="also take goals from left-clicks on the floor of the "
+                        "Genesis viewer window (needs a display; combinable "
+                        "with the dashboard flags)")
     p.add_argument("--headless", action="store_true", default=False)
     p.add_argument("--device", type=str, default="cuda")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.click_viewer and args.headless:
+        p.error("--click-viewer needs the interactive viewer, so it cannot be "
+                "combined with --headless: drop one of the two flags.")
+    return args
 
 
 def main():
@@ -437,21 +490,34 @@ def main():
     controller = build_brain(args, world)
     loop = world.make_loop(controller)
 
-    # --- the click channel --------------------------------------------------
+    # --- the click channels -------------------------------------------------
     dash = attach_dashboard(args)
-    if dash is None:
+    viewer_goal = None
+    if args.click_viewer:
+        # Engine-agnostic viewer picking: the backend raycasts the click onto
+        # the arena floor and calls us on ITS UI thread, so we only store.
+        viewer_goal = GoalSlot()
+        world.scene.on_ground_click(viewer_goal.set,
+                                    ground_z=world.cfg.ground_height)
+    if dash is None and viewer_goal is None:
         stand_still(args, loop, controller)
         return
-    print("Click the point-cloud panel to send the robot there "
-          f"(programs: '{'avoid @ ' if not args.no_avoid else ''}"
-          "goto(x, y) @ walk').\n")
+    program = f"{'avoid @ ' if not args.no_avoid else ''}goto(x, y) @ walk"
+    if dash is not None:
+        print("Click the point-cloud panel to send the robot there "
+              f"(programs: '{program}').")
+    if viewer_goal is not None:
+        print("Left-click the floor in the Genesis viewer window to send the "
+              f"robot there (programs: '{program}').")
+    print()
 
-    # --- run: idle, walk where the page points -----------------------------
-    run(args, world, loop, controller, dash)
+    # --- run: idle, walk where the clicks point ----------------------------
+    run(args, world, loop, controller, dash, viewer_goal)
 
     # --- result -------------------------------------------------------------
     report(controller)
-    hold_dashboard(dash, args)
+    if dash is not None:
+        hold_dashboard(dash, args)
 
 
 if __name__ == "__main__":

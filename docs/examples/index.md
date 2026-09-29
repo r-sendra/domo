@@ -47,7 +47,7 @@ and a short `main()`, so these pages can be read against the source.
 |---------|---------------|------|-----------------|-------------|
 | [Skill demo](skill-demo.md) | `Skill` / `Controller` / `ControlLoop`; a compiled square route against an open-loop contrast | no | `policies/walk.pt` | ~1.5 min |
 | [Digital twin](twin-demo.md) | goal-free `World` + a `PlanningController` that re-plans on outcomes and concedes a skill gap | no | `walk.pt`, optionally `avoid.pt` | ~1–2.5 min |
-| [Click to walk](interactive-nav.md) | a click on the dashboard map becomes a goal; the planner authors `avoid @ goto(x, y) @ walk` | no | `walk.pt`, `avoid.pt` (via the registry) | build ~30 s, then interactive |
+| [Click to walk](interactive-nav.md) | a click on the dashboard map or the viewer floor becomes a goal; the planner authors `avoid @ goto(x, y) @ walk` | no | `walk.pt`, `avoid.pt` (via the registry) | build ~30 s, then interactive |
 | [Locomotion (CPG-RL)](locomotion.md) | the PPO + CPG gait every other example stands on; train, evaluate, resume | training only | `walk.pt` for `--eval` | eval ~1.5 min |
 | [Obstacle avoidance](avoidance.md) | a 36-sector lidar net writing velocity corrections over a frozen walk, evaluated twin-style | training only | `walk.pt`, `avoid.pt` | eval ~110 s |
 | [Avoidance in a house](avoid-house.md) | the same architecture inside a ReplicaCAD apartment | training only | your own checkpoint (assets are vendored) | build alone ~2 min |
@@ -163,7 +163,7 @@ counterpart.
 examples/
 ├── basic_examples/skill_demo.py         Skill / Controller / ControlLoop, a compiled square route
 ├── twin/twin_demo.py                    the goal-free World governed by a PlanningController
-├── twin/interactive_nav.py              click the dashboard map, the planner walks the robot there
+├── twin/interactive_nav.py              click the map or the viewer floor, the planner walks there
 ├── locomotion/go2_cpg_rl.py             train / evaluate / resume the CPG-RL walk (PPO)
 ├── avoidance/go2_cpg_rl_lidar.py        train / evaluate lidar avoidance in a walled arena
 ├── avoidance/go2_cpg_rl_avoid_house.py  the same, inside a ReplicaCAD apartment

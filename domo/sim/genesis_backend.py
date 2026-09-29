@@ -18,13 +18,25 @@ Genesis 1.0.0 quirks encoded here (keep in sync with the comments below):
     [N, n_h, n_v] (azimuth-major); the DOMO contract is [N, n_v, n_h].
   * Per-DOF gains broadcast over envs; `set_pd_gains_scaled` therefore
     applies one draw to a whole reset group.
+  * `scene.viewer` exists as soon as the scene is constructed (the window
+    itself opens during `build`), and `viewer.add_plugin` works on both
+    sides of `build` — before it the plugin is queued and built with the
+    viewer, after it `register_plugin` builds it immediately. So
+    `on_ground_click` may be called before OR after `build`.
+  * `plane_raycast(normal, distance, ray)` uses the plane equation
+    `dot(p, normal) + distance == 0`, so the ground at z = h needs
+    `distance = -h` (not +h).
+  * Viewer plugin handlers run on the pyglet/UI thread and an exception
+    there tears the window down, so the ground-click callback is wrapped.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import logging
+from collections.abc import Callable, Sequence
 
 import genesis as gs
+import numpy as np
 import torch
 
 from .base import (
@@ -53,6 +65,8 @@ __all__ = [
 _BASE_LINK_IDX = 0
 
 _GS_INITIALIZED = False
+
+_log = logging.getLogger(__name__)
 
 
 def _ensure_gs_init(device: str) -> torch.device:
@@ -252,6 +266,68 @@ class GenesisCamera(CameraHandle):
 # Scene
 # ---------------------------------------------------------------------------
 
+def _ground_click_plugin(callback: Callable[[float, float], None],
+                         ground_z: float):
+    """
+    Viewer plugin turning a left-click on the plane z = `ground_z` into
+    `callback(x, y)` (world-frame metres). Returns the unbuilt plugin.
+
+    The genesis.vis imports are deliberately LOCAL: `genesis.vis.viewer_plugins`
+    pulls in pyrender, which Genesis itself imports only when a viewer is
+    actually created so that machines with no rendering stack can still run
+    headless. Importing `domo.sim` must not need it either.
+    """
+    from genesis.utils.raycast import plane_raycast
+    from genesis.vis.keybindings import MouseButton
+    from genesis.vis.viewer_plugins import (
+        EVENT_HANDLE_STATE,
+        RaycasterViewerPlugin,
+        ViewerPlugin,
+    )
+
+    # plane_raycast's equation is dot(p, normal) + distance == 0, so the
+    # horizontal plane at height z needs distance = -z (NOT +z).
+    normal = np.array([0.0, 0.0, 1.0], dtype=gs.np_float)
+    plane_distance = -float(ground_z)
+
+    class _GroundClickPlugin(RaycasterViewerPlugin):
+        """Left-click → `callback`, invoked on the viewer's UI thread."""
+
+        def build(self, viewer, camera, scene) -> None:
+            # Skipping RaycasterViewerPlugin.build on purpose: it builds a BVH
+            # raycaster over every face in the scene and refits it on every sim
+            # step. Hitting a horizontal plane is closed-form geometry, so only
+            # the viewer/camera wiring `_screen_position_to_ray` reads is set up.
+            ViewerPlugin.build(self, viewer, camera, scene)
+
+        def update_on_sim_step(self) -> None:
+            pass                     # no BVH to refit (see build)
+
+        def on_mouse_press(self, x: int, y: int, button: int,
+                           modifiers: int) -> EVENT_HANDLE_STATE:
+            if button != MouseButton.LEFT:
+                return None          # not ours: fall through to camera controls
+            hit = plane_raycast(normal, plane_distance,
+                                self._screen_position_to_ray(x, y))
+            if hit is None:
+                return None          # ray parallel to the plane, or hit behind it
+            try:
+                callback(float(hit.position[0]), float(hit.position[1]))
+            except Exception:
+                # Never let this escape: the handler runs inside pyglet's event
+                # loop, where an exception tears the viewer window down.
+                _log.exception("on_ground_click callback raised; click ignored")
+            # Deliberately NOT EVENT_HANDLED. Consuming the press would stop
+            # pyrender's own on_mouse_press from running, so the trackball never
+            # records the button going down and an orbit dragged straight out of
+            # a goal click jumps. Genesis' own MouseInteractionPlugin returns
+            # None for the same reason. Setting a goal and letting the camera
+            # register the press are not in conflict.
+            return None
+
+    return _GroundClickPlugin()
+
+
 class GenesisScene(Scene):
     """`gs.Scene` wrapper exposing only the `Scene` contract."""
 
@@ -345,6 +421,29 @@ class GenesisScene(Scene):
         cam = self._scene.add_camera(res=tuple(res), pos=tuple(pos),
                                      lookat=tuple(lookat), fov=fov, GUI=False)
         return GenesisCamera(cam)
+
+    def on_ground_click(self, callback, ground_z: float = 0.0) -> None:
+        """
+        Left-click the ground in the Genesis viewer → `callback(x, y)`.
+
+        Needs an interactive viewer, so `SimConfig.headless` must be False;
+        a headless scene raises RuntimeError rather than wiring a callback
+        that could never fire. May be called before OR after `build()`:
+        `viewer.add_plugin` queues the plugin when the viewer is not built yet
+        and registers it immediately when it is.
+
+        The callback runs on the viewer's UI thread (see `Scene.on_ground_click`)
+        and is wrapped: an exception is logged, never raised, because pyglet
+        would otherwise close the window.
+
+        A click that lands on the ground is consumed (`EVENT_HANDLED`), so the
+        trackball does not also see that press; drags are never intercepted.
+        """
+        if self._cfg.headless or self._scene.viewer is None:
+            raise RuntimeError(
+                "GenesisScene.on_ground_click needs the interactive viewer: "
+                "create the scene with SimConfig(headless=False)")
+        self._scene.viewer.add_plugin(_ground_click_plugin(callback, ground_z))
 
     def build(self, n_envs: int) -> None:
         self._scene.build(n_envs=n_envs)

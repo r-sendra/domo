@@ -6,7 +6,7 @@ helper backends use to honour the [N, n_vertical, n_horizontal] contract.
 import pytest
 import torch
 
-from domo.sim import PhysicsEngine, create_engine, register_backend
+from domo.sim import PhysicsEngine, Scene, create_engine, register_backend
 from domo.sim.base import lidar_ranges_to_grid
 
 
@@ -39,6 +39,48 @@ def test_registry_rejects_unknown_backend():
 def test_sim_package_exports_camera_handle():
     from domo.sim import CameraHandle
     assert CameraHandle.__name__ == "CameraHandle"
+
+
+# ---------------------------------------------------------------------------
+# Optional Scene capabilities: default refusal + a backend that opts in
+# ---------------------------------------------------------------------------
+
+class _BareScene(Scene):
+    """Implements only the abstract methods — every optional one must refuse."""
+
+    def add_ground(self, height=0.0): ...
+    def add_terrain(self, cfg): ...
+    def add_mesh(self, *a, **k): ...
+    def add_urdf_prop(self, *a, **k): ...
+    def add_box(self, *a, **k): ...
+    def add_cylinder(self, *a, **k): ...
+    def add_sphere(self, *a, **k): ...
+    def add_articulation(self, *a, **k): ...
+    def add_lidar(self, articulation, cfg): ...
+    def build(self, n_envs): ...
+    def step(self): ...
+
+
+class _ClickableScene(_BareScene):
+    """A backend that does support viewer ground picking."""
+
+    def on_ground_click(self, callback, ground_z=0.0):
+        self.callback, self.ground_z = callback, ground_z
+
+
+def test_on_ground_click_default_refuses_with_backend_name():
+    with pytest.raises(NotImplementedError, match="_BareScene"):
+        _BareScene().on_ground_click(lambda x, y: None)
+
+
+def test_scene_implementing_on_ground_click_satisfies_the_abc():
+    scene = _ClickableScene()
+    assert isinstance(scene, Scene)
+    clicks = []
+    scene.on_ground_click(lambda x, y: clicks.append((x, y)), ground_z=0.5)
+    assert scene.ground_z == 0.5
+    scene.callback(1.0, -2.0)              # what the viewer thread would do
+    assert clicks == [(1.0, -2.0)]
 
 
 # ---------------------------------------------------------------------------

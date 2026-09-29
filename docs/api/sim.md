@@ -312,6 +312,24 @@ def build(self, n_envs: int) -> None   # compile the scene for n_envs parallel c
 def step(self) -> None                 # advance physics by SimConfig.dt
 ```
 
+**Either phase — the interactive viewer**
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `on_ground_click(callback, ground_z: float = 0.0)` | — | **optional**, default raises `NotImplementedError`; needs an interactive viewer, so it is meaningless headless |
+
+`callback(x, y)` receives world-frame metres where the click ray meets the
+horizontal plane `z = ground_z`; clicks that miss it (the sky, a wall above
+the horizon) are dropped. Like `add_camera` this is viewer sugar, not part of
+the sim contract — [`interactive_nav`](../examples/interactive-nav.md) uses it
+to turn a click on the floor into a navigation goal.
+
+!!! warning "The callback runs on the viewer's UI thread"
+
+    Not the sim thread. Store the click in a lock-protected slot and let the
+    control loop pick it up; calling into a controller from the callback races
+    the physics step, and anything slow stalls rendering.
+
 ## `PhysicsEngine`
 
 Entry point of a backend: initialises the engine and creates scenes.
@@ -389,6 +407,11 @@ base), and `set_pd_gains_scaled` calls `set_dofs_kp` / `set_dofs_kv` with
 
 `GenesisScene.add_lidar` raises `TypeError` unless the articulation is a
 `GenesisArticulation` (it needs the entity index).
+
+`GenesisScene.on_ground_click` registers a private `RaycasterViewerPlugin` on
+`scene.viewer`. It raises `RuntimeError` when the scene is headless, and the
+`genesis.vis` imports are local to it so that importing `domo.sim` never pulls
+in pyrender.
 
 ## Adding a backend
 
@@ -517,8 +540,9 @@ Checklist for a real backend:
 
 1. Implement every abstract method of `Articulation`, `Scene` and
    `PhysicsEngine`; add the optional capabilities your engine supports
-   (contact forces, DR setters, `read_points`, `add_camera`) and leave the
-   rest to the `NotImplementedError` defaults.
+   (contact forces, DR setters, `read_points`, `add_camera`,
+   `on_ground_click`) and leave the rest to the `NotImplementedError`
+   defaults.
 2. Convert quaternions to `wxyz` *inside* the backend if the engine uses
    `xyzw`; the rest of the library never sees a non-`wxyz` quaternion.
 3. Normalise lidar buffers with `lidar_ranges_to_grid` so `read_ranges()`
@@ -575,5 +599,14 @@ remain paired; never index it with the `read_ranges()` grid.
   belongs in the backend as a new capability.
 * `add_camera` renders offscreen (`GUI=False`) and costs frame time every
   `render()`; only the dashboard and evaluation scripts call it.
+* `scene.viewer` exists from construction (the window opens during `build`)
+  and `viewer.add_plugin` works on both sides of `build`: before it the plugin
+  is queued and built with the viewer, after it `register_plugin` builds it
+  straight away. `on_ground_click` may therefore be called either side.
+* `plane_raycast(normal, distance, ray)` solves
+  `dot(p, normal) + distance == 0`, so the ground at `z = h` needs
+  `distance = -h`. Viewer plugin handlers run on the pyglet thread and an
+  exception there closes the window, so the user callback is wrapped in a
+  `try/except` that logs through `logging`.
 
 See also [troubleshooting](../guides/troubleshooting.md#genesis).

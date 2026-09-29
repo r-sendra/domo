@@ -20,9 +20,9 @@ is called exactly once; afterwards only `step()`, queries and per-env state
 writes are allowed. `Robot.bind()` and the sensors are the layer above this.
 
 Optional capabilities (contact forces, domain randomization, per-beam
-lidar points, offscreen camera) have non-abstract defaults that raise
-`NotImplementedError`; callers probe them and degrade gracefully so the
-same code runs on every backend.
+lidar points, offscreen camera, viewer ground picking) have non-abstract
+defaults that raise `NotImplementedError`; callers probe them and degrade
+gracefully so the same code runs on every backend.
 """
 
 from __future__ import annotations
@@ -329,6 +329,25 @@ class Scene(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no offscreen camera")
+
+    def on_ground_click(self, callback, ground_z: float = 0.0) -> None:
+        """
+        Optional: call `callback(x, y)` when the user left-clicks the ground
+        plane in the engine's INTERACTIVE viewer. Backends without a viewer
+        picking API raise NotImplementedError.
+
+        Viewer-only, so it has no meaning headless — a headless backend should
+        refuse rather than silently never fire (nothing would ever click).
+
+        `x, y` are world-frame metres of the point where the click ray meets
+        the horizontal plane `z = ground_z`; clicks that miss that plane (sky,
+        a camera looking up) are dropped. The callback runs on the viewer/UI
+        thread, NOT the sim thread: keep it to a cheap, thread-safe store —
+        stash the goal and let the control loop pick it up — because anything
+        slow stalls rendering and anything unsynchronised races the sim.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no viewer ground picking")
 
     @abstractmethod
     def build(self, n_envs: int) -> None:

@@ -1,20 +1,24 @@
 # Click to walk
 
-The twin, driven with a mouse. Click a point on the dashboard's top-down panel
-and the robot walks there, steering around what its lidar sees. Nothing is
-scripted: the click arrives as a goal, and the planner *writes* the program
-that goes there.
+The twin, driven with a mouse. Click a point on the dashboard's top-down panel —
+or, with `--click-viewer`, on the floor in the Genesis window — and the robot
+walks there, steering around what its lidar sees. Nothing is scripted: the click
+arrives as a goal, and the planner *writes* the program that goes there.
 
 ## What it demonstrates
 
 `examples/twin/interactive_nav.py` is library-native. It closes the loop
-between the browser and the [planner seat](../concepts/grammar.md#where-programs-come-from):
+between a mouse and the [planner seat](../concepts/grammar.md#where-programs-come-from):
 the page turns a click into a world `(x, y)`, posts it on the dashboard's
 command channel as `goto:<x>,<y>`, and `ClickToGoController.plan()` composes
 that goal into grammar text. The goal is data; the program is authorship. A
 flag could not do this — it would be configuration handed in from outside,
 which is exactly what [`PlanningController`](../api/skills.md#planning) exists
 to avoid.
+
+There are two click surfaces and they are interchangeable — both end at the
+same `set_goal` and produce the same program — so the example also shows that
+the planner does not care where a goal came from.
 
 -   [`domo.world`](../api/world-and-services.md#domoworld): a goal-free
     `World(scene_kind="arena")` with a 36-sector lidar, obstacles scattered by
@@ -28,6 +32,9 @@ to avoid.
 -   [`domo.dashboard`](../api/dashboard.md): the `goto:<x>,<y>` and `clear`
     commands, the `goal` telemetry key, and the click handler in the page —
     imported lazily and only when `--dashboard` or `--dashboard-url` is given.
+-   [`domo.sim`](../api/sim.md#scene): `Scene.on_ground_click`, the optional
+    viewer capability behind `--click-viewer`. The backend raycasts the click
+    onto the floor plane, so the example never imports `genesis` for it.
 
 Every goal produces one program:
 
@@ -45,7 +52,10 @@ flowchart LR
     CLICK["click on the<br/>top-down panel"] --> PX["pixel → world (x, y)<br/><small>inverse of the draw transform</small>"]
     PX --> CMD["GET /cmd?c=goto:x,y"]
     CMD --> HUB["TelemetryHub<br/><small>one pending command</small>"]
-    HUB -- "poll_command()" --> LOOP["run() loop<br/><small>parse_goto</small>"]
+    HUB -- "poll_command()" --> LOOP["run() loop<br/><small>parse_goto · GoalSlot.take</small>"]
+    VCLICK["left-click the floor<br/>in the Genesis window"] --> RAY["Scene.on_ground_click<br/><small>ray ∩ plane z = 0, UI thread</small>"]
+    RAY --> SLOT["GoalSlot<br/><small>lock-protected, newest wins</small>"]
+    SLOT --> LOOP
     LOOP -- "set_goal(x, y)" --> PLAN["ClickToGoController.plan()"]
     PLAN -- "'avoid @ goto(x, y) @ walk'" --> PROG["compiled program"]
     PROG -- "arrived / failed" --> PLAN
@@ -53,7 +63,7 @@ flowchart LR
 
     classDef box fill:none,stroke:#33566f,stroke-width:1px;
     classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
-    class CLICK,PX,CMD,HUB,LOOP,PROG,TEL box;
+    class CLICK,PX,CMD,HUB,LOOP,PROG,TEL,VCLICK,RAY,SLOT box;
     class PLAN accent;
 ```
 
@@ -80,6 +90,17 @@ flowchart LR
     python examples/twin/interactive_nav.py --headless --device cpu \
         --dashboard 8080
     ```
+
+=== "Click in the viewer"
+
+    ```bash
+    # no browser, no web code: click the floor in the Genesis window
+    python examples/twin/interactive_nav.py --device cpu --click-viewer
+    ```
+
+    Left-click the floor and the robot walks to that point. Needs a display —
+    the flag is rejected together with `--headless` — and it combines with the
+    dashboard flags, in which case either surface sets a goal.
 
 === "Without the avoid layer"
 
@@ -125,8 +146,14 @@ flowchart LR
 -   `attach_dashboard(args)` returns `None`, an in-process `Dashboard` or a
     `DashboardClient`, and pushes a scene manifest with the four arena walls
     and the Go2 URDF for the 3D panel.
--   `run(args, world, loop, controller, dash)` polls the command channel every
-    step: `parse_goto` turns `goto:<x>,<y>` back into floats, `clear` cancels,
+-   `GoalSlot` is the bridge for `--click-viewer`.
+    [`Scene.on_ground_click`](../api/sim.md#scene) fires on the viewer's UI
+    thread, so the callback does one thing — store `(x, y)` under a lock — and
+    never touches the controller. A second click before the loop looks simply
+    overwrites the first.
+-   `run(args, world, loop, controller, dash, viewer_goal)` polls both channels
+    every step: `parse_goto` turns `goto:<x>,<y>` back into floats,
+    `GoalSlot.take()` drains a viewer click, `clear` cancels, and
     `pause` / `reset` / `stop` behave as in the other dashboard examples.
     `collect_hits` folds each scan's above-ground lidar returns into a rolling
     1500-point cloud — that is what the clickable panel draws — and `snapshot`
@@ -151,6 +178,7 @@ point until then.
 | `--dashboard PORT` | `0` | host the dashboard in-process on this port (0 = off) |
 | `--dashboard-url URL` | none | push to a decoupled dashboard server, e.g. `http://127.0.0.1:8080` |
 | `--dashboard-camera` | off | add the Genesis camera frame (small sim-thread cost) |
+| `--click-viewer` | off | also take goals from left-clicks on the floor of the Genesis window; needs a display, rejected with `--headless` |
 | `--headless` | off | no Genesis viewer |
 | `--device` | `cuda` | torch/Genesis device |
 
@@ -179,6 +207,9 @@ In the browser: the status badge reads `idle` or `walking to (x, y)`, the goal
 sits on the top-down panel as a blue crosshair with the robot as a red dot, and
 the 3D panel shows the Go2 inside the arena walls. Nothing is saved.
 
+A goal clicked in the viewer prints `[viewer] goal (+0.93, -0.93)` instead of
+`[dashboard] goal …`; everything after that line is identical.
+
 ## Runtime
 
 | | Build | Stepping |
@@ -189,8 +220,9 @@ the 3D panel shows the Go2 inside the arena walls. Nothing is saved.
 A 2–3 m goal is 400–600 control steps, so a few seconds of wall clock. The
 default 20000-step budget is a dozen or so goals; when it runs out the example
 prints its goal history and keeps serving the final snapshot until ++ctrl+c++
-or the page's stop button. With no dashboard flag at all it stands for 250
-steps, says why, and exits.
+or the page's stop button. With `--click-viewer` alone there is nothing to
+serve, so the run simply ends. With no click surface at all — no dashboard flag
+and no `--click-viewer` — it stands for 250 steps, says why, and exits.
 
 ## Known limitations
 
@@ -225,6 +257,12 @@ steps, says why, and exits.
 -   **The clickable extent is the whole arena** (`bounds` is fixed at
     ±4.5 m), so a click can land on an obstacle or outside the walls. The
     program still compiles; the robot simply pushes at whatever is in the way.
+-   **A viewer click sets a goal and still moves the camera.** The handler
+    reads the press and lets it fall through, so the trackball records it as
+    usual and orbiting out of a goal click behaves normally. The cost is that
+    one left-press does both things: dragging from the floor sets a goal at the
+    point where the drag started. Use the middle or right button to orbit
+    without setting one. Clicks that miss the floor plane set no goal at all.
 -   **The top-down panel shows lidar hits, not a map.** It is a rolling
     1500-point cloud of what the lidar has recently seen, not a SLAM map — the
     obstacles fade as the buffer turns over. [The SLAM demo](slam-demo.md)

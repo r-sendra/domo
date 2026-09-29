@@ -15,7 +15,7 @@ import urllib.request
 import pytest
 
 from domo import dashboard
-from domo.dashboard import DashboardClient, TelemetryHub, make_server
+from domo.dashboard import DashboardClient, TelemetryHub, make_server, parse_goto
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -145,6 +145,50 @@ def test_cmd_route_validates_and_relays(server):
     assert hub.pop_command() is None
 
 
+def test_parse_goto_reads_floats_and_rejects_anything_else():
+    """The goal payload is the one command that carries data — strictly parsed."""
+    assert parse_goto("goto:2,1") == (2.0, 1.0)
+    assert parse_goto("goto:-1.25,-0.50") == (-1.25, -0.5)
+    assert parse_goto("goto:0.00,3.75") == (0.0, 3.75)
+    for bad in ("goto:", "goto:1", "goto:a,b", "goto:1,2,3", "goto:1,", "goto:,1",
+                "goto:1 2", "goto:1,2 ", " goto:1,2", "gotox:1,2", "pause",
+                "goto:1,2;rm", None, ""):
+        assert parse_goto(bad) is None
+
+
+def test_cmd_route_relays_a_goto_goal(server):
+    """Browser click → /cmd → /cmd-poll, verbatim, including negatives."""
+    hub, base = server
+    for payload, xy in (("goto:2,1", (2.0, 1.0)),
+                        ("goto:-1.25,-0.50", (-1.25, -0.5)),
+                        ("goto:0.00,4.50", (0.0, 4.5))):
+        assert _get(base, f"/cmd?c={payload}").read() == b"ok"
+        got = json.loads(_get(base, "/cmd-poll").read())["cmd"]
+        assert got == payload and parse_goto(got) == xy
+    assert json.loads(_get(base, "/cmd-poll").read()) == {"cmd": None}
+    assert hub.pop_command() is None
+
+
+def test_cmd_route_rejects_malformed_goals_without_queueing_them(server):
+    """A malformed payload is a 400 and never reaches the sim."""
+    hub, base = server
+    for bad in ("goto:", "goto:1", "goto:a,b", "goto:1,2,3", "goto:1.2.3,4", "goto"):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _get(base, f"/cmd?c={bad}")
+        assert e.value.code == 400
+        assert e.value.read() == b"bad command"
+        assert hub.pop_command() is None
+        assert json.loads(_get(base, "/cmd-poll").read()) == {"cmd": None}
+
+
+def test_cmd_route_relays_clear(server):
+    """`clear` cancels a goal; it is a bare command like pause/reset/stop."""
+    _, base = server
+    assert "clear" in dashboard.COMMANDS
+    assert _get(base, "/cmd?c=clear").read() == b"ok"
+    assert json.loads(_get(base, "/cmd-poll").read()) == {"cmd": "clear"}
+
+
 def test_unknown_routes_404(server):
     _, base = server
     for path in ("/nope", "/assets/", "/assets/robot/x.dae"):
@@ -249,6 +293,21 @@ def test_page_splits_core_and_3d_scripts():
     assert core < module
     assert "setInterval(tick" in html[core:module]
     assert "import('three')" in html[module:]
+
+
+def test_click_to_goal_lives_in_the_core_script():
+    """The click handler is core interaction: a three.js/CDN failure must not
+    take it down with the 3D panel, so it belongs to the plain <script>."""
+    html = dashboard._DASHBOARD_HTML
+    core = html[html.index("<script>\n(function(){"):html.index('<script type="module">')]
+    assert "onclick" in core and "'/cmd?c='" in html
+    for piece in ("cmd('goto:'", "toFixed(2)", "pxToWorld", "drawMarks",
+                  "cmd('clear')"):
+        assert piece in core, piece
+    # The goal marker reads the same bounds the cloud is drawn with, and the
+    # panel says what a click does.
+    assert "cloudBounds=s.bounds" in core
+    assert "click to set a goal" in html and 'id="goalClear"' in html
 
 
 def test_encode_jpeg_from_float_frame():

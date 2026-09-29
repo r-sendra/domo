@@ -157,6 +157,7 @@ nav:
       - examples/index.md
       - Skill demo: examples/skill-demo.md
       - Digital twin: examples/twin-demo.md
+      - Click to walk: examples/interactive-nav.md
       - Locomotion (CPG-RL): examples/locomotion.md
       - Obstacle avoidance: examples/avoidance.md
       - Avoidance in a house: examples/avoid-house.md

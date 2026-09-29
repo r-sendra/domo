@@ -1,6 +1,6 @@
 # Examples
 
-Eleven runnable scripts under `examples/`, one page each. Every page records
+Twelve runnable scripts under `examples/`, one page each. Every page records
 what library pieces the script exercises, the exact command lines and their
 flags, what the console prints, what gets saved, how long it takes on CPU and
 GPU, and what it does not do. The script itself is the reference: each opens
@@ -41,12 +41,13 @@ and a short `main()`, so these pages can be read against the source.
 
 </div>
 
-## All eleven
+## All twelve
 
 | Example | What it shows | GPU? | Assets or keys? | CPU runtime |
 |---------|---------------|------|-----------------|-------------|
 | [Skill demo](skill-demo.md) | `Skill` / `Controller` / `ControlLoop`; a compiled square route against an open-loop contrast | no | `policies/walk.pt` | ~1.5 min |
 | [Digital twin](twin-demo.md) | goal-free `World` + a `PlanningController` that re-plans on outcomes and concedes a skill gap | no | `walk.pt`, optionally `avoid.pt` | ~1–2.5 min |
+| [Click to walk](interactive-nav.md) | a click on the dashboard map becomes a goal; the planner authors `avoid @ goto(x, y) @ walk` | no | `walk.pt`, `avoid.pt` (via the registry) | build ~30 s, then interactive |
 | [Locomotion (CPG-RL)](locomotion.md) | the PPO + CPG gait every other example stands on; train, evaluate, resume | training only | `walk.pt` for `--eval` | eval ~1.5 min |
 | [Obstacle avoidance](avoidance.md) | a 36-sector lidar net writing velocity corrections over a frozen walk, evaluated twin-style | training only | `walk.pt`, `avoid.pt` | eval ~110 s |
 | [Avoidance in a house](avoid-house.md) | the same architecture inside a ReplicaCAD apartment | training only | your own checkpoint (assets are vendored) | build alone ~2 min |
@@ -57,7 +58,7 @@ and a short `main()`, so these pages can be read against the source.
 | [Voice commands](voice.md) | microphone → Whisper → Gemini → `(vx, vy, vyaw)` into the walk policy | no | microphone, `voice` extra, `GEMINI_API_KEY` | runs until Ctrl+C |
 | [Eureka get-up](eureka-getup.md) | the LLM writes rewards, trains candidates, ranks them, deploys the winner | real runs only | none with `--llm scripted` | smoke ~minutes |
 
-`examples/slam/slam_viz.py` is the twelfth file and not a command-line tool:
+`examples/slam/slam_viz.py` is the thirteenth file and not a command-line tool:
 it holds the matplotlib and dashboard plumbing the two SLAM examples share,
 and is kept out of `domo/` because it imports matplotlib. Its helpers are
 tabulated on the [SLAM demo](slam-demo.md#the-slam_viz-helpers) page.
@@ -112,9 +113,9 @@ are resolved by symbolic name through
     them nothing walks. See
     [running](../guides/running.md#stable-policies).
 
-Only the two SLAM examples default to the stable names. Every other example
-takes explicit paths, so the commands on these pages pass `policies/walk.pt`
-and `policies/avoid.pt` by hand. `domo.checkpoints` loads both the legacy
+Only the two SLAM examples and [click to walk](interactive-nav.md) default to
+the stable names. Every other example takes explicit paths, so the commands on
+these pages pass `policies/walk.pt` and `policies/avoid.pt` by hand. `domo.checkpoints` loads both the legacy
 script format (`{"config", "model_state"}`) and the library format
 (`{"ppo_config", "extra": {"task_config"}}`), rebuilding the network from the
 weight shapes.
@@ -150,6 +151,7 @@ same CLI where it made sense.
 | `scripts/house_scene/go2_cpg_rl_voice.py` | [`examples/hri/go2_cpg_rl_voice.py`](voice.md) | only the interactive part; the duplicated trainer is gone (use `go2_cpg_rl.py`) |
 
 [Skill demo](skill-demo.md), [twin demo](twin-demo.md),
+[click to walk](interactive-nav.md),
 [LLM level designer](gemini-design-nav.md), the two SLAM examples
 ([arena](slam-demo.md), [house](slam-house.md)) and
 [Eureka get-up](eureka-getup.md) are library-native and have no frozen
@@ -161,6 +163,7 @@ counterpart.
 examples/
 ├── basic_examples/skill_demo.py         Skill / Controller / ControlLoop, a compiled square route
 ├── twin/twin_demo.py                    the goal-free World governed by a PlanningController
+├── twin/interactive_nav.py              click the dashboard map, the planner walks the robot there
 ├── locomotion/go2_cpg_rl.py             train / evaluate / resume the CPG-RL walk (PPO)
 ├── avoidance/go2_cpg_rl_lidar.py        train / evaluate lidar avoidance in a walled arena
 ├── avoidance/go2_cpg_rl_avoid_house.py  the same, inside a ReplicaCAD apartment

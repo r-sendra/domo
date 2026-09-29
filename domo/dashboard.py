@@ -32,8 +32,12 @@ no-store` and `Access-Control-Allow-Origin: *`):
                           `_frame_id` (bumps per camera frame) and `_has_scene`
     GET  /scene           3D scene manifest as JSON, or 204 when none was set
     GET  /frame.jpg       latest camera JPEG, or 204 when none was pushed
-    GET  /cmd?c=CMD       browser → sim control; CMD in {pause, reset, stop}
+    GET  /cmd?c=CMD       browser → sim control; CMD in {pause, reset, stop,
+                          clear} or a GOAL payload `goto:<x>,<y>` (two floats,
+                          e.g. `goto:2.50,-1.25`) set by clicking the top-down
+                          panel. Anything else is 400 "bad command"
     GET  /cmd-poll        sim ← pending command: {"cmd": CMD | null}, read-and-clear
+                          (`parse_goto` turns a goal payload back into (x, y))
     GET  /assets/<name>/<rel>   static files under the asset root registered
                           as <name> (URDF + meshes for the 3D viewer)
     POST /ingest          telemetry dict (JSON) → replaces the latest snapshot
@@ -53,6 +57,9 @@ Telemetry payload (what the page reads; all keys optional except `t`):
     map       [row strings of '#', '.', ' ']   occupancy panel
     cloud     [[x, y, z], …]              top-down point-cloud panel
     bounds    [x_min, x_max, y_min, y_max]     cloud panel extent
+    goal      [x, y]                      goal marker on the top-down panel —
+                                          the goal the sim actually accepted,
+                                          which overrides the clicked point
 
 Scene manifest (POST /scene → GET /scene):
     boxes   [{size: [sx, sy, sz], pos: [x, y, z], quat?: [w, x, y, z], color?: css}]
@@ -67,6 +74,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -79,6 +87,7 @@ __all__ = [
     "DashboardServer",
     "TelemetryHub",
     "make_server",
+    "parse_goto",
     "serve",
 ]
 
@@ -86,8 +95,15 @@ _log = logging.getLogger(__name__)
 
 # Loopback only: the dashboard is a local viewer, never exposed on the network.
 BIND_HOST = "127.0.0.1"
-# Control commands the page may send; anything else is a 400.
-COMMANDS = ("pause", "reset", "stop")
+# Bare control commands the page may send; anything else is a 400 unless it is
+# a well-formed goal payload (see GOTO_PREFIX / parse_goto).
+COMMANDS = ("pause", "reset", "stop", "clear")
+# Goal payload: 'goto:<x>,<y>', two plain decimals (optionally negative). The
+# number shape matches the skill grammar's own NUM token, so the (x, y) a
+# click produces always re-serialises into a valid 'goto(x=…, y=…)' program.
+GOTO_PREFIX = "goto:"
+_NUM = r"-?\d+(?:\.\d+)?"
+_GOTO_RE = re.compile(rf"^{GOTO_PREFIX}({_NUM}),({_NUM})$")
 # Network calls from the client's background thread are short so a hung server
 # cannot stall command polling for long.
 REQUEST_TIMEOUT_S = 1.0
@@ -101,6 +117,22 @@ _CONTENT_TYPES = {
     ".stl": "model/stl", ".png": "image/png", ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
 }
+
+
+def parse_goto(cmd: str | None) -> tuple[float, float] | None:
+    """
+    Goal payload → world (x, y), or None when `cmd` is not a well-formed one.
+
+    The command channel carries strings, so a goal travels as
+    `goto:<x>,<y>`; this is the one place that shape is interpreted, used
+    both by the `/cmd` validator and by the sim loop reading `poll_command()`:
+
+        goal = parse_goto(dash.poll_command())    # (2.5, -1.25) or None
+
+    Deliberately strict — a malformed payload is never half-accepted.
+    """
+    m = _GOTO_RE.match(cmd or "")
+    return (float(m.group(1)), float(m.group(2))) if m else None
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +286,12 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(204 if frame is None else 200, frame or b"", "image/jpeg")
 
     def _get_cmd(self, query: dict) -> None:
+        # A bare command, or a goal payload the page built from a click. Both
+        # are relayed verbatim (the sim calls `parse_goto` on what it gets);
+        # anything else is refused without touching the pending slot, so a
+        # malformed click can never reach the control loop.
         cmd = (query.get("c") or [""])[0]
-        if cmd in COMMANDS:
+        if cmd in COMMANDS or parse_goto(cmd) is not None:
             self.hub.set_command(cmd)
             self._send_text(200, b"ok")
         else:
@@ -516,7 +552,9 @@ def main():
 # `make_server` would hit a NameError.
 # Two script blocks on purpose: telemetry/2D panels/controls live in a plain
 # <script> that always runs; the three.js viewer is a separate module with a
-# guarded dynamic import, so a CDN failure only blanks the 3D panel.
+# guarded dynamic import, so a CDN failure only blanks the 3D panel. The
+# click-to-goal handler on the top-down panel is core interaction and lives in
+# the plain script for the same reason.
 # ---------------------------------------------------------------------------
 _DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <title>__TITLE__</title>
@@ -547,6 +585,10 @@ header h1{font-size:15px;margin:0;font-weight:600}
 .card.main{grid-column:span 2;grid-row:span 2}.card.hidden{display:none}
 .card h2{font-size:12px;margin:0 0 8px;color:#7d8590;text-transform:uppercase;letter-spacing:.5px;display:flex;justify-content:space-between}
 .card h2 .x{color:#586069;cursor:pointer}.card h2 .x:hover{color:#f85149}
+.card h2 .hint{color:#586069;text-transform:none;letter-spacing:0;font-weight:400}
+.card h2 .hint b{color:#58a6ff;cursor:pointer;font-weight:400}
+.card h2 .hint b:hover{text-decoration:underline}
+#cloud{cursor:crosshair}
 canvas{width:100%;background:#0d1117;border-radius:6px;display:block}
 #view3d{width:100%;height:60vh;min-height:340px;background:#0d1117;border-radius:6px;position:relative}
 #view3d .msg{position:absolute;left:10px;top:10px;right:10px;color:#7d8590;font-size:12px}
@@ -584,7 +626,7 @@ pre{margin:0;white-space:pre-wrap;font-size:11px;color:#9da7b3;max-height:300px;
     <div id="view3d"><div class="msg" id="v3msg">loading 3D…</div></div></div>
   <div class="card" data-panel="map"><h2>SLAM occupancy map<span class="x" data-close="map">✕</span></h2><canvas id="map" width="320" height="320"></canvas></div>
   <div class="card" data-panel="lidar"><h2>Lidar (top-down)<span class="x" data-close="lidar">✕</span></h2><canvas id="lidar" width="320" height="320"></canvas></div>
-  <div class="card" data-panel="cloud"><h2>Point cloud (top-down)<span class="x" data-close="cloud">✕</span></h2><canvas id="cloud" width="320" height="320"></canvas></div>
+  <div class="card" data-panel="cloud"><h2>Point cloud (top-down)<span class="hint">click to set a goal · <b id="goalClear">clear goal</b></span><span class="x" data-close="cloud">✕</span></h2><canvas id="cloud" width="320" height="320"></canvas></div>
   <div class="card" data-panel="vel"><h2>Base velocity<span class="x" data-close="vel">✕</span></h2><canvas id="vel" width="320" height="150"></canvas></div>
   <div class="card" data-panel="hc"><h2>Base height / coverage<span class="x" data-close="hc">✕</span></h2><canvas id="hc" width="320" height="150"></canvas></div>
   <div class="card" data-panel="raw"><h2>Raw telemetry<span class="x" data-close="raw">✕</span></h2><pre id="raw">–</pre></div>
@@ -624,6 +666,26 @@ function drawLidar(sec){const cv=$('lidar'),c=cv.getContext('2d'),W=cv.width,H=c
   if(!sec)return;const R=Math.min(W,H)/2-6,mx=Math.max(...sec,1);c.strokeStyle='#30363d';c.beginPath();c.arc(cx,cy,R,0,7);c.stroke();
   c.fillStyle='#58a6ff';for(let i=0;i<sec.length;i++){const a=i/sec.length*2*Math.PI,r=Math.min(sec[i]/mx,1)*R;c.fillRect(cx+r*Math.cos(a)-1.5,cy+r*Math.sin(a)-1.5,3,3);}c.fillStyle='#f85149';c.fillRect(cx-2,cy-2,4,4);}
 
+// Click-to-set-a-goal on the top-down panel. world→pixel is scatter()'s map
+// above; pixel→world below is its exact inverse, so the marker lands under
+// the cursor. This is CORE interaction: it must keep working when the 3D
+// module fails, which is why it lives in this script and not in that one.
+let cloudBounds=null,clicked=null;
+function worldToPx(b,p,W,H){return [(p[0]-b[0])/(b[1]-b[0])*W,H-(p[1]-b[2])/(b[3]-b[2])*H];}
+function pxToWorld(b,x,y,W,H){return [b[0]+x/W*(b[1]-b[0]),b[2]+(H-y)/H*(b[3]-b[2])];}
+$('cloud').onclick=ev=>{if(!cloudBounds)return;const cv=$('cloud'),r=cv.getBoundingClientRect();
+  const[x,y]=pxToWorld(cloudBounds,(ev.clientX-r.left)/r.width*cv.width,
+                        (ev.clientY-r.top)/r.height*cv.height,cv.width,cv.height);
+  clicked=[x,y];cmd('goto:'+x.toFixed(2)+','+y.toFixed(2));};
+$('goalClear').onclick=()=>{clicked=null;cmd('clear');};
+function drawMarks(b,goal,pose){const cv=$('cloud'),c=cv.getContext('2d'),W=cv.width,H=cv.height;
+  if(pose){const[x,y]=worldToPx(b,pose,W,H);c.fillStyle='#f85149';c.fillRect(x-2,y-2,4,4);}
+  if(!goal)return;const[x,y]=worldToPx(b,goal,W,H);
+  c.strokeStyle='#58a6ff';c.lineWidth=1.5;c.beginPath();c.arc(x,y,6,0,7);c.stroke();
+  c.beginPath();c.moveTo(x-10,y);c.lineTo(x+10,y);c.moveTo(x,y-10);c.lineTo(x,y+10);c.stroke();
+  c.fillStyle='#58a6ff';c.font='10px ui-monospace,monospace';
+  c.fillText(goal[0].toFixed(1)+', '+goal[1].toFixed(1),x+9,y-9);}
+
 async function tick(){
   let s;
   try{ s=await(await fetch('/state',{cache:'no-store'})).json(); }
@@ -641,7 +703,8 @@ async function tick(){
   if(s.height!=null)hist.h.push(s.height);if(s.coverage!=null)hist.cov.push(s.coverage);
   for(const k in hist)if(hist[k].length>600)hist[k].shift();
   if(vis.map)drawMap(s.map);if(vis.lidar)drawLidar(s.lidar);
-  if(vis.cloud&&s.cloud&&s.bounds)scatter('cloud',s.cloud,s.bounds);
+  if(vis.cloud&&s.bounds){cloudBounds=s.bounds;scatter('cloud',s.cloud,s.bounds);
+    drawMarks(s.bounds,s.goal||clicked,s.pose);}      // the sim's goal wins over the click
   if(vis.vel)line($('vel'),['vx','vy','vyaw'],['#58a6ff','#3fb950','#d29922'],-1.5,1.5);
   if(vis.hc)line($('hc'),['h','cov'],['#bc8cff','#f85149'],0,Math.max(...hist.cov,1));
   if(vis.raw)$('raw').textContent=JSON.stringify(s,null,1);

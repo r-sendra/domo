@@ -57,7 +57,7 @@ flowchart LR
     D -- "POST /ingest · /scene · /frame" --> H
     H -- "GET /cmd-poll → {cmd}" --> D
     B -- "GET /, /state, /scene, /frame.jpg, /assets/…" --> H
-    B -- "GET /cmd?c=pause|reset|stop" --> H
+    B -- "GET /cmd?c=pause|reset|stop|clear|goto:x,y" --> H
 
     classDef box fill:none,stroke:#33566f,stroke-width:1px;
     classDef accent fill:none,stroke:#c4511d,stroke-width:2px;
@@ -198,7 +198,14 @@ class Dashboard:
 ```
 
 Module constants: `BIND_HOST = "127.0.0.1"`, `COMMANDS = ("pause",
-"reset", "stop")`, `REQUEST_TIMEOUT_S = 1.0`, `JPEG_QUALITY = 80`.
+"reset", "stop", "clear")`, `GOTO_PREFIX = "goto:"`, `REQUEST_TIMEOUT_S = 1.0`,
+`JPEG_QUALITY = 80`.
+
+`parse_goto(cmd: str | None) -> tuple[float, float] | None` parses the goal
+payload, returning `None` for anything malformed. Its accepted number shape
+is deliberately the same as the grammar's `NUM` token, so every coordinate
+the dashboard accepts re-serialises into a valid `goto(x=…, y=…)`
+([grammar](../concepts/grammar.md)).
 
 ## Routes
 
@@ -212,8 +219,8 @@ response. Unknown paths, GET or POST, are `404 not found`.
 | GET | `/state` | — | `200` JSON: the latest telemetry dict plus `_uptime` (s since the hub was created, one decimal), `_frame_id` (bumps per camera frame so the page can skip repeats), `_has_scene` (bool) |
 | GET | `/scene` | — | `200` JSON manifest, or `204` when none was set |
 | GET | `/frame.jpg` | — | `200 image/jpeg`, or `204` when no frame was pushed |
-| GET | `/cmd?c=CMD` | `CMD` in `pause`, `reset`, `stop` | `200 ok` and the command is stored; anything else `400 bad command` |
-| GET | `/cmd-poll` | — | `200` `{"cmd": "pause" \| "reset" \| "stop" \| null}`, read-and-clear |
+| GET | `/cmd?c=CMD` | `CMD` in `pause`, `reset`, `stop`, `clear`, or a goal payload `goto:<x>,<y>` | `200 ok` and the command is stored; anything else `400 bad command`, with nothing queued |
+| GET | `/cmd-poll` | — | `200` `{"cmd": CMD \| null}`, read-and-clear |
 | GET | `/assets/<name>/<rel>` | — | `200` the file under the root registered as `<name>`, content type from the extension (`.urdf`/`.xml` → `application/xml`, `.dae` → `model/vnd.collada+xml`, `.stl`, `.glb`, `.gltf`, `.obj`, `.mtl`, `.png`, `.jpg`, else `application/octet-stream`); `404` for an unknown root, a missing file, a directory, or any path that normalises outside the root |
 | POST | `/ingest` | JSON object | `200 ok`; replaces the snapshot. A body that is not JSON, or not a dict, is dropped (DEBUG log) and the previous snapshot stays; still `200` |
 | POST | `/scene` | JSON `{"scene": manifest, "roots": {name: abs_dir}}` | `200 ok`; a body that is not a JSON object is dropped |
@@ -257,6 +264,7 @@ to about 60 rows) and is cheap enough to call at a few Hz.
 | `map` | list of equal-length row strings of `#` occupied, `.` free, space unknown | occupancy panel |
 | `cloud` | `[[x, y, z], …]` | top-down point-cloud panel, coloured by z |
 | `bounds` | `[x_min, x_max, y_min, y_max]` | extent of the cloud panel; required for the cloud to draw |
+| `goal` | `[x, y]` | the navigation goal the simulation currently holds; drawn as a crosshair on the cloud panel, and preferred over the browser's own last click so the marker shows what was actually accepted |
 
 Chart history is kept in the browser (last 600 samples per series), so a
 page reload starts the charts empty.
@@ -308,6 +316,15 @@ command, and `slam_demo.run` is the reference:
 | `pause` | toggles a `paused` flag; while paused the sim does not step but keeps publishing with `status="paused"` every 50 ms so the page stays live; a second `pause` resumes |
 | `reset` | `loop.reset()`, `slam.reset_idx(...)`, step counter back to 0 |
 | `stop` | breaks out of the run; the example then publishes a final snapshot with `status="stopped"`, prints its report and keeps serving in `hold_dashboard` until Ctrl+C or another `stop` |
+| `goto:<x>,<y>` | sets a navigation goal; [the click-to-walk example](../examples/interactive-nav.md) authors `avoid @ goto(x, y) @ walk` inside `plan()` and re-targets if a second click arrives mid-program |
+| `clear` | cancels the current goal and returns the controller to idle |
+
+**Clicking the cloud panel** sets a goal. The handler converts the click
+pixel to world coordinates with the exact inverse of the transform the
+panel draws with, then posts `goto:<x>,<y>`. It lives in the core script,
+not the three.js module, so it keeps working when the CDN does not. The
+marker it draws prefers the `goal` the simulation publishes over the
+browser's own last click, so what you see is what the sim accepted.
 
 A command is delivered once (`/cmd-poll` clears it) and only when the
 loop asks; a press while the loop is inside a long `scene.step()` is
@@ -378,7 +395,7 @@ layout, not WebGL.
 
 ## Tests
 
-`tests/test_dashboard_server.py`, 17 tests, engine-free, no network
+`tests/test_dashboard_server.py`, 22 tests, engine-free, no network
 beyond loopback (a real `DashboardServer` on an ephemeral port):
 
 | Group | What is covered |
